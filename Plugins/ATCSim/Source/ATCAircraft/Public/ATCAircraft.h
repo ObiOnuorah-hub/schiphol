@@ -8,6 +8,7 @@
 
 class UAircraftIdentityComponent;
 class UAircraftMovementComponent;
+class UMeshComponent;
 class UAircraftTypeData;
 class UPushbackControllerComponent;
 class UStaticMeshComponent;
@@ -121,6 +122,18 @@ public:
 	 */
 	void StandInFor(const TArray<TObjectPtr<AActor>>& Models);
 
+	/**
+	 * Look like these actors: every visible mesh part of them (the map's own parked aircraft, with its real livery) is
+	 * copied onto this aircraft, fitted the same way as a type's model: main gear on the origin, nose tip at the type's
+	 * nose offset, wheels on the ground, scaled to the type's length. ModelFrame is where the models stand as an aircraft
+	 * frame (their main gear, X along the nose). The type's model or placeholder is hidden. False when there is nothing to
+	 * copy, or more than MaxParts mesh parts (every part is a draw call: then the type's own model stays).
+	 */
+	bool CopyModelLook(const TArray<TObjectPtr<AActor>>& Models, const FTransform& ModelFrame, int32 MaxParts = 64);
+
+	/** Wears a copied model (CopyModelLook). */
+	bool HasCopiedLook() const { return LookParts.Num() > 0; }
+
 	// IAircraftCommands
 	virtual bool RequestPushback_Implementation(const FPushbackRequest& Request) override;
 	virtual bool StartTaxi_Implementation(ATaxiRoute* Route) override;
@@ -171,6 +184,10 @@ private:
 	 */
 	bool ReserveRunwayExit();
 	void StartGoAround();
+
+	/** The parts copied by CopyModelLook. */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMeshComponent>> LookParts;
 
 	bool bTakingOff = false;
 	float TakeoffSpeedCms = 0.f;

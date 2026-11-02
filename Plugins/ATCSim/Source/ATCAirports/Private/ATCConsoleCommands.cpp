@@ -18,6 +18,7 @@
 #include "EnvironmentTypes.h"
 #include "GMICamera.h"
 #include "GMICameraSubsystem.h"
+#include "GroundServiceSubsystem.h"
 #include "PTZControllerComponent.h"
 #include "ScenarioData.h"
 #include "TaxiNetworkSubsystem.h"
@@ -81,16 +82,102 @@ namespace ATCCommands
 			return;
 		}
 		const float Seconds = Args.Num() > 1 ? FCString::Atof(*Args[1]) : 20.f;
+		// The instructor's choice stays: live or dynamic weather would replace it within minutes
+		WeatherSystem->SetWeatherMode(EATCWeatherMode::Fixed);
 		if (Args.Num() > 2)
 		{
 			// Same preset, other amount of rain or snow (0..1): light shower to downpour
 			FWeatherState State = Preset->State;
 			State.PrecipitationRate = FMath::Clamp(FCString::Atof(*Args[2]), 0.f, 1.f);
 			WeatherSystem->SetWeatherState(State, Seconds);
-			UE_LOG(LogATC, Display, TEXT("Weather -> %s with precipitation rate %.2f"), *Preset->GetName(), State.PrecipitationRate);
+			UE_LOG(LogATC, Display, TEXT("Weather -> %s with precipitation rate %.2f (weather mode fixed; ATC.WeatherMode live for the real weather)"),
+				*Preset->GetName(), State.PrecipitationRate);
 			return;
 		}
 		WeatherSystem->SetWeather(Preset, Seconds);
+		UE_LOG(LogATC, Display, TEXT("Weather mode fixed; ATC.WeatherMode live for the real weather again"));
+	}
+
+	/** ATC.WeatherMode [fixed|dynamic|live]: where the weather comes from; alone: what it is now. */
+	void WeatherMode(const TArray<FString>& Args, UWorld* World)
+	{
+		UWeatherSubsystem* WeatherSystem = World ? World->GetSubsystem<UWeatherSubsystem>() : nullptr;
+		if (!WeatherSystem)
+		{
+			return;
+		}
+		if (Args.Num() > 0)
+		{
+			const FString Name = Args[0].ToLower();
+			if (Name != TEXT("fixed") && Name != TEXT("dynamic") && Name != TEXT("live"))
+			{
+				UE_LOG(LogATC, Warning, TEXT("ATC.WeatherMode <fixed|dynamic|live>"));
+				return;
+			}
+			WeatherSystem->SetWeatherMode(Name == TEXT("fixed") ? EATCWeatherMode::Fixed : Name == TEXT("dynamic") ? EATCWeatherMode::Dynamic : EATCWeatherMode::Live);
+			WeatherSystem->RestartAutomaticWeather();
+		}
+		UE_LOG(LogATC, Display, TEXT("ATC.WeatherMode: %s"), *WeatherSystem->Describe());
+	}
+
+	/**
+	 * ATC.Metar: the METAR live weather uses. ATC.Metar refresh: ask for it now. ATC.Metar EHAM 021225Z 22012KT 4000 RA ...:
+	 * this METAR as the weather (also offline; the weather mode becomes fixed so it stays).
+	 */
+	void Metar(const TArray<FString>& Args, UWorld* World)
+	{
+		UWeatherSubsystem* WeatherSystem = World ? World->GetSubsystem<UWeatherSubsystem>() : nullptr;
+		if (!WeatherSystem)
+		{
+			return;
+		}
+		if (Args.Num() == 1 && Args[0].Equals(TEXT("refresh"), ESearchCase::IgnoreCase))
+		{
+			WeatherSystem->SetWeatherMode(EATCWeatherMode::Live);
+			WeatherSystem->RefreshLiveWeather();
+			UE_LOG(LogATC, Display, TEXT("ATC.Metar: asking %s for the METAR"), *WeatherSystem->GetMetarStation());
+			return;
+		}
+		if (Args.Num() > 1)
+		{
+			const FString Text = FString::Join(Args, TEXT(" "));
+			if (WeatherSystem->ApplyMetar(Text, 20.f))
+			{
+				WeatherSystem->SetWeatherMode(EATCWeatherMode::Fixed);
+			}
+			return;
+		}
+		UE_LOG(LogATC, Display, TEXT("ATC.Metar: %s"), *WeatherSystem->Describe());
+	}
+
+	/** ATC.Vehicles [0|1]: ground vehicles (baggage, fuel, catering, pushback tugs) off or on; alone: who is served now. */
+	void Vehicles(const TArray<FString>& Args, UWorld* World)
+	{
+		UGroundServiceSubsystem* Ground = World ? World->GetSubsystem<UGroundServiceSubsystem>() : nullptr;
+		if (!Ground)
+		{
+			return;
+		}
+		if (Args.Num() > 0)
+		{
+			Ground->SetEnabled(Args[0] != TEXT("0"));
+		}
+		TArray<FString> Lines;
+		Ground->Describe().ParseIntoArrayLines(Lines);
+		for (const FString& Line : Lines)
+		{
+			UE_LOG(LogATC, Display, TEXT("ATC.Vehicles: %s"), *Line);
+		}
+	}
+
+	/** ATC.RealTime: the clock back to the real time of this computer (UTC), at normal speed. */
+	void RealTime(const TArray<FString>& Args, UWorld* World)
+	{
+		if (UATCSimClockSubsystem* Clock = World ? World->GetSubsystem<UATCSimClockSubsystem>() : nullptr)
+		{
+			Clock->FollowRealTime();
+			UE_LOG(LogATC, Display, TEXT("ATC.RealTime: %s (%s)"), *Clock->GetZuluTimeString(), *Clock->GetLocalTimeString());
+		}
 	}
 
 	void Time(const TArray<FString>& Args, UWorld* World)
@@ -595,7 +682,8 @@ namespace ATCCommands
 		}
 		if (const UATCSimClockSubsystem* Clock = World->GetSubsystem<UATCSimClockSubsystem>())
 		{
-			UE_LOG(LogATC, Display, TEXT("ATC.Status: clock %s"), *Clock->GetSimTimeUTC().ToString(TEXT("%Y-%m-%d %H:%M:%SZ")));
+			UE_LOG(LogATC, Display, TEXT("ATC.Status: clock %s (%s, %s, x%.0f)"), *Clock->GetSimTimeUTC().ToString(TEXT("%Y-%m-%d %H:%M:%SZ")),
+				*Clock->GetLocalTimeString(), Clock->IsRealTime() ? TEXT("real time") : TEXT("set by hand or scenario"), Clock->GetTimeScale());
 		}
 		if (const APlayerController* Controller = World->GetFirstPlayerController())
 		{
@@ -614,8 +702,9 @@ namespace ATCCommands
 		if (const UWeatherSubsystem* WeatherSystem = World->GetSubsystem<UWeatherSubsystem>())
 		{
 			const FWeatherState State = WeatherSystem->GetCurrentWeather();
-			UE_LOG(LogATC, Display, TEXT("ATC.Status: weather clouds %.2f base %.0f ft visibility %.0f m %s %.2f"), State.CloudCoverage, State.CloudBaseFt,
-				State.VisibilityM, *UEnum::GetValueAsString(State.Precipitation), State.PrecipitationRate);
+			UE_LOG(LogATC, Display, TEXT("ATC.Status: weather clouds %.2f base %.0f ft visibility %.0f m %s %.2f, wind %03.0f/%.0f kt"), State.CloudCoverage,
+				State.CloudBaseFt, State.VisibilityM, *UEnum::GetValueAsString(State.Precipitation), State.PrecipitationRate, State.WindDirectionDeg, State.WindSpeedKt);
+			UE_LOG(LogATC, Display, TEXT("ATC.Status: weather %s"), *WeatherSystem->Describe());
 		}
 		if (const UTrafficSubsystem* Traffic = World->GetSubsystem<UTrafficSubsystem>())
 		{
@@ -680,7 +769,18 @@ namespace ATCCommands
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Scenario));
 	FAutoConsoleCommandWithWorldAndArgs WeatherCommand(TEXT("ATC.Weather"), TEXT("ATC.Weather <Clear|Overcast|Rain|Mist|Snow> [seconds] [precipitation rate 0..1]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Weather));
-	FAutoConsoleCommandWithWorldAndArgs TimeCommand(TEXT("ATC.Time"), TEXT("ATC.Time <HH:MM> [YYYY-MM-DD]: simulation time in UTC"),
+	FAutoConsoleCommandWithWorldAndArgs WeatherModeCommand(TEXT("ATC.WeatherMode"),
+		TEXT("ATC.WeatherMode [fixed|dynamic|live]: presets only, weather that changes by itself, or the real weather from the METAR"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&WeatherMode));
+	FAutoConsoleCommandWithWorldAndArgs MetarCommand(TEXT("ATC.Metar"),
+		TEXT("ATC.Metar [refresh | <METAR text>]: the live weather's METAR, ask for it now, or use this METAR as the weather"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Metar));
+	FAutoConsoleCommandWithWorldAndArgs VehiclesCommand(TEXT("ATC.Vehicles"),
+		TEXT("ATC.Vehicles [0|1]: ground vehicles at parked aircraft and pushback tugs off or on; alone: who is being served"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Vehicles));
+	FAutoConsoleCommandWithWorldAndArgs RealTimeCommand(TEXT("ATC.RealTime"), TEXT("ATC.RealTime: the clock back to the real time (UTC) at normal speed"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&RealTime));
+	FAutoConsoleCommandWithWorldAndArgs TimeCommand(TEXT("ATC.Time"), TEXT("ATC.Time <HH:MM> [YYYY-MM-DD]: simulation time in UTC (leaves real time; ATC.RealTime goes back)"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Time));
 	FAutoConsoleCommandWithWorldAndArgs TimeScaleCommand(TEXT("ATC.TimeScale"), TEXT("ATC.TimeScale <factor>: speed of the clock (sun)"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TimeScale));

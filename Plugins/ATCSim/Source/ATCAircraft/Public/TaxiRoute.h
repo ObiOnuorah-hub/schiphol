@@ -246,6 +246,13 @@ public:
 	/** Index of the speed zone at a distance, INDEX_NONE outside zones. */
 	int32 GetZoneIndexAt(float Distance) const;
 
+	/**
+	 * How much the route turns (radians per cm) over every piece of StepCm from the start: entry i is the piece from
+	 * i * StepCm. Made once per route and step, and again when the spline changes. Taxiing aircraft read their turn speed
+	 * from it: the same values every frame (no speed hunting in a turn) and no spline queries.
+	 */
+	const TArray<float>& GetCurvatureTable(float StepCm) const;
+
 	/** Distance (cm) of the stop or waypoint with this name; stops first. -1 when there is none. */
 	UFUNCTION(BlueprintPure, Category = "Taxi")
 	float FindNamedDistance(FName Name) const;
@@ -291,4 +298,10 @@ private:
 	TArray<bool> LightOn;
 	TMap<TWeakObjectPtr<const UObject>, FGuidance> Guidance;
 	bool bLightsBuilt = false;
+
+	/** GetCurvatureTable, and the spline it was made for. */
+	mutable TArray<float> CurvatureTable;
+	mutable float CurvatureStepCm = 0.f;
+	mutable float CurvatureLengthCm = -1.f;
+	mutable int32 CurvaturePoints = -1;
 };

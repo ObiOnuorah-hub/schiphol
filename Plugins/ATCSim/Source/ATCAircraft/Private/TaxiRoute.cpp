@@ -56,6 +56,30 @@ FVector ATaxiRoute::GetDirectionAt(float Distance) const
 	return Spline->GetDirectionAtDistanceAlongSpline(FMath::Clamp(Distance, 0.f, GetLength()), ESplineCoordinateSpace::World);
 }
 
+const TArray<float>& ATaxiRoute::GetCurvatureTable(float StepCm) const
+{
+	const float Step = FMath::Max(StepCm, 50.f);
+	const float Length = GetLength();
+	const int32 Points = Spline->GetNumberOfSplinePoints();
+	if (Step != CurvatureStepCm || Points != CurvaturePoints || !FMath::IsNearlyEqual(Length, CurvatureLengthCm, 1.f))
+	{
+		CurvatureStepCm = Step;
+		CurvatureLengthCm = Length;
+		CurvaturePoints = Points;
+		CurvatureTable.Reset();
+		const int32 Num = FMath::Max(FMath::CeilToInt(Length / Step), 1);
+		CurvatureTable.Reserve(Num);
+		FVector Previous = GetDirectionAt(0.f);
+		for (int32 Index = 0; Index < Num; ++Index)
+		{
+			const FVector Next = GetDirectionAt((Index + 1) * Step);
+			CurvatureTable.Add(FMath::Acos(FMath::Clamp(FVector::DotProduct(Previous, Next), -1.f, 1.f)) / Step);
+			Previous = Next;
+		}
+	}
+	return CurvatureTable;
+}
+
 FVector ATaxiRoute::GetLocationAt(float Distance) const
 {
 	const float Length = GetLength();

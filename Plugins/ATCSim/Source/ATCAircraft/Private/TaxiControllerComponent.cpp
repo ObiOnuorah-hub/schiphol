@@ -279,15 +279,20 @@ float UTaxiControllerComponent::GetCurveSpeedLimit(float AtDistance, float Curre
 {
 	const float Decel = GetDecelerationCms2();
 	const float BrakeDistance = CurrentSpeed * CurrentSpeed / (2.f * Decel) + MinLookAheadCm;
-	const float Length = Route->GetLength();
+	const float LateralAccel = GetLateralAccelCms2();
 	float Limit = GetMaxSpeedCms();
 
-	for (float Ahead = 0.f; Ahead < BrakeDistance && AtDistance + Ahead < Length; Ahead += SampleStepCm)
+	// The route's own table: pieces at fixed places along the route, so the limit does not hunt as the aircraft moves on
+	const float Step = FMath::Max(SampleStepCm, 50.f);
+	const TArray<float>& Curvature = Route->GetCurvatureTable(Step);
+	for (int32 Index = FMath::Max(FMath::FloorToInt(AtDistance / Step), 0); Index < Curvature.Num(); ++Index)
 	{
-		const FVector T0 = Route->GetDirectionAt(AtDistance + Ahead);
-		const FVector T1 = Route->GetDirectionAt(AtDistance + Ahead + SampleStepCm);
-		const float Curvature = FMath::Acos(FMath::Clamp(FVector::DotProduct(T0, T1), -1.f, 1.f)) / SampleStepCm;
-		const float TurnSpeed = CurveSpeed(Curvature, GetLateralAccelCms2());
+		const float Ahead = FMath::Max(Index * Step - AtDistance, 0.f);
+		if (Ahead >= BrakeDistance)
+		{
+			break;
+		}
+		const float TurnSpeed = CurveSpeed(Curvature[Index], LateralAccel);
 		if (TurnSpeed < Limit)
 		{
 			// Speed allowed now = turn speed plus what can still be braked away before that point: v^2 = v_turn^2 + 2*a*d

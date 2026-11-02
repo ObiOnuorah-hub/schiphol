@@ -36,10 +36,21 @@ void UAircraftMovementComponent::SetPath(USplineComponent* NewPath, ETravelDirec
 	bNoseAlongTravel = bInNoseAlongTravel;
 	bEndReported = false;
 	CurrentRotation = GetOwner()->GetActorQuat();
+	JoinOffset = FQuat::Identity;
+	JoinBlend = 0.f;
 
 	if (Path)
 	{
 		Distance = FMath::Clamp(StartDistance, 0.f, Path->GetSplineLength());
+		LastDistance = Distance;
+		// The heading it has now against the heading of the new path: that difference fades out as it rolls
+		FQuat Exact;
+		if (!bSnap && GetExactRotation(Exact))
+		{
+			JoinOffset = Exact.Inverse() * CurrentRotation;
+			JoinOffset.Normalize();
+			JoinBlend = JoinOffset.AngularDistance(FQuat::Identity) > KINDA_SMALL_NUMBER ? 1.f : 0.f;
+		}
 		UpdateTransform(0.f, bSnap);
 	}
 }
@@ -108,19 +119,64 @@ FVector UAircraftMovementComponent::GetPointAt(float AtDistance) const
 	return Path->GetLocationAtDistanceAlongSpline(AtDistance, ESplineCoordinateSpace::World);
 }
 
-void UAircraftMovementComponent::UpdateTransform(float DeltaTime, bool bSnap)
+bool UAircraftMovementComponent::GetExactRotation(FQuat& OutRotation) const
 {
-	// Main gear on the spline, nose gear on the spline one wheelbase further: the heading follows from the two
+	// Main gear on the spline, nose gear on the spline one wheelbase away in a straight line: the heading follows from the
+	// two. In a turn that point is a little further along the line than one wheelbase (the chord is shorter than the arc):
+	// a few steps find it, so both gears are on the line, also for a long wide-body in a tight turn
 	const bool bNoseAhead = (Direction == ETravelDirection::Forward) == bNoseAlongTravel;
+	const float Sign = bNoseAhead ? 1.f : -1.f;
 	const FVector MainGear = GetPointAt(Distance);
-	const FVector NoseGear = GetPointAt(Distance + (bNoseAhead ? WheelbaseCm : -WheelbaseCm));
+	float Along = WheelbaseCm;
+	FVector NoseGear = GetPointAt(Distance + Sign * Along);
+	for (int32 Iteration = 0; Iteration < 4; ++Iteration)
+	{
+		const float Chord = FVector::Dist(MainGear, NoseGear);
+		if (Chord < KINDA_SMALL_NUMBER || FMath::Abs(WheelbaseCm - Chord) < 0.2f)
+		{
+			break;
+		}
+		Along += WheelbaseCm - Chord;
+		NoseGear = GetPointAt(Distance + Sign * Along);
+	}
 	const FVector Heading = (NoseGear - MainGear).GetSafeNormal();
 	if (Heading.IsNearlyZero())
 	{
+		return false;
+	}
+	OutRotation = Heading.Rotation().Quaternion();
+	return true;
+}
+
+void UAircraftMovementComponent::UpdateTransform(float DeltaTime, bool bSnap)
+{
+	FQuat Exact;
+	if (!Path || !GetExactRotation(Exact))
+	{
 		return;
 	}
+	const FVector MainGear = GetPointAt(Distance);
 
-	const FQuat TargetRotation = Heading.Rotation().Quaternion();
-	CurrentRotation = (bSnap || RotationSmoothing <= 0.f) ? TargetRotation : FMath::QInterpTo(CurrentRotation, TargetRotation, DeltaTime, RotationSmoothing);
+	if (bSnap)
+	{
+		JoinBlend = 0.f;
+		CurrentRotation = Exact;
+	}
+	else if (RotationSmoothing > 0.f)
+	{
+		CurrentRotation = FMath::QInterpTo(CurrentRotation, Exact, DeltaTime, RotationSmoothing);
+	}
+	else
+	{
+		// Both gears on the line: the heading is the line itself. Only a heading left over from the previous path fades,
+		// by distance rolled, so an aircraft that stands still does not turn
+		if (JoinBlend > 0.f)
+		{
+			JoinBlend *= FMath::Exp(-FMath::Abs(Distance - LastDistance) / FMath::Max(JoinBlendDistanceCm, 1.f));
+			JoinBlend = JoinBlend < 0.001f ? 0.f : JoinBlend;
+		}
+		CurrentRotation = JoinBlend > 0.f ? Exact * FQuat::Slerp(FQuat::Identity, JoinOffset, JoinBlend) : Exact;
+	}
+	LastDistance = Distance;
 	GetOwner()->SetActorLocationAndRotation(MainGear, CurrentRotation);
 }

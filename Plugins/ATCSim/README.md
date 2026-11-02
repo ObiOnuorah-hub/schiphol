@@ -14,8 +14,9 @@ Het ontwerp staat in `Docs/ATC_VR_Bouwblokken.html` in de projectmap.
 | Showcase | `/Game/Airports/Showcase/Maps/Map_Showcase_ATC` | `Showcase` (start vanzelf) | `Tower.Showcase` |
 
 - **Schiphol**: open EHAM en druk op Play. Je staat in Toren Centrum (`PlayTower` van `DA_Airport_EHAM`) en het verkeer loopt meteen:
-  landingen, pushbacks, taxiën en starts (`TrafficDirector_EHAM` met `bStartOnBeginPlay`). De map houdt zijn eigen licht; de weer- en
-  dag/nacht-rig komt pas met een scenario. Weer rustig: `ATC.TrafficOnPlay 0` (editor). Een scenario met eigen verkeer, zoals
+  landingen, pushbacks, taxiën en starts (`TrafficDirector_EHAM` met `bStartOnBeginPlay`). De klok loopt op de echte tijd en het weer is
+  het echte weer van Schiphol (zie *Echte tijd en echt weer*); zet `bLiveEnvironmentOnPlay` uit en de map houdt zijn eigen licht tot een
+  scenario start. Weer rustig: `ATC.TrafficOnPlay 0` (editor). Een scenario met eigen verkeer, zoals
   `ATC.Scenario EHAM_Ochtendpiek`, maakt het vliegveld eerst leeg. Klaring geef je zelf: `ATC.Cmd KLM1023 Continue`.
 - **De andere vier** zijn *schematische* maps, gemaakt uit OpenStreetMap-data (banen, taxibanen, platforms, gebouwen, stands).
   Ze staan als "SCHEMATISCHE KAART" bij de toren. Groningen en Maastricht hebben wel een map in het project (`Content/EHGG`,
@@ -41,9 +42,13 @@ Het ontwerp staat in `Docs/ATC_VR_Bouwblokken.html` in de projectmap.
 ## Console-commando's
 | Commando | Doet |
 |---|---|
-| `ATC.Weather Rain 20` | Weer naar Clear, Overcast, Rain, Mist of Snow in 20 s |
-| `ATC.Time 21:30` | Simulatietijd in UTC (optioneel datum: `ATC.Time 06:00 2026-12-21`) |
+| `ATC.Weather Rain 20` | Weer naar Clear, Overcast, Rain, Mist of Snow in 20 s (de weermodus wordt `fixed`, zodat het zo blijft) |
+| `ATC.WeatherMode live` | Waar het weer vandaan komt: `fixed` (alleen presets), `dynamic` (verandert vanzelf), `live` (de echte METAR). Zonder argument: modus, station, laatste METAR en wat er nu komt |
+| `ATC.Metar` | De METAR van het live weer; `ATC.Metar refresh` vraagt hem nu op; `ATC.Metar EHAM 021225Z 22012KT 4000 RA BKN008 11/10 Q1004` gebruikt die METAR als weer (ook offline) |
+| `ATC.Time 21:30` | Simulatietijd in UTC (optioneel datum: `ATC.Time 06:00 2026-12-21`); de klok gaat dan van de echte tijd af |
+| `ATC.RealTime` | Klok terug op de echte tijd (UTC van deze pc), snelheid 1 |
 | `ATC.TimeScale 60` | Klok 60x sneller (alleen de zon, niet het verkeer) |
+| `ATC.Vehicles 0` | Grondvoertuigen uit (`1` = aan; zonder getal: welke vliegtuigen nu service krijgen) |
 | `ATC.Cmd KLM1023 Hold` | Opdracht: `Pushback`, `Taxi`, `Hold` of `Continue` (+ optioneel tag) |
 | `ATC.Camera GMI-TWR Cam.EHAM.Threshold18R` | GMI-camera naar een preset; die camera wordt ook de bestuurde. Of een lens (`ATC.Camera GMI-TWR 3`), `next`, of pan en tilt (`ATC.Camera GMI-G7 10 -15 100`). Zonder camera-ID: alle camera's (`ATC.Camera Cam.Showcase.Runway`). Alleen `ATC.Camera`: lijst van alle camera's |
 | `ATC.CameraUI` | Instructeurspaneel aan/uit: alle camerabeelden rechtsboven op het desktopscherm (`save` = als plaatje in `Saved/Screenshots/ATC`) |
@@ -60,7 +65,7 @@ Het ontwerp staat in `Docs/ATC_VR_Bouwblokken.html` in de projectmap.
 | `ATC.Monitor 1 GMI-E6` | Welke camera scherm 1 in de toren toont (`next` = volgende) |
 | `ATC.Turn -36` | Kijkrichting draaien in graden (rondkijken zonder muis); `ATC.Turn 0 -20` kijkt ook 20° omlaag |
 | `ATC.Tower Tower.EHAM.West` | Naar een torenpositie (zonder tag: de eerste toren van de luchthaven) |
-| `ATC.Status` | Klok, zon, weer en alle vliegtuigen in de log |
+| `ATC.Status` | Klok (UTC en lokale tijd, echte tijd of niet), zon, weer met de weermodus en alle vliegtuigen in de log |
 | `ATC.Scenario Showcase` | Start een scenario uit `/Game/Scenarios` |
 | `ATC.Shot naam` | Screenshot naar `Saved/Screenshots/ATC` (`ATC.Shot naam ui`: met de widgets) |
 | `ATC.After 30 ATC.Weather Mist` | Commando later uitvoeren (demo's, tests) |
@@ -95,9 +100,9 @@ Editor-only (Output Log > Cmd, of headless met `-ExecCmds`):
 | Module | Belangrijkste klassen |
 |---|---|
 | `ATCSimCore` | `UATCSimClockSubsystem` (UTC-klok), `ATCUnits`, gameplay tags `Cmd.*` en `Event.*`, `UATCSimSettings` (Project Settings > Plugins > ATC Sim) |
-| `ATCAircraft` | `AATCAircraft`, `UAircraftMovementComponent`, `UTaxiControllerComponent`, `UPushbackControllerComponent`, `ATaxiRoute`, `ATaxiStopMarker`, `AStand`, `UTrafficSubsystem`, `UTaxiNetworkSubsystem`, `UAircraftTypeData`, `IAircraftCommands`, `IAircraftInfo`, `UAircraftSpawnSubsystem`, `AAircraftSpawnPoint`, `UTrafficMixData`, `ATrafficDirector` |
+| `ATCAircraft` | `AATCAircraft`, `UAircraftMovementComponent`, `UTaxiControllerComponent`, `UPushbackControllerComponent`, `ATaxiRoute`, `ATaxiStopMarker`, `AStand`, `UTrafficSubsystem`, `UTaxiNetworkSubsystem`, `UAircraftTypeData`, `IAircraftCommands`, `IAircraftInfo`, `UAircraftSpawnSubsystem`, `AAircraftSpawnPoint`, `UTrafficMixData`, `ATrafficDirector`, `AAirportVehicle`, `APushbackTug`, `UGroundServiceSubsystem` |
 | `ATCCamera` | `AGMICamera`, `UPTZControllerComponent`, `AMonitorDisplay`, `ULensSetData`, `ULensLibrary`, `UGMICameraSubsystem` (renderbudget en bediening), `UGMICameraSettings` (Project Settings > Plugins > ATC Sim Camera), `UGMICameraPanel` |
-| `ATCEnvironment` | `UWeatherSubsystem`, `UTimeOfDaySubsystem`, `ULightingRigComponent` / `AEnvironmentRig`, `UWeatherPresetData`, `IWeatherListener`, `IDayNightListener` |
+| `ATCEnvironment` | `UWeatherSubsystem` (presets, dynamisch en live weer), `FMetarReport` (METAR-parser), `UTimeOfDaySubsystem`, `ULightingRigComponent` / `AEnvironmentRig`, `UWeatherPresetData`, `IWeatherListener`, `IDayNightListener` |
 | `ATCAirports` | `UAirportData`, `UScenarioData`, `UAirportSubsystem`, `AScenarioStarter`, `URadioSubsystem`, `URadioVoiceData`, `ARadioLogDisplay`, de console-commando's |
 | `ATCSimEditor` | Validatie van verwijzingen buiten het project, voorbeeldcontent, Schiphol-setup, radio-import, tests |
 
@@ -310,9 +315,14 @@ Er is maar één Windows-stem op deze pc (Zira). Met meer stemmen (Windows Inste
   In Shipping werkt de console niet: instructeursbediening moet dan via UI of Blueprint.
 
 ## Tests
-Session Frontend > Automation > `ATCSim` (19 tests), of zonder editor:
+Session Frontend > Automation > `ATCSim` (26 tests), of zonder editor:
 `UnrealEditor-Cmd.exe Import_testing_obi.uproject -ExecCmds="Automation RunTests ATCSim" -TestExit="Automation Test Queue Empty" -nullrhi -FORCELOGFLUSH`
 (`-TestExit` stopt het proces hard; zonder `-FORCELOGFLUSH` mist het eind van de log soms, en lijkt het alsof er tests ontbreken.)
+
+Nieuw: `Environment.Metar` (METAR-parser), `Environment.DynamicWeather` (geen sneeuw in juli, geen mist 's middags), `Core.RealTimeClock`,
+`Aircraft.NoseGearOnLine` (beide wielen binnen 1-3 cm op de lijn in bochten van 30 m), `Vehicles.DriveAndPark`, `Vehicles.ServiceSpots`
+(plekken en routes vrij van romp, gestel, motoren en elkaar, voor A320 tot A380) en `Vehicles.TurnaroundService` (service komt, en is na
+de pushback weg).
 
 De camera heeft twee tests: `Camera.PTZ` (een preset komt met pan, tilt en zoom tegelijk aan, de zoom logaritmisch; limieten; om de
 kabelstop heen; de koepel draait door; langzamer pannen bij inzoomen; lens wisselen) en `Camera.CaptureBudget` (twee live op 20 Hz, de rest
@@ -324,6 +334,83 @@ landing gaat vóór wie op de grond wacht), `DeadlockBreaker` (een kring wordt g
 een geparkeerd model krijgt een vliegtuig van dat type en die maatschappij; het model komt terug als dat vliegtuig weggaat zonder te
 vertrekken). De tests waarin gereden wordt,
 controleren ook dat niemand overlapt en dat het hoofdgestel binnen 1 cm op de lijn blijft.
+
+## Echte tijd en echt weer
+Project Settings > Plugins > ATC Sim > *Environment*.
+- **Echte tijd** (`bRealTimeClock`, aan). De klok is de UTC-tijd van deze pc: is het buiten nacht, dan is het in de toren nacht.
+  Hij telt geen frametijden op, dus hij loopt niet uit na een hapering of een gepauzeerde editor. `ATC.Time` en `ATC.TimeScale`
+  zetten hem los, `ATC.RealTime` zet hem terug. De monitoren tonen UTC (zoals in de luchtvaart); `ATC.Status` laat ook de lokale tijd zien.
+- **Gewoon Play** (`bLiveEnvironmentOnPlay`, aan): ook zonder scenario komt de dag/nacht- en weer-rig in de map, met de echte tijd en
+  het weer volgens de weermodus. Uit: de map houdt het licht waarmee hij is opgeslagen.
+- **Scenario's**: `bLiveEnvironment` (aan) = echte tijd en echt weer; het `Weather`-preset van het scenario is het beeld tot de METAR
+  binnen is (een seconde of zo). Uit = `StartTimeUTC`, `TimeScale` en `Weather` van het scenario, en het weer blijft zoals het is
+  (een oefening die mist bij nacht nodig heeft).
+- **Weermodus** (`WeatherMode`, `ATC.WeatherMode`):
+  - `live` (standaard): de echte METAR van de luchthaven (`MetarUrl`, aviationweather.gov), elke 10 min opgevraagd (`MetarRefreshMinutes`).
+    Een nieuwe METAR schuift er in 2 min in (`LiveWeatherBlendSeconds`); de eerste bij de start meteen. Een luchthaven zonder echte
+    ICAO-code (de showcase) krijgt het weer van `DefaultMetarStation` (EHAM). Geen internet of geen antwoord: het weer verandert dan
+    vanzelf (zoals `dynamic`) tot er wel een METAR is.
+  - `dynamic`: elke 10-30 min (`DynamicWeatherMinutes`) een nieuw, logisch weerbeeld dat er in 3-8 min (`DynamicBlendMinutes`)
+    in schuift: meestal een kleine stap (helder → wat wolken → bewolkt → buien, en terug), mist alleen 's nachts en 's ochtends, sneeuw
+    alleen in de winter, wind die wat draait. Met `ATC.TimeScale` gaat het weer mee sneller.
+  - `fixed`: alleen presets, zoals vroeger. `ATC.Weather` zet de modus op `fixed`, zodat de keuze van de instructeur blijft.
+- **Wat er uit een METAR komt** (`FMetarReport`): wind (ook `VRB`, vlagen, m/s), zicht (`9999`, `CAVOK`, meters of statute miles), wolken
+  (`FEW` … `OVC`, `VV`, `CB`/`TCU`), neerslag met sterkte (`-RA`, `+TSRA`, `SHSN`, `DZ`, `RASN` op temperatuur), mist (`FG`, `BR`), recente
+  regen (`RERA`), temperatuur en QNH. TEMPO/BECMG en RMK tellen niet mee. Daaruit: bewolking, wolkenbasis, zicht, regen of sneeuw, natte
+  of besneeuwde grond, zonsterkte en schaduwzachtheid. De wind gaat naar de radio (startklaring).
+- Het weer verandert alleen vanzelf als er een rig is die het laat zien; zonder rig worden ook geen METARs opgevraagd.
+
+## Grondvoertuigen
+Kleine voertuigen van eenvoudige vormen in hun eigen kleuren, dus zonder content: een **pushbacktruck** bij elke pushback, en rond
+geparkeerde vliegtuigen een **bagagetrein** (trekker met twee karren die zijn spoor volgen), een **tankwagen** en een **cateringwagen**.
+- Ze komen als een vliegtuig op zijn stand staat: eerst de bagage (na 5-15 s), dan de rest. Tanken en catering zijn na een paar minuten
+  klaar en rijden weg; de bagage blijft tot de pushback. Zodra de pushback is aangevraagd rijdt alles weg, de bagagetrein een paar seconden later.
+- Vaste plekken, berekend uit het type (romp, hoofdgestel, motoren): de bagage rechts bij het achterruim, de cateringwagen haaks op de
+  rechter voordeur (de slurf zit links), de tankwagen links onder de vleugel achter het gestel. Ze komen en gaan over een eigen baan
+  buiten de motoren (bij een A380 of 747 tussen de binnenste en de buitenste motor), en de tankwagen en de cateringwagen rijden eerst
+  achteruit weg. Getest voor alle types van de vloot: niets rijdt of staat in de romp, het gestel, de motoren of in een ander voertuig.
+- De pushbacktruck staat onder het neuswiel. Na het loskoppelen rijdt hij opzij weg (vóór het vliegtuig gaat taxiën) en terug naar de stand.
+  Een eigen tug-model van het project (`TugClass` van de pushback controller) werkt zoals vroeger.
+- Vliegtuigen die er bij de start al staan krijgen meteen hun service, de helft ervan (`ServicedAtStartShare`).
+- Kosten: een voertuig is 3 tot 7 simpele meshes met één gedeeld materiaal per kleur, alleen het grootste deel werpt schaduw, ze tekenen
+  niet verder dan 4 km, en ze tikken alleen als ze rijden. Hoogstens 40 tegelijk (`MaxServiceVehicles`). Zwaailicht (een klein lampje
+  zonder schaduw, alleen tijdens het rijden): `atc.VehicleBeacons 0` zet ze uit.
+- `ATC.Vehicles 0/1`, of `bGroundVehicles` in Project Settings > Plugins > ATC Sim > *Vehicles*.
+
+## Precies op de lijn en soepel
+- **Beide wielen op de lijn.** Het hoofdgestel stond al exact op de spline. Het neuswiel nu ook: het staat één wielbasis in een rechte
+  lijn verder óp de lijn (in een bocht is dat iets verder langs de lijn dan één wielbasis). Eerst stond het één wielbasis langs de lijn,
+  en dan ~30 cm buiten de lijn bij een 787 in een bocht van 30 m. De koers volgde de lijn ook met wat vertraging (`RotationSmoothing` 6);
+  nu exact (`RotationSmoothing` 0). Alleen een koersverschil bij het begin van een nieuw pad (eind van de pushback → taxiroute) vervaagt
+  over de eerste 10 m (`JoinBlendDistanceCm`). Test: `Aircraft.NoseGearOnLine`.
+- **Geen schommelende snelheid in bochten.** De bochtsnelheid kwam uit punten die met het vliegtuig mee schoven, waardoor de limiet per
+  frame een beetje anders was. Nu heeft elke route een vaste tabel (`GetCurvatureTable`): elke frame dezelfde waarden en geen
+  spline-berekeningen meer per vliegtuig per frame.
+- **GMI-camera's.** Met de joystick of de toetsen trekt het beeld nu soepel op en remt het af (`InputSmoothingSeconds` 0,12 s), in
+  plaats van met een schok. De beelden komen in een vast ritme van hele frames (20 Hz bij 55 fps was 3-3-2 frames: hapering), en als
+  twee camera's in hetzelfde frame zouden tekenen wacht één een frame (gelijkmatige GPU-last). De camera die je beweegt tekent zolang
+  hij beweegt minstens 30 beelden per seconde (`MovingRateHz`). Test: `Camera.CaptureBudget`, `Camera.PTZ`.
+- **De oude `AircraftSplineActor`** (game-module) tikte niet (`bCanEverTick` stond uit), dus hij bewoog nooit; nu wel, met snelheden in
+  knopen, de neus naar de gate bij de pushback, en de landing rolt uit tot het eind van zijn spline.
+
+## Soepeler (performance)
+- De zon draait pas na een zichtbare stap (0,1°, in echte tijd elke 24 s) in plaats van elke seconde: elke draai van het zonlicht gooit
+  de schaduw-cache weg.
+- Een skylight zonder real-time capture wordt alleen opnieuw opgenomen als de lucht zichtbaar veranderd is (zon 1°, andere wolken of
+  zicht, schemer), niet elke seconde (een hele cubemap).
+- Lange weerovergangen sturen de rig 10 keer per seconde bij in plaats van elk frame; de rig zoekt zijn wolken en MPC één keer op.
+- Bochtsnelheid uit de vaste routetabel (zie hierboven).
+
+## KLM-livery
+De KLM 777 had de speciale "orange pride"-livery en de 787-10 de "100 jaar"-livery; de geparkeerde KLM-toestellen van de Schiphol-map
+(gewone KLM-kleuren) werden bij het starten van het verkeer vervangen door die modellen.
+- **Verkeer draagt de modellen van de map** (`bWearMapModels` op de traffic director, aan): een vliegtuig van een type en maatschappij
+  waarvan de map een geparkeerd model heeft, krijgt een kopie van dat model (alle mesh-delen, met de materialen van de map), uitgelijnd
+  zoals een typemodel: hoofdgestel op de oorsprong, neus op de neus-offset, wielen op de grond, geschaald naar de typelengte, en rechtgezet
+  als het geparkeerde model een paar graden schuin op zijn stand stond. Heeft de map er meer (een gewone KLM 777 en de orange pride),
+  dan wint de gewone. Een geparkeerd toestel dat vertrekt houdt zijn eigen model.
+- **`ATC.SetupFleet`** neemt voor KLM nu de gewone modellen (`KLM_Boeing_777_306_ER`, `KLM_Boeing_787_9_Dreamliner`) als die als één mesh
+  in het project staan, en valt anders terug op de oude. Daarna `ATC.SetupFleet` opnieuw draaien om de types bij te werken.
 
 ## Weer: hoeveelheid neerslag
 `PrecipitationRate` (0..1) gaat via `MPC_Environment.PrecipitationRate` naar de materialen `M_RainStreak` en `M_SnowFlake`:

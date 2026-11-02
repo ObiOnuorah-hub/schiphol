@@ -9,8 +9,10 @@
 #include "TaxiControllerComponent.h"
 #include "TaxiNetworkSubsystem.h"
 #include "TrafficSubsystem.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "Components/SplineComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Engine/SkinnedAsset.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
@@ -133,6 +135,13 @@ void AATCAircraft::ApplyType()
 		Model = AircraftType->Mesh.LoadSynchronous();
 		Offset = AircraftType->MeshOffset;
 	}
+	// Wearing the map's own model of its airline (CopyModelLook): the type's model stays hidden
+	if (LookParts.Num() > 0)
+	{
+		Body->SetVisibility(false);
+		Wings->SetVisibility(false);
+		return;
+	}
 	if (Model)
 	{
 		Body->SetStaticMesh(Model);
@@ -220,6 +229,151 @@ void AATCAircraft::StandInFor(const TArray<TObjectPtr<AActor>>& Models)
 			StoodInFor.Add(Model);
 		}
 	}
+}
+
+bool AATCAircraft::CopyModelLook(const TArray<TObjectPtr<AActor>>& Models, const FTransform& ModelFrame, int32 MaxParts)
+{
+	// Every visible mesh part with its bounds (in its own space)
+	struct FPart
+	{
+		UMeshComponent* Source = nullptr;
+		FBox LocalBounds = FBox(ForceInit);
+		FTransform Relative;
+	};
+	TArray<FPart> Parts;
+	for (AActor* Model : Models)
+	{
+		if (!IsValid(Model))
+		{
+			continue;
+		}
+		TInlineComponentArray<UMeshComponent*> Meshes(Model);
+		for (UMeshComponent* Mesh : Meshes)
+		{
+			const UStaticMeshComponent* Static = Cast<UStaticMeshComponent>(Mesh);
+			const USkinnedMeshComponent* Skinned = Cast<USkinnedMeshComponent>(Mesh);
+			const UStaticMesh* StaticAsset = Static ? Static->GetStaticMesh() : nullptr;
+			const USkinnedAsset* SkinnedAsset = Skinned ? Skinned->GetSkinnedAsset() : nullptr;
+			if ((!StaticAsset && !SkinnedAsset) || !Mesh->IsVisible() || Mesh->bHiddenInGame)
+			{
+				continue;
+			}
+			FPart& Part = Parts.AddDefaulted_GetRef();
+			Part.Source = Mesh;
+			Part.LocalBounds = StaticAsset ? StaticAsset->GetBoundingBox() : SkinnedAsset->GetBounds().GetBox();
+		}
+	}
+	if (Parts.Num() == 0)
+	{
+		return false;
+	}
+	if (Parts.Num() > MaxParts)
+	{
+		UE_LOG(LogATC, Display, TEXT("%s keeps its type's model: the map's model %s has %d parts (more than %d)"), *Identity->Callsign.ToString(),
+			Models.Num() > 0 && Models[0] ? *Models[0]->GetName() : TEXT("?"), Parts.Num(), MaxParts);
+		return false;
+	}
+
+	// A parked model of the map can stand a few degrees off its stand line: its own heading is where its outline (nose to
+	// tail times wingtip to wingtip) is smallest. Checked from straight ahead outwards, so a model in line stays in line
+	TArray<FVector> Corners;
+	for (const FPart& Part : Parts)
+	{
+		FVector Vertices[8];
+		Part.LocalBounds.GetVertices(Vertices);
+		const FTransform World = Part.Source->GetComponentTransform();
+		for (const FVector& Vertex : Vertices)
+		{
+			Corners.Add(ModelFrame.InverseTransformPosition(World.TransformPosition(Vertex)));
+		}
+	}
+	float BestYaw = 0.f;
+	double BestArea = TNumericLimits<double>::Max();
+	for (int32 Step = 0; Step <= 60; ++Step)
+	{
+		for (const float Sign : { 1.f, -1.f })
+		{
+			const float Yaw = Sign * Step * 0.25f;
+			const FQuat Back(FVector::UpVector, FMath::DegreesToRadians(-Yaw));
+			FBox Outline(ForceInit);
+			for (const FVector& Corner : Corners)
+			{
+				Outline += Back.RotateVector(Corner);
+			}
+			const double Area = Outline.GetSize().X * Outline.GetSize().Y;
+			if (Area < BestArea * 0.9995)
+			{
+				BestArea = Area;
+				BestYaw = Yaw;
+			}
+			if (Step == 0)
+			{
+				break;
+			}
+		}
+	}
+	const FTransform Frame = FTransform(FRotator(0.f, BestYaw, 0.f)) * ModelFrame;
+	FBox Box(ForceInit);
+	for (FPart& Part : Parts)
+	{
+		Part.Relative = Part.Source->GetComponentTransform().GetRelativeTransform(Frame);
+		Box += Part.LocalBounds.TransformBy(Part.Relative);
+	}
+	if (!Box.IsValid || Box.GetSize().X < 100.f)
+	{
+		return false;
+	}
+
+	// Fitted like a type's model: nose tip at the nose offset, centred on the line, wheels on the ground, the type's length
+	const float Scale = AircraftType ? FMath::Clamp(AircraftType->GetLengthCm() / float(Box.GetSize().X), 0.5f, 2.f) : 1.f;
+	const FVector Offset(GetNoseOffsetCm() - Box.Max.X * Scale, -Box.GetCenter().Y * Scale, -Box.Min.Z * Scale);
+	const FTransform Fit(FQuat::Identity, Offset, FVector(Scale));
+
+	for (UMeshComponent* Part : LookParts)
+	{
+		if (Part)
+		{
+			Part->DestroyComponent();
+		}
+	}
+	LookParts.Reset();
+	for (const FPart& Part : Parts)
+	{
+		UMeshComponent* Copy = nullptr;
+		if (const UStaticMeshComponent* Static = Cast<UStaticMeshComponent>(Part.Source))
+		{
+			UStaticMeshComponent* NewStatic = NewObject<UStaticMeshComponent>(this);
+			NewStatic->SetStaticMesh(Static->GetStaticMesh());
+			Copy = NewStatic;
+		}
+		else if (const USkinnedMeshComponent* Skinned = Cast<USkinnedMeshComponent>(Part.Source))
+		{
+			USkeletalMeshComponent* NewSkeletal = NewObject<USkeletalMeshComponent>(this);
+			NewSkeletal->SetSkinnedAssetAndUpdate(Skinned->GetSkinnedAsset());
+			Copy = NewSkeletal;
+		}
+		if (!Copy)
+		{
+			continue;
+		}
+		// The same materials as the original, also the ones set on the component in the map
+		for (int32 Slot = 0; Slot < Part.Source->GetNumMaterials(); ++Slot)
+		{
+			Copy->SetMaterial(Slot, Part.Source->GetMaterial(Slot));
+		}
+		Copy->SetMobility(EComponentMobility::Movable);
+		Copy->SetupAttachment(RootComponent);
+		Copy->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		Copy->SetCanEverAffectNavigation(false);
+		Copy->SetRelativeTransform(Part.Relative * Fit);
+		Copy->RegisterComponent();
+		LookParts.Add(Copy);
+	}
+	Body->SetVisibility(false);
+	Wings->SetVisibility(false);
+	UE_LOG(LogATC, Display, TEXT("%s wears the map's model %s (%d parts, x%.3f, turned %.2f deg onto its line)"), *Identity->Callsign.ToString(),
+		Models.Num() > 0 && Models[0] ? *Models[0]->GetName() : TEXT("?"), LookParts.Num(), Scale, BestYaw);
+	return LookParts.Num() > 0;
 }
 
 void AATCAircraft::EndPlay(const EEndPlayReason::Type EndPlayReason)

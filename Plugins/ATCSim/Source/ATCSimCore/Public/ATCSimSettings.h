@@ -4,6 +4,18 @@
 #include "Engine/DeveloperSettings.h"
 #include "ATCSimSettings.generated.h"
 
+/** Where the weather comes from. */
+UENUM(BlueprintType)
+enum class EATCWeatherMode : uint8
+{
+	/** Only presets (scenario, airport, ATC.Weather): the weather never changes by itself. */
+	Fixed,
+	/** Starts like Fixed, then drifts to a new plausible weather every 10-30 minutes (clouds, showers, mist at dawn, snow in winter). */
+	Dynamic,
+	/** The real weather of the airport from its METAR, refreshed every few minutes. Offline: Dynamic. */
+	Live
+};
+
 /** Project-wide defaults for the ATC building blocks: Project Settings > Plugins > ATC Sim. */
 UCLASS(Config = Game, DefaultConfig, meta = (DisplayName = "ATC Sim"))
 class ATCSIMCORE_API UATCSimSettings : public UDeveloperSettings
@@ -64,6 +76,59 @@ public:
 	/** Landings on the same runway come out of the stack at least this far apart. */
 	UPROPERTY(Config, EditAnywhere, Category = "Traffic", meta = (Units = "s"))
 	float LandingSpacingSeconds = 75.f;
+
+	/**
+	 * Plain Play in an airport map (no scenario) gets the environment rig too: the sun and the sky follow the clock, and the
+	 * weather follows WeatherMode. Off = the map keeps its own light, as it was saved.
+	 */
+	UPROPERTY(Config, EditAnywhere, Category = "Environment")
+	bool bLiveEnvironmentOnPlay = true;
+
+	/**
+	 * The clock runs on the real UTC time of this computer: day and night outside are day and night in the tower. A scenario
+	 * with bLiveEnvironment off keeps its own StartTimeUTC. ATC.Time and ATC.TimeScale leave real time until ATC.RealTime.
+	 */
+	UPROPERTY(Config, EditAnywhere, Category = "Environment")
+	bool bRealTimeClock = true;
+
+	UPROPERTY(Config, EditAnywhere, Category = "Environment")
+	EATCWeatherMode WeatherMode = EATCWeatherMode::Live;
+
+	/** {ICAO} is replaced by the airport code. The answer is the raw METAR text. */
+	UPROPERTY(Config, EditAnywhere, Category = "Environment")
+	FString MetarUrl = TEXT("https://aviationweather.gov/api/data/metar?ids={ICAO}&format=raw");
+
+	/** An airport without a real ICAO code (the showcase) uses the weather of this station. */
+	UPROPERTY(Config, EditAnywhere, Category = "Environment")
+	FString DefaultMetarStation = TEXT("EHAM");
+
+	/** METARs come out every 30 minutes; asking more often only catches a new one sooner. */
+	UPROPERTY(Config, EditAnywhere, Category = "Environment", meta = (Units = "min", ClampMin = "1"))
+	float MetarRefreshMinutes = 10.f;
+
+	/** A new METAR blends in over this time, so a front moves in instead of switching on. */
+	UPROPERTY(Config, EditAnywhere, Category = "Environment", meta = (Units = "s", ClampMin = "0"))
+	float LiveWeatherBlendSeconds = 120.f;
+
+	/** Dynamic weather: time between two weather changes, min and max (real minutes, the clock's TimeScale speeds it up). */
+	UPROPERTY(Config, EditAnywhere, Category = "Environment")
+	FVector2D DynamicWeatherMinutes = FVector2D(10.f, 30.f);
+
+	/** Dynamic weather: one change takes this long, min and max (real minutes). */
+	UPROPERTY(Config, EditAnywhere, Category = "Environment")
+	FVector2D DynamicBlendMinutes = FVector2D(3.f, 8.f);
+
+	/** Ground vehicles serve parked aircraft: fuel truck, baggage train, catering truck; and a tug for every pushback. */
+	UPROPERTY(Config, EditAnywhere, Category = "Vehicles")
+	bool bGroundVehicles = true;
+
+	/** Upper limit of service vehicles in the whole airport (each is a few simple meshes). Pushback tugs do not count. */
+	UPROPERTY(Config, EditAnywhere, Category = "Vehicles", meta = (ClampMin = "0"))
+	int32 MaxServiceVehicles = 40;
+
+	/** Share of the aircraft already parked when the map starts that have service vehicles around them. */
+	UPROPERTY(Config, EditAnywhere, Category = "Vehicles", meta = (ClampMin = "0", ClampMax = "1"))
+	float ServicedAtStartShare = 0.5f;
 
 	/** Asset paths that must not depend on content outside the project or this plugin (see the reference validator). */
 	UPROPERTY(Config, EditAnywhere, Category = "Validation")

@@ -129,36 +129,51 @@ void UGMICameraSubsystem::PlanCaptures(TArray<FGMICaptureState>& States, float D
 	TArray<int32> Viewed;
 	for (int32 Index = 0; Index < States.Num(); ++Index)
 	{
-		States[Index].bLive = false;
-		if (States[Index].bViewed)
+		FGMICaptureState& State = States[Index];
+		State.bLive = false;
+		State.FrameSeconds = State.FrameSeconds > 0.f ? FMath::Lerp(State.FrameSeconds, DeltaTime, 0.05f) : DeltaTime;
+		if (State.bViewed)
 		{
 			Viewed.Add(Index);
 		}
 		else
 		{
 			// Nobody sees it: no pictures, and the first one comes at once when a screen comes into view again
-			States[Index].Credit = 1.f;
+			State.FramesSincePicture = -1;
 		}
 	}
 	Viewed.StableSort([&States](int32 A, int32 B) { return States[A].Priority > States[B].Priority; });
+
+	TArray<int32> Due;
 	for (int32 Rank = 0; Rank < Viewed.Num(); ++Rank)
 	{
 		FGMICaptureState& State = States[Viewed[Rank]];
 		State.bLive = Rank < MaxLive;
 		const float Rate = State.bLive ? State.LiveRateHz : FMath::Min(BackgroundRateHz, State.LiveRateHz);
-		// At most two pictures owed: a camera that had to wait catches up with one picture, not with a burst
-		State.Credit = FMath::Min(State.Credit + Rate * DeltaTime, 2.f);
-	}
-
-	TArray<int32> Due;
-	for (const int32 Index : Viewed)
-	{
-		if (States[Index].Credit >= 1.f)
+		if (Rate <= 0.f || State.FrameSeconds <= 0.f)
 		{
-			Due.Add(Index);
+			continue;
+		}
+		// Whole frames between pictures, with some room before it changes, so it does not flip between two counts
+		const float Wanted = 1.f / (Rate * State.FrameSeconds);
+		if (State.IntervalFrames <= 0 || FMath::Abs(Wanted - float(State.IntervalFrames)) > 0.75f)
+		{
+			State.IntervalFrames = FMath::Max(FMath::RoundToInt(Wanted), 1);
+		}
+		State.FramesSincePicture = State.FramesSincePicture < 0 ? State.IntervalFrames : State.FramesSincePicture + 1;
+		if (State.FramesSincePicture >= State.IntervalFrames)
+		{
+			Due.Add(Viewed[Rank]);
 		}
 	}
-	Due.StableSort([&States](int32 A, int32 B) { return States[A].Credit > States[B].Credit; });
+
+	// Most overdue first, then the one that matters most
+	Due.StableSort([&States](int32 A, int32 B)
+	{
+		const int32 LateA = States[A].FramesSincePicture - States[A].IntervalFrames;
+		const int32 LateB = States[B].FramesSincePicture - States[B].IntervalFrames;
+		return LateA != LateB ? LateA > LateB : States[A].Priority > States[B].Priority;
+	});
 	OutCapture.Reset();
 	for (const int32 Index : Due)
 	{
@@ -166,7 +181,14 @@ void UGMICameraSubsystem::PlanCaptures(TArray<FGMICaptureState>& States, float D
 		{
 			break;
 		}
-		States[Index].Credit -= 1.f;
+		FGMICaptureState& State = States[Index];
+		// Just due while another camera already renders in this frame: one frame later, so the cost is spread
+		if (OutCapture.Num() > 0 && State.IntervalFrames > 1 && State.FramesSincePicture == State.IntervalFrames)
+		{
+			continue;
+		}
+		// Keeps its rhythm: a picture one frame late does not push all the next ones back; and no burst after a long wait
+		State.FramesSincePicture = FMath::Clamp(State.FramesSincePicture - State.IntervalFrames, 0, State.IntervalFrames - 1);
 		OutCapture.Add(Index);
 	}
 }
@@ -214,7 +236,13 @@ void UGMICameraSubsystem::Tick(float DeltaTime)
 	TArray<FGMICaptureState> States;
 	for (FTrackedCamera& Entry : Tracked)
 	{
-		Entry.State.LiveRateHz = Entry.Camera->CaptureRateHz * RateScale;
+		float Rate = Entry.Camera->CaptureRateHz;
+		// The camera the operator is moving: a smoother picture while it pans, tilts or zooms
+		if (Entry.Camera == SelectedCamera.Get() && Entry.Camera->PTZ && Entry.Camera->PTZ->IsActive())
+		{
+			Rate = FMath::Max(Rate, Settings->MovingRateHz);
+		}
+		Entry.State.LiveRateHz = Rate * RateScale;
 		States.Add(Entry.State);
 	}
 	TArray<int32> Capture;

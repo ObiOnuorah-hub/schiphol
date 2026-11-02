@@ -4,8 +4,15 @@
 #include "Components/SplineComponent.h"
 #include "Components/StaticMeshComponent.h"
 
+namespace
+{
+	constexpr float KnotsToCms = 51.4444f;
+}
+
 AAircraftSplineActor::AAircraftSplineActor()
 {
+	// Without this the actor never ticks and the aircraft stands still at the start of its first spline
+	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.TickInterval = 0.0f;
 
 	// Create root scene component
@@ -71,8 +78,17 @@ void AAircraftSplineActor::Tick(float DeltaTime)
 
 void AAircraftSplineActor::UpdateSpeed(float DeltaTime)
 {
-	// Smoothly interpolate current speed toward target speed
-	CurrentSpeed = FMath::FInterpTo(CurrentSpeed, TargetSpeed, DeltaTime, CurrentAccelerationRate);
+	// A steady acceleration or braking (knots per second) towards the target speed
+	CurrentSpeed = FMath::FInterpConstantTo(CurrentSpeed, TargetSpeed, DeltaTime, CurrentAccelerationRate);
+
+	// The last phase stops at the end of its spline instead of running past it: v^2 = 2 a d
+	if (CurrentPhase == EFlightPhase::Landing && CurrentSpline)
+	{
+		const float RemainingCm = FMath::Max(CurrentSpline->GetSplineLength() - DistanceAlongSpline, 0.f);
+		const float StopKt = FMath::Sqrt(2.f * FMath::Max(LandingDeceleration, 0.1f) * KnotsToCms * RemainingCm) / KnotsToCms;
+		// At least a crawl, so it really gets to the end (and the phase finishes)
+		CurrentSpeed = FMath::Min(CurrentSpeed, FMath::Max(StopKt, 0.5f));
+	}
 }
 
 void AAircraftSplineActor::UpdateMovement(float DeltaTime)
@@ -82,8 +98,8 @@ void AAircraftSplineActor::UpdateMovement(float DeltaTime)
 		return;
 	}
 
-	// Calculate distance traveled this frame
-	float DistanceTraveled = CurrentSpeed * DeltaTime;
+	// Calculate distance traveled this frame (speeds are knots, the spline is in cm)
+	float DistanceTraveled = CurrentSpeed * KnotsToCms * DeltaTime;
 	DistanceAlongSpline += DistanceTraveled;
 
 	// Get spline length
@@ -95,11 +111,15 @@ void AAircraftSplineActor::UpdateMovement(float DeltaTime)
 		ESplineCoordinateSpace::World
 	);
 
-	// Get rotation at distance along spline
+	// Get rotation at distance along spline; pushed back, the nose points the other way (back to the gate)
 	FRotator NewRotation = CurrentSpline->GetRotationAtDistanceAlongSpline(
 		FMath::Clamp(DistanceAlongSpline, 0.0f, SplineLength),
 		ESplineCoordinateSpace::World
 	);
+	if (CurrentPhase == EFlightPhase::Pushback && bPushbackTailFirst)
+	{
+		NewRotation = FRotator(-NewRotation.Pitch, NewRotation.Yaw + 180.f, -NewRotation.Roll);
+	}
 
 	// Apply new location and rotation to the aircraft
 	AircraftMesh->SetWorldLocationAndRotation(NewLocation, NewRotation);
@@ -148,6 +168,8 @@ void AAircraftSplineActor::AdvanceToNextPhase()
 	case EFlightPhase::Landing:
 		CurrentSpeed = 0.0f;
 		TargetSpeed = 0.0f;
+		CurrentSpline = nullptr;   // done: stands at the end of the landing spline, and stops ticking
+		SetActorTickEnabled(false);
 		UE_LOG(LogTemp, Warning, TEXT("Aircraft has completed landing sequence"));
 		break;
 
@@ -165,9 +187,9 @@ void AAircraftSplineActor::InitializePhase(EFlightPhase NewPhase)
 	{
 	case EFlightPhase::Pushback:
 		CurrentSpline = PushbackSpline;
-		CurrentSpeed = PushbackSpeed;
+		CurrentSpeed = 0.0f;
 		TargetSpeed = PushbackSpeed;
-		CurrentAccelerationRate = 10.0f;
+		CurrentAccelerationRate = 1.0f;
 		UE_LOG(LogTemp, Warning, TEXT("Aircraft entering PUSHBACK phase"));
 		break;
 
@@ -190,7 +212,7 @@ void AAircraftSplineActor::InitializePhase(EFlightPhase NewPhase)
 	case EFlightPhase::Landing:
 		CurrentSpline = LandingSpline;
 		CurrentSpeed = LandingStartSpeed;
-		TargetSpeed = 0.0f;
+		TargetSpeed = TaxiSpeed;
 		CurrentAccelerationRate = LandingDeceleration;
 		UE_LOG(LogTemp, Warning, TEXT("Aircraft entering LANDING phase"));
 		break;

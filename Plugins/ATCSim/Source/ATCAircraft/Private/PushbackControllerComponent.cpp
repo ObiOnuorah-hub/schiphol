@@ -1,5 +1,7 @@
 #include "PushbackControllerComponent.h"
+#include "AirportVehicle.h"
 #include "AircraftCommands.h"
+#include "GroundServiceSubsystem.h"
 #include "AircraftMovementComponent.h"
 #include "AircraftTypeData.h"
 #include "ATCUnits.h"
@@ -14,6 +16,7 @@ UPushbackControllerComponent::UPushbackControllerComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.TickGroup = TG_PrePhysics;
+	TugClass = APushbackTug::StaticClass();
 }
 
 void UPushbackControllerComponent::BeginPlay()
@@ -34,11 +37,9 @@ void UPushbackControllerComponent::EndPlay(const EEndPlayReason::Type EndPlayRea
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(Timer);
+		World->GetTimerManager().ClearTimer(TugTimer);
 	}
-	if (IsValid(Tug))
-	{
-		Tug->Destroy();
-	}
+	DestroyTug();
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -105,7 +106,10 @@ void UPushbackControllerComponent::StartTugConnect()
 {
 	SetState(EPushbackState::TugConnecting);
 
-	if (TugClass)
+	// The vehicle tug follows the ground vehicles switch (ATC.Vehicles 0: none); a tug model of the project always comes
+	const UGroundServiceSubsystem* Ground = GetWorld()->GetSubsystem<UGroundServiceSubsystem>();
+	const bool bVehicleTug = TugClass && TugClass->IsChildOf(AAirportVehicle::StaticClass());
+	if (TugClass && !Tug && !(bVehicleTug && Ground && !Ground->IsEnabled()))
 	{
 		USceneComponent* AttachTo = GetOwner()->GetRootComponent();
 		TInlineComponentArray<USceneComponent*> Components(GetOwner());
@@ -131,6 +135,8 @@ void UPushbackControllerComponent::StartPushing()
 	ATaxiRoute* Route = PushRoute.Get();
 	if (!Route)
 	{
+		// No pushback after all: the tug goes again
+		DestroyTug();
 		SetState(EPushbackState::Parked);
 		return;
 	}
@@ -218,15 +224,49 @@ void UPushbackControllerComponent::HandlePathEnd()
 	Movement->StopImmediately();
 	SetState(EPushbackState::TugDisconnecting);
 	GetWorld()->GetTimerManager().SetTimer(Timer, this, &UPushbackControllerComponent::Finish, FMath::Max(TugDisconnectTime, 0.01f));
+	// Disconnected after the first part of that time: the tug drives off, clear of the nose before the aircraft moves
+	GetWorld()->GetTimerManager().SetTimer(TugTimer, this, &UPushbackControllerComponent::ReleaseTug, FMath::Max(TugDisconnectTime * 0.4f, 0.01f));
+}
+
+void UPushbackControllerComponent::DestroyTug()
+{
+	if (IsValid(Tug))
+	{
+		Tug->Destroy();
+	}
+	Tug = nullptr;
+}
+
+void UPushbackControllerComponent::ReleaseTug()
+{
+	AAirportVehicle* Vehicle = Cast<AAirportVehicle>(Tug);
+	if (!Vehicle || !IsValid(Vehicle))
+	{
+		// A tug model of the project: removed when the pushback is finished, as before
+		return;
+	}
+	Vehicle->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+	const FVector At = Vehicle->GetActorLocation();
+	const FVector Forward = GetOwner()->GetActorForwardVector().GetSafeNormal2D();
+	const FVector Right = GetOwner()->GetActorRightVector().GetSafeNormal2D();
+	// Off to the right, clear of the nose and the wing, then back to its stand
+	TArray<FVector> Points = { At + Right * 700.f + Forward * 300.f, At + Right * 1600.f - Forward * 300.f };
+	FVector Home = At + Right * 2200.f - Forward * 2500.f;
+	if (const AStand* FromStand = Stand.Get())
+	{
+		Home = FromStand->GetParkingTransform().TransformPosition(UGroundServiceSubsystem::GetStagingPoint(AircraftType));
+	}
+	Points.Add(Home);
+	Vehicle->DriveThrough(Points, (Home - Points[1]).Rotation().Yaw, true);
+	// From here it drives on its own
+	Tug = nullptr;
 }
 
 void UPushbackControllerComponent::Finish()
 {
-	if (Tug)
-	{
-		Tug->Destroy();
-		Tug = nullptr;
-	}
+	GetWorld()->GetTimerManager().ClearTimer(TugTimer);
+	ReleaseTug();
+	DestroyTug();
 	SetState(EPushbackState::Completed);
 
 	if (ActiveRequest.bAutoTaxi && ActiveRequest.TaxiRouteAfter)

@@ -13,6 +13,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnDayPhaseChanged, EDayPhase, NewPh
 /**
  * Sun position for the current airport and the simulation clock (Core). Uses the engine's Sun Position plugin,
  * always in UTC: no daylight-saving mistakes. Updates once per simulated second; the sun moves 0.25 degrees a minute.
+ * The light itself only turns when the sun has moved a tenth of a degree (every 24 s in real time): every turn of the
+ * directional light throws away the cached shadow maps, which is not worth an invisible step.
  */
 UCLASS()
 class ATCENVIRONMENT_API UTimeOfDaySubsystem : public UTickableWorldSubsystem
@@ -43,6 +45,12 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "ATC|TimeOfDay")
 	FDateTime GetSunsetUTC() const { return SunsetUTC; }
+
+	UFUNCTION(BlueprintPure, Category = "ATC|TimeOfDay")
+	double GetLatitude() const { return Latitude; }
+
+	UFUNCTION(BlueprintPure, Category = "ATC|TimeOfDay")
+	double GetLongitude() const { return Longitude; }
 
 	/** Actor implementing IDayNightListener. */
 	UFUNCTION(BlueprintCallable, Category = "ATC|TimeOfDay")
@@ -84,6 +92,11 @@ private:
 	FDateTime SunsetUTC;
 	FDateTime LastUpdate;
 	bool bHasUpdated = false;
+
+	/** The sun as the rig last got it: it only moves the light again after a visible step (see SunStepDeg). */
+	float PushedElevation = 0.f;
+	float PushedAzimuth = 0.f;
+	bool bHasPushed = false;
 
 	TWeakObjectPtr<ULightingRigComponent> LightingRig;
 	TArray<TWeakObjectPtr<UObject>> Listeners;

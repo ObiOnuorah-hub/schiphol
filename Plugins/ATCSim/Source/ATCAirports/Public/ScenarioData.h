@@ -123,15 +123,23 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Scenario")
 	FGameplayTag TowerPosition;
 
-	/** UTC, so the traffic picture is the same in summer and winter. */
+	/**
+	 * Real time and real weather: the clock is the computer's UTC time, and the weather comes from the airport's METAR or
+	 * changes by itself (Project Settings > Plugins > ATC Sim > Environment). Off: this scenario's StartTimeUTC, TimeScale
+	 * and Weather, and the weather stays as it is (an exercise that needs fog at night).
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Scenario")
+	bool bLiveEnvironment = true;
+
+	/** UTC, so the traffic picture is the same in summer and winter. Only with bLiveEnvironment off. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Scenario", meta = (EditCondition = "!bLiveEnvironment"))
 	FDateTime StartTimeUTC = FDateTime(2026, 10, 13, 9, 30, 0);
 
-	/** Speed of the clock (sun); traffic always runs in real time. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Scenario")
+	/** Speed of the clock (sun); traffic always runs in real time. Only with bLiveEnvironment off. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Scenario", meta = (EditCondition = "!bLiveEnvironment"))
 	float TimeScale = 1.f;
 
-	/** Empty = the airport's default weather. */
+	/** Empty = the airport's default weather. With bLiveEnvironment: the weather until the real one is in. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Scenario")
 	TSoftObjectPtr<UWeatherPresetData> Weather;
 

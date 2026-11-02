@@ -15,6 +15,7 @@ class UMaterialInstanceDynamic;
 class UMaterialParameterCollection;
 class UNiagaraComponent;
 class UNiagaraSystem;
+class UVolumetricCloudComponent;
 
 /**
  * The only writer to sun, sky light, fog, clouds, MPC_Environment and precipitation. Day/night supplies the sun
@@ -110,8 +111,21 @@ private:
 	void Recompose();
 	void UpdatePrecipitation();
 
+	/**
+	 * A sky light without real-time capture is captured again (a whole cubemap) only when the sky changed enough to
+	 * see: the sun one degree further, other clouds or visibility, or dusk turning into night. Not every second.
+	 */
+	void RequestRecaptureIfChanged();
+
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> CloudMaterial;
+
+	/** Found once at BeginPlay, not on every update. */
+	UPROPERTY(Transient)
+	TObjectPtr<UVolumetricCloudComponent> CloudComponent;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialParameterCollection> Collection;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UNiagaraComponent> PrecipitationComponent;
@@ -126,6 +140,14 @@ private:
 	bool bPrecipitationDirty = false;
 	float RecaptureTimer = 0.f;
 	bool bRecapturePending = false;
+
+	/** The sky at the last capture. */
+	bool bHasCaptured = false;
+	float CapturedElevation = 0.f;
+	float CapturedYaw = 0.f;
+	float CapturedCoverage = 0.f;
+	float CapturedVisibility = 0.f;
+	float CapturedNight = 0.f;
 };
 
 /** Container actor for the lighting rig; placed once per airport map (as Level Instance). */

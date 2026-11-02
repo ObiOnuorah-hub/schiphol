@@ -71,6 +71,12 @@ struct ATCENVIRONMENT_API FWeatherState
 	float WindSpeedKt = 8.f;
 
 	static FWeatherState Lerp(const FWeatherState& A, const FWeatherState& B, float Alpha);
+
+	/**
+	 * Sun intensity and shadow softness from the sky: clouds, precipitation and low visibility dim the sun and soften the
+	 * shadows. Calibrated on the presets (CAVOK 1.0 / 0.5, overcast 0.4 / 5, rain 0.25 / 6, fog 0.08 / 10).
+	 */
+	void DeriveSunFromSky();
 };
 
 /** A weather preset, linked to the METAR a controller would read. */

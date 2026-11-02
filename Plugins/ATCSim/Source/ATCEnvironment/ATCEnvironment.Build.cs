@@ -7,6 +7,6 @@ public class ATCEnvironment : ModuleRules
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "ATCSimCore" });
-		PrivateDependencyModuleNames.AddRange(new string[] { "SunPosition", "Niagara" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "SunPosition", "Niagara", "HTTP" });
 	}
 }

@@ -15,7 +15,11 @@
 #include "TrafficMixData.h"
 #include "TrafficSubsystem.h"
 #include "AircraftMovementComponent.h"
+#include "Components/SkinnedMeshComponent.h"
 #include "Components/SplineComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/SkinnedAsset.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
 
@@ -57,6 +61,7 @@ void ATrafficDirector::StartTraffic()
 	bRunning = true;
 	Traffic->OnAircraftEvent.AddUniqueDynamic(this, &ATrafficDirector::HandleAircraftEvent);
 	Spawner->OnAircraftSpawned.AddUniqueDynamic(this, &ATrafficDirector::HandleSpawned);
+	FindMapModels();
 
 	// A normal day is already going: part of the gates have an aircraft in its turnaround, ready at different times.
 	// A gate with a parked model of the map always has one: it takes the model's place and leaves later in the day
@@ -343,8 +348,92 @@ void ATrafficDirector::SpawnArrival()
 	}
 }
 
+namespace
+{
+	/** "B77W|KLM": type and airline (the first three letters of the callsign). */
+	FString LookKey(const UAircraftTypeData* Type, const FString& Airline)
+	{
+		return Type ? FString::Printf(TEXT("%s|%s"), *Type->ICAOType.ToString(), *Airline.Left(3).ToUpper()) : FString();
+	}
+
+	/** A model in a special livery (KLM "orange pride", "100 jaar"): only used when there is no normal one. */
+	bool IsSpecialLivery(const TArray<TObjectPtr<AActor>>& Models)
+	{
+		static const TCHAR* const Words[] = { TEXT("orange"), TEXT("pride"), TEXT("jaar"), TEXT("anniversary"), TEXT("retro"), TEXT("special"), TEXT("skyteam") };
+		for (const AActor* Model : Models)
+		{
+			if (!Model)
+			{
+				continue;
+			}
+			TInlineComponentArray<UMeshComponent*> Meshes(Model);
+			for (const UMeshComponent* Mesh : Meshes)
+			{
+				const UStaticMeshComponent* Static = Cast<UStaticMeshComponent>(Mesh);
+				const USkinnedMeshComponent* Skinned = Cast<USkinnedMeshComponent>(Mesh);
+				const UObject* Asset = Static ? static_cast<const UObject*>(Static->GetStaticMesh()) : Skinned ? static_cast<const UObject*>(Skinned->GetSkinnedAsset()) : nullptr;
+				const FString Path = Asset ? Asset->GetPathName() : FString();
+				for (const TCHAR* Word : Words)
+				{
+					if (Path.Contains(Word))
+					{
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+}
+
+void ATrafficDirector::FindMapModels()
+{
+	LookGates.Reset();
+	TMap<FString, bool> Normal;
+	for (int32 Index = 0; Index < Gates.Num(); ++Index)
+	{
+		const FTrafficGate& Gate = Gates[Index];
+		const UAircraftTypeData* Type = Gate.ParkedModels.Num() > 0 ? Gate.ParkedType.LoadSynchronous() : nullptr;
+		const FString Key = LookKey(Type, Gate.ParkedAirline);
+		if (Key.IsEmpty() || Gate.ParkedAirline.IsEmpty())
+		{
+			continue;
+		}
+		const bool bNormal = !IsSpecialLivery(Gate.ParkedModels);
+		const bool* Known = Normal.Find(Key);
+		if (!Known || (bNormal && !*Known))
+		{
+			LookGates.Add(Key, Index);
+			Normal.Add(Key, bNormal);
+		}
+	}
+	if (LookGates.Num() > 0)
+	{
+		TArray<FString> Keys;
+		LookGates.GetKeys(Keys);
+		UE_LOG(LogATC, Display, TEXT("%s: %d types and airlines wear the map's own parked model: %s"), *GetName(), LookGates.Num(), *FString::Join(Keys, TEXT(", ")));
+	}
+}
+
+void ATrafficDirector::WearMapModel(AATCAircraft* Aircraft) const
+{
+	const int32* Gate = Aircraft && bWearMapModels ? LookGates.Find(LookKey(Aircraft->AircraftType, Aircraft->Identity->Callsign.ToString())) : nullptr;
+	const UTrafficSubsystem* Traffic = GetWorld()->GetSubsystem<UTrafficSubsystem>();
+	const AStand* Stand = Gate && Gates.IsValidIndex(*Gate) && Traffic ? Traffic->FindStand(Gates[*Gate].Stand) : nullptr;
+	if (Stand)
+	{
+		// A copy for every aircraft of that airline: only for a model of a few parts, they are all draw calls
+		Aircraft->CopyModelLook(Gates[*Gate].ParkedModels, Stand->GetParkingTransform(), 24);
+	}
+}
+
 void ATrafficDirector::HandleSpawned(AATCAircraft* Aircraft, FName Callsign)
 {
+	// The airline's livery as this map has it (a stand-in wears its own parked model below)
+	if (Aircraft && !ParkedModelStandIns.Contains(Callsign))
+	{
+		WearMapModel(Aircraft);
+	}
 	const int32* Gate = GateOf.Find(Callsign);
 	UTrafficSubsystem* Traffic = GetWorld()->GetSubsystem<UTrafficSubsystem>();
 	AStand* Stand = Gate && Traffic ? Traffic->FindStand(Gates[*Gate].Stand) : nullptr;
@@ -360,6 +449,12 @@ void ATrafficDirector::HandleSpawned(AATCAircraft* Aircraft, FName Callsign)
 	if (ParkedModelStandIns.Remove(Callsign) > 0)
 	{
 		Aircraft->StandInFor(Gates[*Gate].ParkedModels);
+		// It is the map's own aircraft that leaves: it keeps its look
+		if (bWearMapModels)
+		{
+			// In place of the hidden model itself: as many parts as it has
+			Aircraft->CopyModelLook(Gates[*Gate].ParkedModels, Aircraft->GetActorTransform(), 512);
+		}
 	}
 }
 

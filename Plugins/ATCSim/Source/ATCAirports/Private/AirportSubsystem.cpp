@@ -123,7 +123,16 @@ void UAirportSubsystem::ApplyPlayTower(TWeakObjectPtr<UWorld> WeakWorld, int32 A
 		return;
 	}
 	UAirportData* Airport = UAirportData::FindForWorld(World);
-	if (!Airport || !Airport->PlayTower.IsValid())
+	if (!Airport)
+	{
+		return;
+	}
+	if (Attempt == 0)
+	{
+		ActiveAirport = Airport;
+		ApplyLiveEnvironment(World, Airport);
+	}
+	if (!Airport->PlayTower.IsValid())
 	{
 		return;
 	}
@@ -149,21 +158,23 @@ void UAirportSubsystem::ApplyScenario(UWorld* World, UScenarioData* Scenario)
 	ActiveScenario = Scenario;
 	ActiveAirport = Scenario->Airport.LoadSynchronous();
 
-	// An imported airport map has its own sun, sky and fog but no rig: one is added now, so plain Play keeps the map's
-	// own look and the scenario takes over the lighting
-	if (UWeatherSubsystem* WeatherSystem = World->GetSubsystem<UWeatherSubsystem>(); WeatherSystem && !WeatherSystem->HasRig())
-	{
-		FActorSpawnParameters Params;
-		Params.ObjectFlags |= RF_Transient;
-		World->SpawnActor<AEnvironmentRig>(AEnvironmentRig::StaticClass(), FTransform::Identity, Params);
-		UE_LOG(LogATC, Display, TEXT("Scenario %s: environment rig added to the map"), *Scenario->GetName());
-	}
+	// The scenario takes over the lighting of the map
+	EnsureEnvironmentRig(World);
 
 	// Clock, sun and weather right away, so the first frame already looks right
+	const UATCSimSettings* Settings = GetDefault<UATCSimSettings>();
+	const bool bLive = Scenario->bLiveEnvironment;
 	if (UATCSimClockSubsystem* Clock = World->GetSubsystem<UATCSimClockSubsystem>())
 	{
-		Clock->SetTimeScale(Scenario->TimeScale);
-		Clock->SetSimTimeUTC(Scenario->StartTimeUTC);
+		if (bLive && Settings->bRealTimeClock)
+		{
+			Clock->FollowRealTime();
+		}
+		else
+		{
+			Clock->SetTimeScale(Scenario->TimeScale);
+			Clock->SetSimTimeUTC(Scenario->StartTimeUTC);
+		}
 	}
 	if (UTimeOfDaySubsystem* TimeOfDay = World->GetSubsystem<UTimeOfDaySubsystem>(); TimeOfDay && ActiveAirport)
 	{
@@ -171,9 +182,16 @@ void UAirportSubsystem::ApplyScenario(UWorld* World, UScenarioData* Scenario)
 	}
 	UWeatherPresetData* Weather = !Scenario->Weather.IsNull() ? Scenario->Weather.LoadSynchronous()
 		: ActiveAirport ? ActiveAirport->DefaultWeather.LoadSynchronous() : nullptr;
-	if (UWeatherSubsystem* WeatherSystem = World->GetSubsystem<UWeatherSubsystem>(); WeatherSystem && Weather)
+	if (UWeatherSubsystem* WeatherSystem = World->GetSubsystem<UWeatherSubsystem>())
 	{
-		WeatherSystem->SetWeather(Weather, 0.f);
+		if (Weather)
+		{
+			WeatherSystem->SetWeather(Weather, 0.f);
+		}
+		// Live: the preset is the picture until the METAR is in (a second or so); fixed: it stays
+		WeatherSystem->SetMetarStation(ActiveAirport ? ActiveAirport->ICAO.ToString() : FString());
+		WeatherSystem->SetWeatherMode(bLive ? Settings->WeatherMode : EATCWeatherMode::Fixed);
+		WeatherSystem->RestartAutomaticWeather();
 	}
 
 	if (UDataLayerManager* Layers = UDataLayerManager::GetDataLayerManager(World))
@@ -288,6 +306,50 @@ void UAirportSubsystem::ApplyDeferred(TWeakObjectPtr<UWorld> WeakWorld, int32 At
 		ActiveAirport ? *ActiveAirport->ICAO.ToString() : TEXT("no airport"), *ActiveScenario->TowerPosition.ToString(),
 		ActiveScenario->Aircraft.Num(), ActiveScenario->Events.Num(), ActiveScenario->Spawns.Num());
 	OnScenarioStarted.Broadcast(ActiveScenario);
+}
+
+void UAirportSubsystem::EnsureEnvironmentRig(UWorld* World)
+{
+	UWeatherSubsystem* WeatherSystem = World ? World->GetSubsystem<UWeatherSubsystem>() : nullptr;
+	if (WeatherSystem && !WeatherSystem->HasRig())
+	{
+		FActorSpawnParameters Params;
+		Params.ObjectFlags |= RF_Transient;
+		World->SpawnActor<AEnvironmentRig>(AEnvironmentRig::StaticClass(), FTransform::Identity, Params);
+		UE_LOG(LogATC, Display, TEXT("Environment rig added to %s"), *World->GetMapName());
+	}
+}
+
+void UAirportSubsystem::ApplyLiveEnvironment(UWorld* World, UAirportData* Airport)
+{
+	const UATCSimSettings* Settings = GetDefault<UATCSimSettings>();
+	if (!World || !Airport || !Settings->bLiveEnvironmentOnPlay)
+	{
+		return;
+	}
+	EnsureEnvironmentRig(World);
+	UATCSimClockSubsystem* Clock = World->GetSubsystem<UATCSimClockSubsystem>();
+	if (Clock && Settings->bRealTimeClock)
+	{
+		Clock->FollowRealTime();
+	}
+	if (UTimeOfDaySubsystem* TimeOfDay = World->GetSubsystem<UTimeOfDaySubsystem>())
+	{
+		TimeOfDay->SetLocation(Airport->Latitude, Airport->Longitude, Airport->NorthOffsetDeg);
+	}
+	if (UWeatherSubsystem* WeatherSystem = World->GetSubsystem<UWeatherSubsystem>())
+	{
+		if (UWeatherPresetData* Weather = Airport->DefaultWeather.LoadSynchronous())
+		{
+			WeatherSystem->SetWeather(Weather, 0.f);
+		}
+		WeatherSystem->SetMetarStation(Airport->ICAO.ToString());
+		WeatherSystem->SetWeatherMode(Settings->WeatherMode);
+		WeatherSystem->RestartAutomaticWeather();
+	}
+	UE_LOG(LogATC, Display, TEXT("Live environment for %s: clock %s, weather %s"), *Airport->ICAO.ToString(),
+		Clock ? *FString::Printf(TEXT("%s (%s)"), *Clock->GetZuluTimeString(), Clock->IsRealTime() ? TEXT("real time") : TEXT("set")) : TEXT("-"),
+		Settings->WeatherMode == EATCWeatherMode::Live ? TEXT("live (METAR)") : Settings->WeatherMode == EATCWeatherMode::Dynamic ? TEXT("dynamic") : TEXT("fixed"));
 }
 
 namespace

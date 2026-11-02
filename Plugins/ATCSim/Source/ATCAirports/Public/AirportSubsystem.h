@@ -53,6 +53,15 @@ private:
 
 	/** Plain Play without a scenario: the player goes to the airport's PlayTower. */
 	void ApplyPlayTower(TWeakObjectPtr<UWorld> World, int32 Attempt);
+
+	/**
+	 * Plain Play (UATCSimSettings::bLiveEnvironmentOnPlay): the environment rig with the real time and the real (or
+	 * changing) weather of the airport, so an airport map is never stuck at the moment it was saved.
+	 */
+	void ApplyLiveEnvironment(UWorld* World, UAirportData* Airport);
+
+	/** An imported airport map has its own sun, sky and fog but no rig: one is added to take them over. */
+	void EnsureEnvironmentRig(UWorld* World);
 	void ScheduleSpawns(UWorld* World);
 	void ApplyRenderProfile();
 

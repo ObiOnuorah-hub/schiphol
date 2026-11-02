@@ -140,6 +140,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	float ArrivalSpeedKt = 30.f;
 
+	/**
+	 * Aircraft of an airline and type of which the map has a parked model (a gate's ParkedModels) wear a copy of that
+	 * model: the airline's livery as it is in this map, and the very same aircraft when a parked one departs. When the map
+	 * has several (a KLM 777 in the normal colours and one in a special livery), the normal one is used. Off: the type's
+	 * own model and liveries (DA_AircraftType_*).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Parked model")
+	bool bWearMapModels = true;
+
 	/** Arrivals fly the final approach and land. Off: they appear on the runway at the end of the rollout. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	bool bVisibleLandings = true;
@@ -188,6 +197,12 @@ private:
 	/** Type and airlines from the mix that fit the gate size. */
 	bool PickType(bool bWideBody, UAircraftTypeData*& OutType, TArray<FString>& OutAirlines);
 
+	/** The map's parked model for the aircraft's type and airline, if there is one (bWearMapModels). */
+	void WearMapModel(AATCAircraft* Aircraft) const;
+
+	/** Collects the gates whose parked model an aircraft of that type and airline can wear (LookGates). */
+	void FindMapModels();
+
 	float Now() const;
 
 	/** Callsign -> gate it is going to or standing on. */
@@ -195,6 +210,9 @@ private:
 
 	/** Aircraft that take the place of a parked model, until they are spawned. */
 	TSet<FName> ParkedModelStandIns;
+
+	/** "B77W|KLM" -> the gate whose parked model aircraft of that type and airline wear. */
+	TMap<FString, int32> LookGates;
 
 	/** Runway designator ("36L") -> time from which the next departure or crossing may use it. */
 	TMap<FString, float> RunwayFreeAt;

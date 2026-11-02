@@ -91,7 +91,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ATC|Pushback", meta = (Units = "m"))
 	float ReserveAheadM = 700.f;
 
-	/** Optional tug model, attached to the nose gear while pushing. */
+	/**
+	 * Tug attached to the nose gear while pushing. Default: APushbackTug, which drives off to the side once it has
+	 * disconnected and goes back to the stand. Another actor class (a tug model of the project) is removed at the end
+	 * like before; empty = no tug.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ATC|Pushback")
 	TSubclassOf<AActor> TugClass;
 
@@ -103,6 +107,9 @@ private:
 	void StartTugConnect();
 	void StartPushing();
 	void Finish();
+	/** The tug has disconnected: a vehicle tug drives away to the side before the aircraft taxis. */
+	void ReleaseTug();
+	void DestroyTug();
 
 	UFUNCTION()
 	void HandlePathEnd();
@@ -122,4 +129,5 @@ private:
 	/** Holds the pushback path, logged once per aircraft it waits for. */
 	TWeakObjectPtr<AActor> WaitingFor;
 	FTimerHandle Timer;
+	FTimerHandle TugTimer;
 };

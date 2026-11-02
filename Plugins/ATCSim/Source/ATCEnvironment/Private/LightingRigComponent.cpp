@@ -115,15 +115,13 @@ void ULightingRigComponent::BeginPlay()
 			DayIlluminanceLux = Sun->GetLightComponent()->Intensity;
 		}
 	}
-	if (Clouds)
+	CloudComponent = Clouds ? Clouds->FindComponentByClass<UVolumetricCloudComponent>() : nullptr;
+	if (CloudComponent && CloudComponent->GetMaterial())
 	{
-		UVolumetricCloudComponent* CloudComponent = Clouds->FindComponentByClass<UVolumetricCloudComponent>();
-		if (CloudComponent && CloudComponent->GetMaterial())
-		{
-			CloudMaterial = UMaterialInstanceDynamic::Create(CloudComponent->GetMaterial(), this);
-			CloudComponent->SetMaterial(CloudMaterial);
-		}
+		CloudMaterial = UMaterialInstanceDynamic::Create(CloudComponent->GetMaterial(), this);
+		CloudComponent->SetMaterial(CloudMaterial);
 	}
+	Collection = EnvironmentParameters.LoadSynchronous();
 	if (Atmosphere)
 	{
 		BaseMieScattering = Atmosphere->GetComponent()->MieScatteringScale;
@@ -211,18 +209,15 @@ void ULightingRigComponent::Recompose()
 		Atmosphere->GetComponent()->SetMieScatteringScale(BaseMieScattering * (1.f + 4.f * Haze));
 	}
 
-	if (Clouds)
+	if (CloudComponent)
 	{
-		if (UVolumetricCloudComponent* CloudComponent = Clouds->FindComponentByClass<UVolumetricCloudComponent>())
-		{
-			CloudComponent->SetLayerBottomAltitude(FMath::Max(Weather.CloudBaseFt * ATCUnits::FeetToCm / 100000.f, 0.1f));
-		}
-		if (CloudMaterial)
-		{
-			CloudMaterial->SetScalarParameterValue(TEXT("Cloud_GlobalCoverage"), FMath::Lerp(CloudCoverageRange.X, CloudCoverageRange.Y, Weather.CloudCoverage));
-			const float Storm = Weather.Precipitation == EPrecipitationType::Rain ? Weather.PrecipitationRate * 0.7f : 0.f;
-			CloudMaterial->SetScalarParameterValue(TEXT("StormClouds"), Storm);
-		}
+		CloudComponent->SetLayerBottomAltitude(FMath::Max(Weather.CloudBaseFt * ATCUnits::FeetToCm / 100000.f, 0.1f));
+	}
+	if (CloudMaterial)
+	{
+		CloudMaterial->SetScalarParameterValue(TEXT("Cloud_GlobalCoverage"), FMath::Lerp(CloudCoverageRange.X, CloudCoverageRange.Y, Weather.CloudCoverage));
+		const float Storm = Weather.Precipitation == EPrecipitationType::Rain ? Weather.PrecipitationRate * 0.7f : 0.f;
+		CloudMaterial->SetScalarParameterValue(TEXT("StormClouds"), Storm);
 	}
 
 	if (PostProcess)
@@ -233,7 +228,7 @@ void ULightingRigComponent::Recompose()
 		PostProcess->Settings.AutoExposureBias = NightExposureBias * Darkness;
 	}
 
-	if (UMaterialParameterCollection* Collection = EnvironmentParameters.LoadSynchronous())
+	if (Collection)
 	{
 		UKismetMaterialLibrary::SetScalarParameterValue(this, Collection, TEXT("Wetness"), Weather.Wetness);
 		UKismetMaterialLibrary::SetScalarParameterValue(this, Collection, TEXT("SnowCover"), Weather.SnowCover);
@@ -245,7 +240,29 @@ void ULightingRigComponent::Recompose()
 	}
 
 	UpdatePrecipitation();
-	bRecapturePending = true;
+	RequestRecaptureIfChanged();
+}
+
+void ULightingRigComponent::RequestRecaptureIfChanged()
+{
+	const float Yaw = SunRotation.Yaw;
+	const float Visibility = FMath::Max(Weather.VisibilityM, 10.f);
+	const bool bChanged = !bHasCaptured
+		|| FMath::Abs(SunElevation - CapturedElevation) >= 1.f
+		|| FMath::Abs(FMath::FindDeltaAngleDegrees(CapturedYaw, Yaw)) >= 2.f
+		|| FMath::Abs(Weather.CloudCoverage - CapturedCoverage) >= 0.05f
+		|| FMath::Abs(FMath::Loge(Visibility / FMath::Max(CapturedVisibility, 10.f))) >= 0.2f
+		|| FMath::Abs(Night - CapturedNight) >= 0.05f;
+	if (bChanged)
+	{
+		bRecapturePending = true;
+		bHasCaptured = true;
+		CapturedElevation = SunElevation;
+		CapturedYaw = Yaw;
+		CapturedCoverage = Weather.CloudCoverage;
+		CapturedVisibility = Visibility;
+		CapturedNight = Night;
+	}
 }
 
 void ULightingRigComponent::UpdatePrecipitation()
@@ -296,9 +313,9 @@ void ULightingRigComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 		UpdatePrecipitation();
 	}
 
-	// A sky light without real-time capture is recaptured at most once per second
+	// A sky light without real-time capture is recaptured after a visible change, at most once every two seconds
 	RecaptureTimer += DeltaTime;
-	if (bRecapturePending && RecaptureTimer >= 1.f && SkyLight)
+	if (bRecapturePending && RecaptureTimer >= 2.f && SkyLight)
 	{
 		USkyLightComponent* SkyComponent = SkyLight->GetLightComponent();
 		if (!SkyComponent->bRealTimeCapture)

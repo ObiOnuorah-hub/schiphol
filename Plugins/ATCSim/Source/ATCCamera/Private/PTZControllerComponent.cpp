@@ -116,6 +116,8 @@ FText UPTZControllerComponent::GetLensName() const
 
 void UPTZControllerComponent::StartTurn(float ToPan, float ToTilt, float Duration)
 {
+	// A preset or a set direction takes over from the joystick, also while that is still slowing down
+	PanRate = TiltRate = 0.f;
 	StartPan = PanDeg;
 	StartTilt = TiltDeg;
 	TargetTilt = FMath::Clamp(ToTilt, TiltLimitsDeg.X, TiltLimitsDeg.Y);
@@ -146,6 +148,7 @@ void UPTZControllerComponent::StartTurn(float ToPan, float ToTilt, float Duratio
 
 void UPTZControllerComponent::StartZoom(float ToFocalMm, float Duration)
 {
+	ZoomRate = 0.f;
 	StartFocalMm = FocalLengthMm;
 	TargetFocalMm = FMath::Clamp(ToFocalMm, FocalLimitsMm.X, FocalLimitsMm.Y);
 	if (Duration <= 0.f)
@@ -186,38 +189,55 @@ void UPTZControllerComponent::TickComponent(float DeltaTime, ELevelTick TickType
 	const bool bHasInput = !FMath::IsNearlyZero(PanInput) || !FMath::IsNearlyZero(TiltInput) || !FMath::IsNearlyZero(ZoomInput);
 	if (bHasInput)
 	{
-		// Manual input takes over from a running preset or lens change. Slower when zoomed in, or the picture flies away
+		// Manual input takes over from a running preset or lens change
 		bTurning = bZooming = false;
 		bAtPreset = false;
-		const float Scale = GetFieldOfView() / ULensLibrary::FocalLengthToFOV(FocalLimitsMm.X, SensorWidthMm);
-		const float NewPan = PanDeg + FMath::Clamp(PanInput, -1.f, 1.f) * PanSpeedDegS * Scale * DeltaTime;
+	}
+
+	// The joystick speed: slower when zoomed in, or the picture flies away. It follows the stick in InputSmoothingSeconds,
+	// so the picture starts and stops smoothly (the first frames of a key press are not a jump to full speed)
+	const float Scale = GetFieldOfView() / ULensLibrary::FocalLengthToFOV(FocalLimitsMm.X, SensorWidthMm);
+	const float WantPan = FMath::Clamp(PanInput, -1.f, 1.f) * PanSpeedDegS * Scale;
+	const float WantTilt = FMath::Clamp(TiltInput, -1.f, 1.f) * TiltSpeedDegS * Scale;
+	const float WantZoom = FMath::Clamp(ZoomInput, -1.f, 1.f);
+	const float Follow = InputSmoothingSeconds > 0.f ? 1.f - FMath::Exp(-DeltaTime / InputSmoothingSeconds) : 1.f;
+	PanRate += (WantPan - PanRate) * Follow;
+	TiltRate += (WantTilt - TiltRate) * Follow;
+	ZoomRate += (WantZoom - ZoomRate) * Follow;
+	if (!bHasInput)
+	{
+		// Come to rest: what is left after the stick was let go is less than the eye sees
+		PanRate = FMath::Abs(PanRate) < 0.005f * Scale ? 0.f : PanRate;
+		TiltRate = FMath::Abs(TiltRate) < 0.005f * Scale ? 0.f : TiltRate;
+		ZoomRate = FMath::Abs(ZoomRate) < 0.002f ? 0.f : ZoomRate;
+	}
+
+	if (!bTurning && (PanRate != 0.f || TiltRate != 0.f))
+	{
+		const float NewPan = PanDeg + PanRate * DeltaTime;
 		PanDeg = IsContinuousPan() ? FRotator::NormalizeAxis(NewPan) : FMath::Clamp(NewPan, PanLimitsDeg.X, PanLimitsDeg.Y);
-		TiltDeg = FMath::Clamp(TiltDeg + FMath::Clamp(TiltInput, -1.f, 1.f) * TiltSpeedDegS * Scale * DeltaTime, TiltLimitsDeg.X, TiltLimitsDeg.Y);
-		if (!FMath::IsNearlyZero(ZoomInput))
+		TiltDeg = FMath::Clamp(TiltDeg + TiltRate * DeltaTime, TiltLimitsDeg.X, TiltLimitsDeg.Y);
+	}
+	else if (bTurning)
+	{
+		TurnAlpha = FMath::Min(TurnAlpha + DeltaTime / TurnDuration, 1.f);
+		const float T = FMath::SmoothStep(0.f, 1.f, TurnAlpha);
+		PanDeg = FMath::Lerp(StartPan, TargetPan, T);
+		TiltDeg = FMath::Lerp(StartTilt, TargetTilt, T);
+		bTurning = TurnAlpha < 1.f;
+		if (!bTurning && IsContinuousPan())
 		{
-			LensIndex = INDEX_NONE;
-			FocalLengthMm = FMath::Clamp(FocalLengthMm * FMath::Pow(ZoomRatePerSecond, FMath::Clamp(ZoomInput, -1.f, 1.f) * DeltaTime),
-				FocalLimitsMm.X, FocalLimitsMm.Y);
+			PanDeg = FRotator::NormalizeAxis(PanDeg);
 		}
 	}
-	else
+	if (!bZooming && ZoomRate != 0.f)
 	{
-		if (bTurning)
-		{
-			TurnAlpha = FMath::Min(TurnAlpha + DeltaTime / TurnDuration, 1.f);
-			const float T = FMath::SmoothStep(0.f, 1.f, TurnAlpha);
-			PanDeg = FMath::Lerp(StartPan, TargetPan, T);
-			TiltDeg = FMath::Lerp(StartTilt, TargetTilt, T);
-			bTurning = TurnAlpha < 1.f;
-			if (!bTurning && IsContinuousPan())
-			{
-				PanDeg = FRotator::NormalizeAxis(PanDeg);
-			}
-		}
-		if (bZooming)
-		{
-			TickZoom(DeltaTime);
-		}
+		LensIndex = INDEX_NONE;
+		FocalLengthMm = FMath::Clamp(FocalLengthMm * FMath::Pow(ZoomRatePerSecond, ZoomRate * DeltaTime), FocalLimitsMm.X, FocalLimitsMm.Y);
+	}
+	else if (bZooming)
+	{
+		TickZoom(DeltaTime);
 	}
 	PanInput = TiltInput = ZoomInput = 0.f;
 	Apply();

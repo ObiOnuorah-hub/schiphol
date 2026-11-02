@@ -45,27 +45,32 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Splines")
 	USplineComponent* LandingSpline;
 
-	// Flight Parameters
+	// Flight parameters. Speeds in knots, accelerations in knots per second (1 kt = 0.514 m/s)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aircraft|Speed")
-	float PushbackSpeed = 5.0f;
+	float PushbackSpeed = 3.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aircraft|Speed")
 	float TaxiSpeed = 20.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aircraft|Speed")
-	float TaxiAcceleration = 5.0f;
+	float TaxiAcceleration = 1.5f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aircraft|Speed")
 	float TakeoffMaxSpeed = 150.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aircraft|Speed")
-	float TakeoffAcceleration = 30.0f;
+	float TakeoffAcceleration = 4.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aircraft|Speed")
-	float LandingStartSpeed = 100.0f;
+	float LandingStartSpeed = 130.0f;
 
+	/** Braking after touchdown, down to TaxiSpeed; then it rolls on to the end of the landing spline and stops there. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aircraft|Speed")
-	float LandingDeceleration = 20.0f;
+	float LandingDeceleration = 5.0f;
+
+	/** The pushback spline starts at the gate: the aircraft goes along it tail first, its nose pointing back to the gate. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aircraft|Speed")
+	bool bPushbackTailFirst = true;
 
 	// State variables
 	EFlightPhase CurrentPhase;

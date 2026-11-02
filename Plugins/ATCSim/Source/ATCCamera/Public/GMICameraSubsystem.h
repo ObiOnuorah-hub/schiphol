@@ -51,8 +51,15 @@ struct ATCCAMERA_API FGMICaptureState
 	/** How much its screens matter now: bigger and nearer the middle of the view is more; the operated camera highest. */
 	float Priority = 0.f;
 	float LiveRateHz = 20.f;
-	/** Pictures owed: grows with the rate; a picture is taken from 1. */
-	float Credit = 1.f;
+	/** Frames since its last picture; -1 = the next picture comes at once (its screen just came into view). */
+	int32 FramesSincePicture = -1;
+	/**
+	 * Frames between two pictures: the rate in whole frames, so the pictures come at an even pace (20 Hz at 55 fps
+	 * would otherwise be 3, 3, 2, 3, 3, 2 frames apart: a picture that judders).
+	 */
+	int32 IntervalFrames = 0;
+	/** Frame time, smoothed over about a second (the interval must not flip with every frame). */
+	float FrameSeconds = 0.f;
 	/** Set by the planner: renders at LiveRateHz. */
 	bool bLive = false;
 };
@@ -115,8 +122,10 @@ public:
 
 	/**
 	 * One frame of capture planning, without the world (tests): the MaxLive viewed cameras with the highest priority
-	 * are live, the other viewed ones get BackgroundRateHz, the rest nothing. Credits grow with the rate; OutCapture
-	 * gets the cameras to render now, most overdue first, at most MaxPerFrame.
+	 * are live, the other viewed ones get BackgroundRateHz, the rest nothing. Every camera renders every IntervalFrames
+	 * frames; OutCapture gets the cameras to render now, most overdue first, at most MaxPerFrame. A camera that is just
+	 * due waits one frame when another one already renders in this frame (one capture per frame where it can: an even
+	 * GPU load instead of a heavy frame now and then), and keeps its rhythm after that.
 	 */
 	static void PlanCaptures(TArray<FGMICaptureState>& States, float DeltaTime, int32 MaxLive, float BackgroundRateHz, int32 MaxPerFrame,
 		TArray<int32>& OutCapture);

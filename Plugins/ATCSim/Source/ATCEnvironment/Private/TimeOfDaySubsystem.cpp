@@ -7,6 +7,9 @@
 namespace
 {
 	constexpr float SunriseElevation = -0.833f;   // standard: refraction plus the sun's radius
+
+	/** The light turns again after the sun has moved this far (elevation or azimuth). */
+	constexpr float SunStepDeg = 0.1f;
 }
 
 void UTimeOfDaySubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -141,9 +144,17 @@ void UTimeOfDaySubsystem::Update(bool bJumped)
 
 	if (ULightingRigComponent* Rig = LightingRig.Get())
 	{
-		// Airport lighting fades in from 2 degrees above the horizon to civil twilight
-		const float NightAmount = 1.f - FMath::SmoothStep(-6.f, 2.f, Elevation);
-		Rig->SetSun(SunLightRotation(Elevation, Azimuth, NorthOffsetDeg), Elevation, NightAmount);
+		const bool bVisibleStep = FMath::Abs(Elevation - PushedElevation) >= SunStepDeg
+			|| FMath::Abs(FMath::FindDeltaAngleDegrees(PushedAzimuth, Azimuth)) >= SunStepDeg;
+		if (bJumped || !bHasPushed || bVisibleStep)
+		{
+			// Airport lighting fades in from 2 degrees above the horizon to civil twilight
+			const float NightAmount = 1.f - FMath::SmoothStep(-6.f, 2.f, Elevation);
+			Rig->SetSun(SunLightRotation(Elevation, Azimuth, NorthOffsetDeg), Elevation, NightAmount);
+			PushedElevation = Elevation;
+			PushedAzimuth = Azimuth;
+			bHasPushed = true;
+		}
 	}
 
 	LastUpdate = Now;

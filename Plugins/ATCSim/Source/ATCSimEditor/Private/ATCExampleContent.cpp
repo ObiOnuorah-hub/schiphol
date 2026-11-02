@@ -375,6 +375,36 @@ namespace ATCExample
 	}
 
 	/**
+	 * The static mesh of a model folder that is the whole aircraft: the biggest one that is about as wide as it is long
+	 * (fuselage and wings together). Empty when the model is split into parts or the folder is not in the project.
+	 */
+	FString FindWholeModel(const FString& Folder)
+	{
+		const IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		TArray<FAssetData> Assets;
+		Registry.GetAssetsByPath(FName(*Folder), Assets, true);
+		UStaticMesh* Best = nullptr;
+		double BestArea = 0.0;
+		for (const FAssetData& Asset : Assets)
+		{
+			if (Asset.AssetClassPath != UStaticMesh::StaticClass()->GetClassPathName())
+			{
+				continue;
+			}
+			UStaticMesh* Mesh = Cast<UStaticMesh>(Asset.GetAsset());
+			const FVector Size = Mesh ? Mesh->GetBoundingBox().GetSize() : FVector::ZeroVector;
+			const double Long = FMath::Max(Size.X, Size.Y);
+			const double Wide = FMath::Min(Size.X, Size.Y);
+			if (Long > 0.0 && Wide / Long >= 0.6 && Long * Wide > BestArea)
+			{
+				Best = Mesh;
+				BestArea = Long * Wide;
+			}
+		}
+		return Best ? Best->GetPathName() : FString();
+	}
+
+	/**
 	 * Every aircraft type with the models in the project: Content/staticmeshplane and the Datasmith aircraft. The first model
 	 * of a type is its own Mesh, the others are liveries of the airline that flies them.
 	 */
@@ -397,8 +427,18 @@ namespace ATCExample
 		FitMesh(E190, *Model(TEXT("KLM_Cityhopper/KLM_Cityhopper/Geometries/Group_281.Group_281")));
 
 		// Wide-bodies (code E gates) and the A380 (code F)
+		// KLM in its normal colours where the project has that model as one mesh; the others are the older ones
+		const FString Klm789 = FindWholeModel(Datasmith + TEXT("KLM_Boeing_787_9_Dreamliner"));
+		const FString Klm77W = FindWholeModel(Datasmith + TEXT("KLM_Boeing_777_306_ER"));
 		UAircraftTypeData* B789 = MakeAircraftType(TEXT("B789"), TEXT("Boeing 787-9"), EAerodromeCode::E, EWakeCategory::Heavy, 60.1f, 62.8f, 25.9f, 25.f, 2.5f);
-		FitMesh(B789, *Model(TEXT("787-9_KLM/787-9_KLM/Geometries/Group_2.Group_2")), FRotator(0.f, -90.f, 0.f));
+		if (!Klm789.IsEmpty())
+		{
+			FitMesh(B789, *Klm789);
+		}
+		else
+		{
+			FitMesh(B789, *Model(TEXT("787-9_KLM/787-9_KLM/Geometries/Group_2.Group_2")), FRotator(0.f, -90.f, 0.f));
+		}
 		UAircraftTypeData* B78X = MakeAircraftType(TEXT("B78X"), TEXT("Boeing 787-10"), EAerodromeCode::E, EWakeCategory::Heavy, 60.1f, 68.3f, 30.0f, 25.f, 2.5f);
 		FitMesh(B78X, *Model(TEXT("787-10_KLM/787-10_KLM_100_jaar/Geometries/Group_3.Group_3")));
 		UAircraftTypeData* B788 = MakeAircraftType(TEXT("B788"), TEXT("Boeing 787-8"), EAerodromeCode::E, EWakeCategory::Heavy, 60.1f, 56.7f, 22.8f, 25.f, 2.5f);
@@ -406,7 +446,10 @@ namespace ATCExample
 		FitMesh(B788, *Plane(TEXT("787norwegian")), FRotator(0.f, -90.f, 0.f));
 		UAircraftTypeData* B77W = MakeAircraftType(TEXT("B77W"), TEXT("Boeing 777-300ER"), EAerodromeCode::E, EWakeCategory::Heavy, 64.8f, 73.9f, 31.2f, 25.f, 2.5f);
 		FitMesh(B77W, *Plane(TEXT("777koreanair")));
-		AddLivery(B77W, TEXT("KLM"), *Model(TEXT("777-306_KLM_orange_pride/777-306_KLM_orange_pride/Geometries/Group_101.Group_101")));
+		// The "orange pride" 777 is a special livery: only when the normal KLM 777 is not in the project
+		AddLivery(B77W, TEXT("KLM"), Klm77W.IsEmpty() ? *Model(TEXT("777-306_KLM_orange_pride/777-306_KLM_orange_pride/Geometries/Group_101.Group_101")) : *Klm77W);
+		UE_LOG(LogATC, Display, TEXT("ATC: KLM 787-9 model %s, KLM 777 model %s"), Klm789.IsEmpty() ? TEXT("787-9_KLM (Group_2)") : *Klm789,
+			Klm77W.IsEmpty() ? TEXT("orange pride (no normal KLM 777 as one mesh)") : *Klm77W);
 		AddLivery(B77W, TEXT("ANZ"), *Plane(TEXT("777airnewzealand")));
 		AddLivery(B77W, TEXT("AAL"), *Plane(TEXT("777americanairline")));
 		UAircraftTypeData* B77L = MakeAircraftType(TEXT("B77L"), TEXT("Boeing 777F"), EAerodromeCode::E, EWakeCategory::Heavy, 64.8f, 63.7f, 25.9f, 25.f, 2.5f);

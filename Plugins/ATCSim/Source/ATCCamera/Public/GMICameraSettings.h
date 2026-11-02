@@ -33,6 +33,13 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Budget", meta = (ClampMin = "1"))
 	int32 MaxCapturesPerFrame = 2;
 
+	/**
+	 * The camera the operator is moving (pan, tilt, zoom, a preset) renders at least this often while it moves, so the
+	 * picture follows the joystick smoothly. Back to its own CaptureRateHz once it stands still. Scaled like the live rate.
+	 */
+	UPROPERTY(Config, EditAnywhere, Category = "Budget", meta = (Units = "Hz", ClampMin = "0"))
+	float MovingRateHz = 30.f;
+
 	/** Mapping for the camera the operator moves (added with priority 1 when play starts). */
 	UPROPERTY(Config, EditAnywhere, Category = "Input")
 	TSoftObjectPtr<UInputMappingContext> InputContext;

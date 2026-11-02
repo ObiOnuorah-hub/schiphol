@@ -3,6 +3,11 @@
 
 #include "AircraftIdentityComponent.h"
 #include "AircraftSpawnSubsystem.h"
+#include "AirportVehicle.h"
+#include "ATCSimClockSubsystem.h"
+#include "GroundServiceSubsystem.h"
+#include "MetarReport.h"
+#include "WeatherSubsystem.h"
 #include "AirportData.h"
 #include "ATCSimSettings.h"
 #include "TrafficSubsystem.h"
@@ -32,6 +37,7 @@
 #include "Components/SplineComponent.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "GameFramework/WorldSettings.h"
 #include "Misc/AutomationTest.h"
 
@@ -118,10 +124,27 @@ bool FATCPTZTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("zoom at the preset"), PTZ->FocalLengthMm, 400.f, 0.01f);
 	TestEqual(TEXT("the capture gets the field of view of 400 mm"), Camera->Capture->FOVAngle, 5.15f, 0.01f);
 
-	// Full joystick for one second at 400 mm: 40 deg/s scaled with the field of view
+	// Full joystick for one second at 400 mm: 40 deg/s scaled with the field of view (the speed law without the ramp)
+	PTZ->InputSmoothingSeconds = 0.f;
 	const float Before = PTZ->PanDeg;
 	Run(1.f, [PTZ]() { PTZ->AddPanInput(1.f); });
-	TestEqual(TEXT("slower when zoomed in"), PTZ->PanDeg - Before, 40.f * ULensLibrary::FocalLengthToFOV(400.f) / ULensLibrary::FocalLengthToFOV(24.f), 0.05f);
+	const float FullSpeed = 40.f * ULensLibrary::FocalLengthToFOV(400.f) / ULensLibrary::FocalLengthToFOV(24.f);
+	TestEqual(TEXT("slower when zoomed in"), PTZ->PanDeg - Before, FullSpeed, 0.05f);
+
+	// With the ramp a key press starts and ends softly: less than full speed in the first frame, rolling on a little
+	// after the key is let go, then at rest
+	PTZ->InputSmoothingSeconds = 0.12f;
+	Run(0.5f);
+	const float BeforeRamp = PTZ->PanDeg;
+	Run(1.f / 30.f, [PTZ]() { PTZ->AddPanInput(1.f); });
+	const float FirstFrame = PTZ->PanDeg - BeforeRamp;
+	TestTrue(TEXT("smooth start"), FirstFrame > 0.f && FirstFrame < 0.5f * FullSpeed / 30.f);
+	Run(0.5f, [PTZ]() { PTZ->AddPanInput(1.f); });
+	const float AtRelease = PTZ->PanDeg;
+	TestTrue(TEXT("still moving when the key is let go"), PTZ->IsActive());
+	Run(1.5f);
+	TestTrue(TEXT("rolls on a little after the key is let go"), PTZ->PanDeg > AtRelease && PTZ->PanDeg - AtRelease < 0.25f * FullSpeed);
+	TestFalse(TEXT("and comes to rest"), PTZ->IsActive());
 
 	PTZ->SetPanTilt(200.f, 30.f, false);
 	TestEqual(TEXT("pan clamped"), PTZ->PanDeg, 170.f, 0.01f);
@@ -209,6 +232,27 @@ bool FATCCaptureBudgetTest::RunTest(const FString& Parameters)
 		Total += Capture.Num();
 	}
 	TestEqual(TEXT("two pictures every frame"), Total, 120);
+
+	// 20 Hz at 55 fps: always the same number of frames between two pictures (no 3-3-2 judder)
+	TArray<FGMICaptureState> One;
+	One.Init(FGMICaptureState(), 1);
+	One[0].bViewed = true;
+	One[0].LiveRateHz = 20.f;
+	TArray<int32> Gaps;
+	int32 LastFrame = -1;
+	for (int32 Frame = 0; Frame < 300; ++Frame)
+	{
+		UGMICameraSubsystem::PlanCaptures(One, 1.f / 55.f, 2, 5.f, 2, Capture);
+		if (Capture.Num() > 0)
+		{
+			if (LastFrame >= 0)
+			{
+				Gaps.Add(Frame - LastFrame);
+			}
+			LastFrame = Frame;
+		}
+	}
+	TestTrue(TEXT("pictures at an even pace"), Gaps.Num() > 50 && !Gaps.ContainsByPredicate([&Gaps](int32 Gap) { return Gap != Gaps[0]; }));
 	return true;
 }
 
@@ -1225,6 +1269,343 @@ bool FATCDeadlockTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("NORTH1 let go of the crossing"), To < 55000.f);
 	TestNull(TEXT("EAST1 now gets the crossing"), Ask(EastOne, East, nullptr));
 	TestTrue(TEXT("EAST1 reserved through it"), Network->GetClaim(EastOne, Route, From, To) && To > 65000.f);
+	ATCTest::DestroyPlayWorld(World);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCMetarTest, "ATCSim.Environment.Metar", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/** The METARs of the presets and some real ones come out as the weather they describe; text that is no METAR is refused. */
+bool FATCMetarTest::RunTest(const FString& Parameters)
+{
+	FMetarReport Report;
+	TestTrue(TEXT("CAVOK parses"), FMetarReport::Parse(TEXT("EHAM 131125Z 24008KT CAVOK 16/07 Q1021 NOSIG"), Report));
+	TestEqual(TEXT("station"), Report.Station, FString(TEXT("EHAM")));
+	TestEqual(TEXT("wind direction"), Report.WindDirectionDeg, 240.f, 0.01f);
+	TestEqual(TEXT("wind speed"), Report.WindSpeedKt, 8.f, 0.01f);
+	TestTrue(TEXT("CAVOK: no clouds"), Report.bCavok && Report.CloudCoverage == 0.f);
+	TestEqual(TEXT("QNH"), Report.QnhHpa, 1021.f, 0.01f);
+	const FWeatherState Clear = Report.ToWeatherState(FWeatherState());
+	TestTrue(TEXT("clear air: far visibility and full sun"), Clear.VisibilityM > 20000.f && Clear.SunIntensityScale > 0.95f);
+
+	TestTrue(TEXT("rain parses"), FMetarReport::Parse(TEXT("METAR EHAM 131125Z 21018G28KT 4000 RA BKN008 OVC015 11/10 Q1004"), Report));
+	TestEqual(TEXT("gusts"), Report.GustKt, 28.f, 0.01f);
+	TestTrue(TEXT("moderate rain"), Report.Precipitation == EPrecipitationType::Rain && FMath::IsNearlyEqual(Report.PrecipitationRate, 0.65f, 0.001f));
+	TestEqual(TEXT("ceiling is the broken layer"), Report.CloudBaseFt, 800.f, 0.1f);
+	const FWeatherState Rain = Report.ToWeatherState(FWeatherState());
+	TestTrue(TEXT("wet, dim and soft"), Rain.Wetness > 0.9f && Rain.SunIntensityScale < 0.35f && Rain.SunSourceAngle > 5.f);
+
+	TestTrue(TEXT("fog parses"), FMetarReport::Parse(TEXT("EHAM 130625Z 00000KT 0300 FG VV001 06/06 Q1025"), Report));
+	TestTrue(TEXT("fog with a vertical visibility"), Report.bFog && Report.CloudCoverage == 1.f && FMath::IsNearlyEqual(Report.CloudBaseFt, 100.f));
+	FWeatherState Before;
+	Before.WindDirectionDeg = 123.f;
+	TestEqual(TEXT("calm keeps the wind direction it had"), Report.ToWeatherState(Before).WindDirectionDeg, 123.f, 0.01f);
+
+	TestTrue(TEXT("snow parses"), FMetarReport::Parse(TEXT("EHAM 130925Z 03010KT 1500 SN BKN006 OVC012 M01/M02 Q1009"), Report));
+	TestTrue(TEXT("snow below zero"), Report.Precipitation == EPrecipitationType::Snow && FMath::IsNearlyEqual(Report.TemperatureC, -1.f));
+	TestTrue(TEXT("snow on the ground"), Report.ToWeatherState(FWeatherState()).SnowCover > 0.5f);
+
+	TestTrue(TEXT("rain and snow at +3 C is rain"), FMetarReport::Parse(TEXT("EHAM 021225Z 25015KT 3000 -RASN BKN010 03/01 Q1002"), Report)
+		&& Report.Precipitation == EPrecipitationType::Rain);
+	TestTrue(TEXT("rain and snow at 0 C is snow"), FMetarReport::Parse(TEXT("EHAM 021225Z 25015KT 3000 -RASN BKN010 00/M01 Q1002"), Report)
+		&& Report.Precipitation == EPrecipitationType::Snow);
+	TestTrue(TEXT("thunderstorm, trend ignored"), FMetarReport::Parse(TEXT("EHAM 021225Z 22012G24KT 190V260 9999 R18R/1200N +TSRA FEW012 BKN025CB 12/08 Q1018 TEMPO 4000 SHRA"), Report)
+		&& Report.bThunderstorm && Report.PrecipitationRate == 1.f && Report.bTenKmOrMore);
+	TestTrue(TEXT("showers nearby do not rain here"), FMetarReport::Parse(TEXT("EHAM 021225Z 22012KT 9999 VCSH RERA SCT020 12/08 Q1018"), Report)
+		&& Report.Precipitation == EPrecipitationType::None && Report.bRecentPrecipitation);
+	TestTrue(TEXT("US units"), FMetarReport::Parse(TEXT("METAR KJFK 021251Z 31015G25KT 1 1/2SM BR OVC008 07/06 A2992 RMK AO2"), Report)
+		&& FMath::IsNearlyEqual(Report.VisibilityM, 1.5f * 1609.34f, 1.f) && FMath::IsNearlyEqual(Report.QnhHpa, 1013.2f, 0.5f));
+	TestTrue(TEXT("wind in m/s"), FMetarReport::Parse(TEXT("UUEE 021230Z 27005MPS 9999 SCT030 M05/M10 Q1020"), Report)
+		&& FMath::IsNearlyEqual(Report.WindSpeedKt, 9.72f, 0.05f));
+	TestTrue(TEXT("first station of a longer answer"), FMetarReport::Parse(TEXT("\nEHAM 021225Z AUTO 22012KT 9999 NCD 12/08 Q1018\nEHRD 021225Z 23010KT CAVOK 12/07 Q1018\n"), Report)
+		&& Report.Station == TEXT("EHAM"));
+	TestFalse(TEXT("an HTML page is no METAR"), FMetarReport::Parse(TEXT("<html><body>Not found</body></html>"), Report));
+	TestFalse(TEXT("an empty answer is no METAR"), FMetarReport::Parse(FString(), Report));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCDynamicWeatherTest, "ATCSim.Environment.DynamicWeather", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/** Weather that changes by itself stays plausible: no snow in summer, no fog in the afternoon, sometimes rain; snow and fog in winter mornings. */
+bool FATCDynamicWeatherTest::RunTest(const FString& Parameters)
+{
+	FRandomStream Random(7);
+	FWeatherState Weather;
+	int32 Snow = 0, AfternoonFog = 0, Rain = 0;
+	bool bInRange = true;
+	for (int32 Step = 0; Step < 2000; ++Step)
+	{
+		Weather = UWeatherSubsystem::MakeDynamicWeather(Random, Weather, 7, 15);
+		Snow += Weather.Precipitation == EPrecipitationType::Snow ? 1 : 0;
+		AfternoonFog += Weather.VisibilityM < 1000.f ? 1 : 0;
+		Rain += Weather.Precipitation == EPrecipitationType::Rain ? 1 : 0;
+		bInRange &= Weather.CloudCoverage >= 0.f && Weather.CloudCoverage <= 1.f && Weather.VisibilityM > 0.f && Weather.WindDirectionDeg >= 0.f
+			&& Weather.WindDirectionDeg < 360.f && Weather.SunIntensityScale > 0.f;
+	}
+	TestTrue(TEXT("every value in its range"), bInRange);
+	TestEqual(TEXT("no snow in July"), Snow, 0);
+	TestEqual(TEXT("no fog in the afternoon"), AfternoonFog, 0);
+	TestTrue(TEXT("sometimes rain"), Rain > 50);
+	int32 WinterSnow = 0, MorningFog = 0;
+	for (int32 Step = 0; Step < 2000; ++Step)
+	{
+		Weather = UWeatherSubsystem::MakeDynamicWeather(Random, Weather, 1, 6);
+		WinterSnow += Weather.Precipitation == EPrecipitationType::Snow ? 1 : 0;
+		MorningFog += Weather.VisibilityM < 1000.f ? 1 : 0;
+	}
+	TestTrue(TEXT("snow in January"), WinterSnow > 20);
+	TestTrue(TEXT("fog on winter mornings"), MorningFog > 20);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCRealTimeClockTest, "ATCSim.Core.RealTimeClock", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/** The clock on real time is the computer's UTC time; setting a time or another speed leaves it, ATC.RealTime goes back. */
+bool FATCRealTimeClockTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = ATCTest::MakePlayWorld(TEXT("ATCSimClockWorld"));
+	UATCSimClockSubsystem* Clock = World->GetSubsystem<UATCSimClockSubsystem>();
+	if (!TestNotNull(TEXT("clock"), Clock))
+	{
+		ATCTest::DestroyPlayWorld(World);
+		return false;
+	}
+	Clock->FollowRealTime();
+	ATCTest::Advance(World, 1.f);
+	TestTrue(TEXT("real time"), Clock->IsRealTime());
+	TestTrue(TEXT("on the computer's UTC time"), FMath::Abs((Clock->GetSimTimeUTC() - FDateTime::UtcNow()).GetTotalSeconds()) < 2.0);
+
+	const FDateTime Night(2026, 12, 21, 23, 0, 0);
+	Clock->SetSimTimeUTC(Night);
+	ATCTest::Advance(World, 2.f);
+	TestFalse(TEXT("a set time is no longer real time"), Clock->IsRealTime());
+	TestTrue(TEXT("and runs on from there"), FMath::Abs((Clock->GetSimTimeUTC() - Night).GetTotalSeconds() - 2.0) < 0.6);
+	Clock->FollowRealTime();
+	Clock->SetTimeScale(60.f);
+	TestFalse(TEXT("a faster clock is no longer real time"), Clock->IsRealTime());
+	Clock->FollowRealTime();
+	TestTrue(TEXT("back to real time at speed 1"), Clock->IsRealTime() && Clock->GetTimeScale() == 1.f);
+	TestTrue(TEXT("local time text"), Clock->GetLocalTimeString().EndsWith(TEXT(" LT")));
+	ATCTest::DestroyPlayWorld(World);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCNoseGearOnLineTest, "ATCSim.Aircraft.NoseGearOnLine", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * A long wide-body through tight 30 m corners: the main gear and the nose gear both stay on the line (the nose gear used to
+ * be a wheelbase further along the line, which put it about 30 cm outside it in such a turn).
+ */
+bool FATCNoseGearOnLineTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = ATCTest::MakePlayWorld(TEXT("ATCSimNoseGearWorld"));
+	ATaxiRoute* Route = ATCTest::MakeTaxiway(World, { FVector(0, 0, 0), FVector(20000, 0, 0), FVector(20000, 20000, 0), FVector(45000, 20000, 0) });
+	UAircraftTypeData* Type = NewObject<UAircraftTypeData>();
+	Type->WingspanM = 60.1f;
+	Type->LengthM = 62.8f;
+	Type->WheelbaseM = 25.9f;
+	Type->MaxTaxiSpeedKt = 15.f;
+	AATCAircraft* Aircraft = ATCTest::StartOnRoute(World, Type, TEXT("NOSE1"), Route, 0.f);
+	float MaxMain = 0.f, MaxNose = 0.f;
+	for (float Time = 0.f; Time < 300.f && Aircraft->TaxiController->GetState() != ETaxiState::Arrived; Time += 1.f / 30.f)
+	{
+		++GFrameCounter;
+		World->Tick(LEVELTICK_All, 1.f / 30.f);
+		MaxMain = FMath::Max(MaxMain, ATCTest::OffLine(Aircraft));
+		// Once a few metres along (the start is placed, not driven)
+		if (Aircraft->Movement->Distance > 3000.f && Aircraft->Movement->Distance < Route->GetLength() - Type->GetWheelbaseCm())
+		{
+			const FVector Nose = Aircraft->NoseGear->GetComponentLocation();
+			MaxNose = FMath::Max(MaxNose, float(FVector::Dist(Nose, Route->Spline->FindLocationClosestToWorldLocation(Nose, ESplineCoordinateSpace::World))));
+		}
+	}
+	TestTrue(TEXT("arrived"), Aircraft->TaxiController->GetState() == ETaxiState::Arrived);
+	TestTrue(TEXT("main gear on the line (within 1 cm)"), MaxMain < 1.f);
+	TestTrue(TEXT("nose gear on the line (within 3 cm)"), MaxNose < 3.f);
+	AddInfo(FString::Printf(TEXT("main gear at most %.2f cm, nose gear at most %.2f cm off the line"), MaxMain, MaxNose));
+	ATCTest::DestroyPlayWorld(World);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCVehicleDriveTest, "ATCSim.Vehicles.DriveAndPark", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/** A baggage train drives round two corners and parks on its spot facing the right way; one sent away is gone at the end. */
+bool FATCVehicleDriveTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = ATCTest::MakePlayWorld(TEXT("ATCSimVehicleWorld"));
+	const FTransform Start(FRotator::ZeroRotator, FVector::ZeroVector);
+	AAirportVehicle* Train = World->SpawnActorDeferred<AAirportVehicle>(AAirportVehicle::StaticClass(), Start, nullptr, nullptr, ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+	Train->Kind = EAirportVehicleKind::BaggageTrain;
+	Train->FinishSpawning(Start);
+	Train->DriveThrough({ FVector(3000, 0, 0), FVector(3000, 2500, 0), FVector(0, 2500, 0) }, 180.f, false);
+	ATCTest::Advance(World, 60.f);
+	TestFalse(TEXT("parked"), Train->IsDriving());
+	TestTrue(TEXT("on its spot (within 20 cm)"), FVector::Dist2D(Train->GetActorLocation(), FVector(0, 2500, 0)) < 20.f);
+	TestTrue(TEXT("facing the way it should"), FMath::Abs(FMath::FindDeltaAngleDegrees(Train->GetActorRotation().Yaw, 180.f)) < 2.f);
+
+	AAirportVehicle* Fuel = World->SpawnActorDeferred<AAirportVehicle>(AAirportVehicle::StaticClass(), Start, nullptr, nullptr, ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+	Fuel->Kind = EAirportVehicleKind::FuelTruck;
+	Fuel->FinishSpawning(Start);
+	const TWeakObjectPtr<AAirportVehicle> WeakFuel(Fuel);
+	// Backs up first, then drives off and is removed
+	Fuel->DriveThrough({ FVector(-1500, 0, 0), FVector(-1500, -3000, 0), FVector(2000, -3000, 0) }, 0.f, true, 1);
+	ATCTest::Advance(World, 60.f);
+	TestFalse(TEXT("removed at the end of its drive"), WeakFuel.IsValid());
+	ATCTest::DestroyPlayWorld(World);
+	return true;
+}
+
+namespace ATCTest
+{
+	struct FFootprint
+	{
+		double X0, X1, Y0, Y1;
+		bool Overlaps(const FFootprint& Other, double Margin = 0.0) const
+		{
+			return X0 < Other.X1 + Margin && Other.X0 < X1 + Margin && Y0 < Other.Y1 + Margin && Other.Y0 < Y1 + Margin;
+		}
+	};
+
+	/** Where a parked service vehicle stands (aircraft frame), carts included. */
+	FFootprint SpotFootprint(const FServiceSpot& Spot)
+	{
+		const FVector& P = Spot.Location;
+		switch (Spot.Kind)
+		{
+		case EAirportVehicleKind::BaggageTrain:  return { P.X - 150.0, P.X + 910.0, P.Y - 80.0, P.Y + 80.0 };   // facing the tail, carts towards the nose
+		case EAirportVehicleKind::FuelTruck:     return { P.X - 450.0, P.X + 450.0, P.Y - 122.0, P.Y + 122.0 };
+		default:                                 return { P.X - 122.0, P.X + 122.0, P.Y - 400.0, P.Y + 400.0 };   // square to the fuselage
+		}
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCServiceSpotsTest, "ATCSim.Vehicles.ServiceSpots", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * For a narrow-body, a wide-body and an A380 the service vehicles park clear of the fuselage, the main gear, the engines
+ * and each other, and their ways in and out stay clear of all of that too.
+ */
+bool FATCServiceSpotsTest::RunTest(const FString& Parameters)
+{
+	struct FKind
+	{
+		const TCHAR* ICAO;
+		float Span, Length, Wheelbase;
+		bool bFourEngines;
+	};
+	for (const FKind& Kind : { FKind{ TEXT("A320"), 35.8f, 37.6f, 12.6f, false }, FKind{ TEXT("B789"), 60.1f, 62.8f, 25.9f, false },
+		FKind{ TEXT("B77W"), 64.8f, 73.9f, 31.2f, false }, FKind{ TEXT("B744"), 64.4f, 70.7f, 25.6f, true }, FKind{ TEXT("A388"), 79.8f, 72.7f, 32.0f, true } })
+	{
+		UAircraftTypeData* Type = NewObject<UAircraftTypeData>();
+		Type->ICAOType = Kind.ICAO;
+		Type->WingspanM = Kind.Span;
+		Type->LengthM = Kind.Length;
+		Type->WheelbaseM = Kind.Wheelbase;
+		const double HalfSpan = Type->GetHalfSpanCm();
+		const double Nose = Type->GetNoseOffsetCm();
+		const double Fuselage = FMath::Max(HalfSpan * 0.11, 190.0);
+		// Keep out: fuselage, main gear, engines (a twin at a third of the half span; four engines at 0.37 and 0.64)
+		TArray<ATCTest::FFootprint> KeepOut = { { Nose - Type->GetLengthCm(), Nose, -Fuselage, Fuselage }, { -200.0, 200.0, -(0.27 * HalfSpan + 60.0), 0.27 * HalfSpan + 60.0 } };
+		const double EngineRadius = 0.06 * HalfSpan + 30.0;
+		for (const double Side : { 1.0, -1.0 })
+		{
+			for (const double At : Kind.bFourEngines ? TArray<double>{ 0.37, 0.64 } : TArray<double>{ 0.33 })
+			{
+				KeepOut.Add({ -0.15 * Nose, 0.5 * Nose, Side * At * HalfSpan - EngineRadius, Side * At * HalfSpan + EngineRadius });
+			}
+		}
+		const TArray<FServiceSpot> Spots = UGroundServiceSubsystem::PlanSpots(Type, true, true);
+		TestEqual(FString::Printf(TEXT("%s: baggage, fuel and catering"), Kind.ICAO), Spots.Num(), 3);
+		for (int32 Index = 0; Index < Spots.Num(); ++Index)
+		{
+			const ATCTest::FFootprint Parked = ATCTest::SpotFootprint(Spots[Index]);
+			for (const ATCTest::FFootprint& Zone : KeepOut)
+			{
+				TestFalse(FString::Printf(TEXT("%s: vehicle %d parks clear of the aircraft"), Kind.ICAO, Index), Parked.Overlaps(Zone, 30.0));
+			}
+			for (int32 Other = Index + 1; Other < Spots.Num(); ++Other)
+			{
+				TestFalse(FString::Printf(TEXT("%s: vehicles %d and %d park apart"), Kind.ICAO, Index, Other), Parked.Overlaps(ATCTest::SpotFootprint(Spots[Other]), 50.0));
+			}
+			// The ways in and out, a vehicle wide
+			for (const TArray<FVector>& Path : { UGroundServiceSubsystem::PathIn(Type, Spots[Index]), UGroundServiceSubsystem::PathOut(Type, Spots[Index]) })
+			{
+				bool bClear = true;
+				for (int32 Point = 0; Point + 1 < Path.Num(); ++Point)
+				{
+					const int32 Steps = FMath::CeilToInt(FVector::Dist2D(Path[Point], Path[Point + 1]) / 50.0) + 1;
+					for (int32 Step = 0; Step <= Steps; ++Step)
+					{
+						const FVector At = FMath::Lerp(Path[Point], Path[Point + 1], double(Step) / Steps);
+						const ATCTest::FFootprint Box = { At.X - 125.0, At.X + 125.0, At.Y - 125.0, At.Y + 125.0 };
+						for (const ATCTest::FFootprint& Zone : KeepOut)
+						{
+							bClear &= !Box.Overlaps(Zone);
+						}
+						for (int32 Other = 0; Other < Spots.Num(); ++Other)
+						{
+							bClear &= Other == Index || !Box.Overlaps(ATCTest::SpotFootprint(Spots[Other]));
+						}
+					}
+				}
+				TestTrue(FString::Printf(TEXT("%s: vehicle %d drives clear of the aircraft and the others"), Kind.ICAO, Index), bClear);
+			}
+		}
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCTurnaroundServiceTest, "ATCSim.Vehicles.TurnaroundService", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * An aircraft that parks on its stand gets its baggage train (and maybe fuel and catering) within a minute and a half;
+ * when it asks for pushback they all drive away and are gone a minute later. None of them stands on the fuselage.
+ */
+bool FATCTurnaroundServiceTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = ATCTest::MakePlayWorld(TEXT("ATCSimServiceWorld"));
+	UGroundServiceSubsystem* Ground = World->GetSubsystem<UGroundServiceSubsystem>();
+	if (!TestNotNull(TEXT("ground service"), Ground))
+	{
+		ATCTest::DestroyPlayWorld(World);
+		return false;
+	}
+	Ground->SetEnabled(true);
+	ATaxiRoute* Push = ATCTest::MakeRoute(World, { FVector(0, 0, 0), FVector(-6000, 0, 0) });
+	AStand* Stand = World->SpawnActor<AStand>(FVector::ZeroVector, FRotator::ZeroRotator);
+	FPushbackOption Option;
+	Option.Route = Push;
+	Stand->PushbackOptions = { Option };
+	// After the first seconds: an arrival, not an aircraft that was there when the map started
+	ATCTest::Advance(World, 8.f);
+
+	UAircraftTypeData* Type = ATCTest::MakeNarrowBody();
+	AATCAircraft* Aircraft = World->SpawnActor<AATCAircraft>(FVector::ZeroVector, FRotator::ZeroRotator);
+	Aircraft->SetAircraftType(Type);
+	Aircraft->Identity->Callsign = TEXT("SERV1");
+	Aircraft->Identity->Stand = Stand;
+	Stand->SetOccupant(Aircraft);
+	TestTrue(TEXT("parked on its stand"), UGroundServiceSubsystem::IsParkedAtStand(Aircraft));
+
+	const double Fuselage = FMath::Max(Type->GetHalfSpanCm() * 0.11, 190.0);
+	bool bOnFuselage = false;
+	for (float Time = 0.f; Time < 90.f; Time += 0.25f)
+	{
+		ATCTest::Advance(World, 0.25f);
+		for (TActorIterator<AAirportVehicle> It(World); It; ++It)
+		{
+			const FVector Local = Aircraft->GetActorTransform().InverseTransformPosition(It->GetActorLocation());
+			bOnFuselage |= FMath::Abs(Local.Y) < Fuselage && Local.X > Type->GetNoseOffsetCm() - Type->GetLengthCm() && Local.X < Type->GetNoseOffsetCm();
+		}
+	}
+	TestTrue(TEXT("its ground handling has come"), Ground->GetVehicleCount() >= 1);
+	TestFalse(TEXT("no vehicle on the fuselage"), bOnFuselage);
+	AddInfo(Ground->Describe());
+
+	FPushbackRequest Request;
+	TestTrue(TEXT("pushback asked for"), IAircraftCommands::Execute_RequestPushback(Aircraft, Request));
+	ATCTest::Advance(World, 60.f);
+	TestEqual(TEXT("all service vehicles gone after the pushback"), Ground->GetVehicleCount(), 0);
 	ATCTest::DestroyPlayWorld(World);
 	return true;
 }

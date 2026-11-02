@@ -74,6 +74,9 @@ public:
 
 	bool IsMoving() const { return bTurning || bZooming; }
 
+	/** Moving in any way: a preset or lens change, or the joystick (also while it slows down after the stick is let go). */
+	bool IsActive() const { return IsMoving() || PanRate != 0.f || TiltRate != 0.f || ZoomRate != 0.f; }
+
 	/** A span of 360 degrees or more: no cable stop, the camera turns all the way round (a dome camera). */
 	bool IsContinuousPan() const { return PanLimitsDeg.Y - PanLimitsDeg.X >= 360.f; }
 
@@ -104,6 +107,13 @@ public:
 	/** Focal length factor per second at full zoom input (2 = doubles every second). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ATC|Camera|Speed")
 	float ZoomRatePerSecond = 2.f;
+
+	/**
+	 * Joystick and keys: the time the camera takes to get up to speed and to stop again, like the motors of a real PTZ
+	 * head. A key press then starts and ends the movement smoothly instead of with a jerk. 0 = instant.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ATC|Camera|Speed", meta = (Units = "s", ClampMin = "0"))
+	float InputSmoothingSeconds = 0.12f;
 
 	/** Going to a preset: pan, tilt and zoom move together in this time. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ATC|Camera|Speed", meta = (Units = "s"))
@@ -147,6 +157,11 @@ private:
 	float PanInput = 0.f;
 	float TiltInput = 0.f;
 	float ZoomInput = 0.f;
+
+	/** Joystick speeds right now (deg/s, and zoom input -1..1), following the input in InputSmoothingSeconds. */
+	float PanRate = 0.f;
+	float TiltRate = 0.f;
+	float ZoomRate = 0.f;
 
 	float SensorWidthMm = 36.f;
 	int32 LensIndex = INDEX_NONE;
