@@ -1,0 +1,63 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "ATC Sim Bouwblokken",
+	"Description": "Herbruikbare bouwblokken voor VR-luchtverkeerssimulatie: taxi, pushback, GMI-camera, weer, dag/nacht en luchthavens.",
+	"Category": "Simulation",
+	"CreatedBy": "",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"Modules": [
+		{
+			"Name": "ATCSimCore",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "ATCAircraft",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "ATCCamera",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "ATCEnvironment",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "ATCAirports",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "ATCSimEditor",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "SunPosition",
+			"Enabled": true
+		},
+		{
+			"Name": "Niagara",
+			"Enabled": true
+		},
+		{
+			"Name": "DataValidation",
+			"Enabled": true
+		},
+		{
+			"Name": "EnhancedInput",
+			"Enabled": true
+		}
+	]
+}
