@@ -9,6 +9,7 @@
 #include "AircraftSpawnSubsystem.h"
 #include "AircraftTypeData.h"
 #include "ATCAircraft.h"
+#include "ATCScoreSubsystem.h"
 #include "MonitorDisplay.h"
 #include "RadioSubsystem.h"
 #include "TrafficDirector.h"
@@ -411,6 +412,35 @@ namespace ATCCommands
 		}
 	}
 
+	/** ATC.Score [save|reset]: the session score (landings, go-arounds, conflicts, stop-bar waits). */
+	void Score(const TArray<FString>& Args, UWorld* World)
+	{
+		UATCScoreSubsystem* Scores = World ? World->GetSubsystem<UATCScoreSubsystem>() : nullptr;
+		if (!Scores)
+		{
+			UE_LOG(LogATC, Warning, TEXT("ATC.Score: only during Play"));
+			return;
+		}
+		const FString Action = Args.Num() > 0 ? Args[0].ToLower() : FString();
+		if (Action == TEXT("reset"))
+		{
+			Scores->ResetScore();
+			UE_LOG(LogATC, Display, TEXT("ATC.Score: from zero again"));
+			return;
+		}
+		if (Action == TEXT("save"))
+		{
+			Scores->SaveReport();
+			return;
+		}
+		TArray<FString> Lines;
+		Scores->GetScore().ToReport().ParseIntoArrayLines(Lines);
+		for (const FString& Line : Lines)
+		{
+			UE_LOG(LogATC, Display, TEXT("ATC.Score: %s"), *Line);
+		}
+	}
+
 	/** ATC.TrafficDirector <start|stop|status|auto 0/1|rate N>: the map's traffic program. */
 	void TrafficDirector(const TArray<FString>& Args, UWorld* World)
 	{
@@ -702,6 +732,8 @@ namespace ATCCommands
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Radio));
 	FAutoConsoleCommandWithWorldAndArgs MonitorCommand(TEXT("ATC.Monitor"), TEXT("ATC.Monitor <screen number> <camera id | next>: camera on a tower screen"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Monitor));
+	FAutoConsoleCommandWithWorldAndArgs ScoreCommand(TEXT("ATC.Score"), TEXT("ATC.Score [save|reset]: the session score; save writes it to Saved/ATC"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Score));
 	FAutoConsoleCommandWithWorldAndArgs TrafficDirectorCommand(TEXT("ATC.TrafficDirector"),
 		TEXT("ATC.TrafficDirector <start|stop|status|auto 0/1|rate N>: the map's traffic program (arrivals, turnarounds, departures)"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TrafficDirector));

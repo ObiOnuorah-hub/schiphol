@@ -9,6 +9,7 @@
 class UAircraftIdentityComponent;
 class UAircraftMovementComponent;
 class UAircraftTypeData;
+class UATCSoundComponent;
 class UPushbackControllerComponent;
 class UStaticMeshComponent;
 class UTaxiControllerComponent;
@@ -89,6 +90,13 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "ATC|Aircraft")
 	TObjectPtr<UAircraftIdentityComponent> Identity;
 
+	/** Engine sound made in code: off at the stand, idle while taxiing, full power on takeoff and go-around. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "ATC|Aircraft")
+	TObjectPtr<UATCSoundComponent> EngineSound;
+
+	/** Engine power for the sound now: 0 off, 0.3 idle, 1 takeoff. */
+	float GetEngineThrust() const;
+
 	/**
 	 * Placed by hand on a taxi route: in the editor the aircraft snaps onto the spline (main gear on the line, nose
 	 * along the route); at Play it starts there. Empty = an ordinary aircraft (stand or spawn manager).
@@ -136,6 +144,8 @@ public:
 private:
 	void ApplyType();
 	void Report(const FGameplayTag& EventTag, const FString& Detail);
+	/** Sets the engine sound to GetEngineThrust (on every event and at touchdown). */
+	void UpdateEngineSound();
 
 	UFUNCTION()
 	void HandleTaxiState(ETaxiState OldState, ETaxiState NewState);

@@ -402,6 +402,7 @@ void UTaxiControllerComponent::UpdateClaim(float LookAheadCm, float SeparationCm
 	Request.LengthCm = GetLengthCm();
 	Request.NoseOffsetCm = GetNoseOffsetCm();
 	Request.RoomAheadCm = CachedBlocker.IsValid() ? FMath::Max(CachedGap - SeparationCm, 0.f) : BIG_NUMBER;
+	Request.bPriority = bPriority;
 	// Standing at its distance behind the aircraft ahead: it waits for that one
 	Request.HeldBy = CachedBlocker.IsValid() && Movement->Speed < 100.f && CachedGap - SeparationCm < 1000.f ? CachedBlocker.Get() : nullptr;
 	AActor* Blocker = nullptr;

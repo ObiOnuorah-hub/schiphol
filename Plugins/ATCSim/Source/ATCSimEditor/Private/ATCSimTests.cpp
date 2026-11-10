@@ -11,6 +11,10 @@
 #include "AircraftMovementComponent.h"
 #include "AircraftTypeData.h"
 #include "ATCAircraft.h"
+#include "ATCGameplayTags.h"
+#include "ATCScoreSubsystem.h"
+#include "ATCSoundComponent.h"
+#include "ATCAmbienceSubsystem.h"
 #include "ATCUnits.h"
 #include "EnvironmentTypes.h"
 #include "GMICamera.h"
@@ -1308,6 +1312,91 @@ bool FATCMonitorButtonsTest::RunTest(const FString& Parameters)
 	Monitor->PressButton(3);
 	ATCTest::Advance(World, Second->PTZ->TransitionTime + 1.f);
 	TestEqual(TEXT("PRE> turns the camera to its next preset"), Second->PTZ->PanDeg, 100.f, 0.5f);
+	ATCTest::DestroyPlayWorld(World);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCScoreTest, "ATCSim.Aircraft.SessionScore", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * The session score: 100 without mistakes, minus 10 per go-around, 20 per conflict, 5 per deadlock and 1 per 5 s that
+ * the average stop-bar wait is over 30 s. The events of the traffic count landings, takeoffs, go-arounds and waits.
+ */
+bool FATCScoreTest::RunTest(const FString& Parameters)
+{
+	FATCSessionScore Clean;
+	Clean.Landings = 5;
+	TestEqual(TEXT("no mistakes: 100"), Clean.GetScore(), 100);
+	FATCSessionScore Bad;
+	Bad.GoArounds = 2;
+	Bad.Conflicts = 1;
+	Bad.Deadlocks = 1;
+	Bad.StopBarWaits = 2;
+	Bad.StopBarWaitSeconds = 120.f;
+	TestEqual(TEXT("100 - 20 - 20 - 5 - 6 (60 s average wait)"), Bad.GetScore(), 49);
+
+	UWorld* World = ATCTest::MakePlayWorld(TEXT("ATCSimScoreWorld"));
+	UATCScoreSubsystem* Score = World->GetSubsystem<UATCScoreSubsystem>();
+	TestNotNull(TEXT("score subsystem in a game world"), Score);
+	if (Score)
+	{
+		Score->HandleAircraftEvent(nullptr, TEXT("KLM1"), TAG_ATC_Event_Traffic_Landed, TEXT("Route.EHAM.Arr36C"));
+		Score->HandleAircraftEvent(nullptr, TEXT("KLM2"), TAG_ATC_Event_Traffic_Takeoff, TEXT("Route.EHAM.Dep24"));
+		Score->HandleAircraftEvent(nullptr, TEXT("KLM3"), TAG_ATC_Event_Traffic_Removed, TEXT("went around"));
+		Score->HandleAircraftEvent(nullptr, TEXT("KLM2"), TAG_ATC_Event_Traffic_Removed, TEXT("departed"));
+		Score->HandleAircraftEvent(nullptr, TEXT("KLM4"), TAG_ATC_Event_Taxi_StopReached, TEXT("Holding point 24 (waiting for clearance)"));
+		ATCTest::Advance(World, 2.f);
+		Score->HandleAircraftEvent(nullptr, TEXT("KLM4"), TAG_ATC_Event_Taxi_State, TEXT("Taxiing"));
+		// Moving again without a stop bar first is no wait
+		Score->HandleAircraftEvent(nullptr, TEXT("KLM5"), TAG_ATC_Event_Taxi_State, TEXT("Taxiing"));
+
+		const FATCSessionScore Now = Score->GetScore();
+		TestEqual(TEXT("landings"), Now.Landings, 1);
+		TestEqual(TEXT("takeoffs"), Now.Takeoffs, 1);
+		TestEqual(TEXT("go-arounds (a normal departure is none)"), Now.GoArounds, 1);
+		TestEqual(TEXT("one stop-bar wait"), Now.StopBarWaits, 1);
+		TestEqual(TEXT("of about 2 s"), Now.StopBarWaitSeconds, 2.f, 0.5f);
+		TestEqual(TEXT("score 90"), Now.GetScore(), 90);
+		TestTrue(TEXT("line for the tower screen"), Now.ToLine().StartsWith(TEXT("SCORE 90")));
+
+		Score->ResetScore();
+		TestEqual(TEXT("reset: no landings"), Score->GetScore().Landings, 0);
+	}
+	ATCTest::DestroyPlayWorld(World);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCSoundTest, "ATCSim.Aircraft.EngineSound", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * Sound made in code: an engine is silent when off, louder, brighter and higher with more power; the wind on the cab
+ * grows with the wind speed. An aircraft at its stand has its engines off; the cab sound is there in a game world.
+ */
+bool FATCSoundTest::RunTest(const FString& Parameters)
+{
+	const FATCSoundParams Off = UATCSoundComponent::EngineParams(0.f);
+	const FATCSoundParams Idle = UATCSoundComponent::EngineParams(0.3f);
+	const FATCSoundParams Takeoff = UATCSoundComponent::EngineParams(1.f);
+	TestTrue(TEXT("engines off: silent"), Off.IsSilent());
+	TestFalse(TEXT("idle: audible"), Idle.IsSilent());
+	TestTrue(TEXT("takeoff louder than idle"), Takeoff.NoiseLevel > Idle.NoiseLevel);
+	TestTrue(TEXT("takeoff brighter (roar, not rumble)"), Takeoff.NoiseCutoffHz > Idle.NoiseCutoffHz);
+	TestTrue(TEXT("the whine climbs with the power"), Takeoff.ToneHz > Idle.ToneHz);
+	TestTrue(TEXT("stronger wind is louder"), UATCAmbienceSubsystem::WindParams(30.f).NoiseLevel > UATCAmbienceSubsystem::WindParams(8.f).NoiseLevel);
+	TestTrue(TEXT("no wind is almost silent"), UATCAmbienceSubsystem::WindParams(0.f).NoiseLevel < 0.02f);
+
+	UWorld* World = ATCTest::MakePlayWorld(TEXT("ATCSimSoundWorld"));
+	AATCAircraft* Aircraft = World->SpawnActor<AATCAircraft>(FVector::ZeroVector, FRotator::ZeroRotator);
+	TestNotNull(TEXT("aircraft has an engine sound"), Aircraft ? Aircraft->EngineSound.Get() : nullptr);
+	TestEqual(TEXT("at the stand: engines off"), Aircraft ? Aircraft->GetEngineThrust() : -1.f, 0.f);
+	if (Aircraft && Aircraft->EngineSound)
+	{
+		Aircraft->EngineSound->SetThrust(1.f);
+		TestEqual(TEXT("thrust is kept"), Aircraft->EngineSound->GetThrust(), 1.f);
+		TestEqual(TEXT("and gives takeoff sound"), Aircraft->EngineSound->GetParams().NoiseLevel, Takeoff.NoiseLevel);
+	}
+	const UATCAmbienceSubsystem* Ambience = World->GetSubsystem<UATCAmbienceSubsystem>();
+	TestTrue(TEXT("cab sound in a game world"), Ambience && Ambience->GetWind() != nullptr);
 	ATCTest::DestroyPlayWorld(World);
 	return true;
 }

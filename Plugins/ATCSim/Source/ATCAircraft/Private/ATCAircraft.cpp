@@ -3,6 +3,7 @@
 #include "AircraftMovementComponent.h"
 #include "AircraftTypeData.h"
 #include "ATCGameplayTags.h"
+#include "ATCSoundComponent.h"
 #include "ATCUnits.h"
 #include "PushbackControllerComponent.h"
 #include "Stand.h"
@@ -52,6 +53,42 @@ AATCAircraft::AATCAircraft()
 	TaxiController = CreateDefaultSubobject<UTaxiControllerComponent>(TEXT("TaxiController"));
 	PushbackController = CreateDefaultSubobject<UPushbackControllerComponent>(TEXT("PushbackController"));
 	Identity = CreateDefaultSubobject<UAircraftIdentityComponent>(TEXT("Identity"));
+
+	EngineSound = CreateDefaultSubobject<UATCSoundComponent>(TEXT("EngineSound"));
+	EngineSound->SetupAttachment(RootComponent);
+}
+
+float AATCAircraft::GetEngineThrust() const
+{
+	if (bTakingOff || bGoingAround)
+	{
+		return 1.f;
+	}
+	if (bLanding)
+	{
+		return LandingToGoCm < 0.f ? 0.7f : 0.45f;   // reversers on the rollout, approach power before
+	}
+	const ETaxiState Taxi = TaxiController->GetState();
+	const EPushbackState Push = PushbackController->GetState();
+	if (Taxi == ETaxiState::Taxiing || Taxi == ETaxiState::Braking || Taxi == ETaxiState::Holding)
+	{
+		return 0.3f;
+	}
+	if (Push == EPushbackState::Pushing || Push == EPushbackState::Stopping || Push == EPushbackState::TugDisconnecting
+		|| (Push == EPushbackState::Completed && Taxi == ETaxiState::Idle))
+	{
+		return 0.22f;   // the engines start during the push
+	}
+	return 0.f;   // at the stand: engines off
+}
+
+void AATCAircraft::UpdateEngineSound()
+{
+	const float Thrust = GetEngineThrust();
+	if (EngineSound && !FMath::IsNearlyEqual(Thrust, EngineSound->GetThrust()))
+	{
+		EngineSound->SetThrust(Thrust);
+	}
 }
 
 void AATCAircraft::OnConstruction(const FTransform& Transform)
@@ -243,6 +280,7 @@ void AATCAircraft::EndPlay(const EEndPlayReason::Type EndPlayReason)
 void AATCAircraft::Report(const FGameplayTag& EventTag, const FString& Detail)
 {
 	UE_LOG(LogATC, Display, TEXT("%s %s %s"), *Identity->Callsign.ToString(), *EventTag.ToString(), *Detail);
+	UpdateEngineSound();
 	if (UTrafficSubsystem* Traffic = GetWorld() ? GetWorld()->GetSubsystem<UTrafficSubsystem>() : nullptr)
 	{
 		Traffic->BroadcastAircraftEvent(this, EventTag, Detail);
@@ -251,6 +289,10 @@ void AATCAircraft::Report(const FGameplayTag& EventTag, const FString& Detail)
 
 void AATCAircraft::HandleTaxiState(ETaxiState OldState, ETaxiState NewState)
 {
+	if (NewState == ETaxiState::Arrived || NewState == ETaxiState::Idle)
+	{
+		TaxiController->bPriority = false;   // on its stand: an ordinary aircraft again
+	}
 	Report(TAG_ATC_Event_Taxi_State, StaticEnum<ETaxiState>()->GetNameStringByValue(static_cast<int64>(NewState)));
 }
 
@@ -350,6 +392,7 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 	bLanding = true;
 	SetActorTickEnabled(true);
 	TickLanding(0.f);
+	UpdateEngineSound();
 	UE_LOG(LogATC, Display, TEXT("%s on final for %s, touchdown %.0f m before the exit route"), *Identity->Callsign.ToString(),
 		*Route->RouteTag.ToString(), RolloutCm / 100.f);
 }
@@ -364,11 +407,16 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 	}
 
 	// Landing clearance: on final it asks for its runway exit (and so joins the queue for it, with a head start over the
-	// ground); still not free 1.5 km before touchdown, it goes around
+	// ground); still not free 1.5 km before touchdown, it goes around. Unless the one holding the exit is the landing
+	// before it, rolling out or taxiing off: that one is gone by the time this one gets there (its own rollout takes
+	// another half a minute), so it decides just before the threshold (150 m), like a pilot who sees the runway being vacated
 	if (!bExitReserved)
 	{
 		bExitReserved = ReserveRunwayExit();
-		if (!bExitReserved && LandingToGoCm < 150000.f)
+		const AATCAircraft* Ahead = Cast<AATCAircraft>(ExitBlocker.Get());
+		// (on the rollout the landing moves itself, not through Movement; in the turn off the runway it is down to ~6 kt)
+		const bool bBeingVacated = Ahead && (Ahead->IsLanding() || (Ahead->TaxiController->bPriority && Ahead->Movement->Speed > 50.f));
+		if (!bExitReserved && LandingToGoCm < (bBeingVacated ? 15000.f : 150000.f))
 		{
 			StartGoAround();
 			return;
@@ -386,6 +434,11 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 		LandingSpeedCms = FMath::Max(LandingSpeedCms - RolloutDecelCms2 * DeltaSeconds, RolloutEndSpeedCms);
 	}
 	LandingToGoCm -= LandingSpeedCms * DeltaSeconds;
+	// Touchdown: the reversers roar
+	if (LandingToGoCm < 0.f && EngineSound && EngineSound->GetThrust() < 0.6f)
+	{
+		UpdateEngineSound();
+	}
 
 	// 3 degree glide path; from 12 m the flare: the sink rate drops to a third at touchdown (smooth cubic)
 	const float Glide = FMath::Tan(FMath::DegreesToRadians(3.f));
@@ -419,10 +472,13 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 		// On the lane its exit is reserved on
 		ATaxiRoute* Lane = ExitLane.IsValid() ? ExitLane.Get() : Route;
 		Movement->SetPath(Route->Spline, ETravelDirection::Forward, true, LandingStartCm, true);
+		// Off the runway first: until it is on its stand it goes before ground traffic, or it blocks its runway's exits
+		TaxiController->bPriority = true;
 		TaxiController->StartTaxiOnLane(Route, Lane, LandingStartCm, LandingEndCm);
 		Movement->Speed = LandingSpeedCms;
 		UE_LOG(LogATC, Display, TEXT("%s landed, rolling out at %.0f kt onto %s"), *Identity->Callsign.ToString(),
 			LandingSpeedCms / ATCUnits::KnotsToCms, *Lane->RouteTag.ToString());
+		Report(TAG_ATC_Event_Traffic_Landed, Lane->RouteTag.ToString());
 	}
 }
 
@@ -448,15 +504,19 @@ void AATCAircraft::StartGoAround()
 {
 	// Missed approach: full power and climb straight ahead; it leaves the circuit (it does not come back here)
 	const AActor* Blocker = ExitBlocker.Get();
-	UE_LOG(LogATC, Display, TEXT("%s goes around: runway exit of %s not free (%s)"), *Identity->Callsign.ToString(),
+	const AATCAircraft* Ahead = Cast<AATCAircraft>(Blocker);
+	const FString State = Ahead ? FString::Printf(TEXT(", %s, %.0f kt, %.0f m to go"), Ahead->IsLanding() ? TEXT("landing") : Ahead->TaxiController->bPriority
+		? TEXT("taxiing in") : *UEnum::GetValueAsString(Ahead->TaxiController->GetState()), Ahead->Movement->Speed / ATCUnits::KnotsToCms, LandingToGoCm / 100.f) : FString();
+	UE_LOG(LogATC, Display, TEXT("%s goes around: runway exit of %s not free (%s%s)"), *Identity->Callsign.ToString(),
 		LandingRoute.IsValid() ? *LandingRoute->RouteTag.ToString() : TEXT("?"), Blocker && Blocker->Implements<UAircraftInfo>()
-		? *FString::Printf(TEXT("held by %s"), *IAircraftInfo::Execute_GetCallsign(Blocker).ToString()) : TEXT("held"));
+		? *FString::Printf(TEXT("held by %s"), *IAircraftInfo::Execute_GetCallsign(Blocker).ToString()) : TEXT("held"), *State);
 	LeaveTaxiNetwork();
 	bLanding = false;
 	bGoingAround = true;
 	bTakingOff = true;
 	TakeoffSpeedCms = LandingSpeedCms;
 	TakeoffSeconds = 0.f;
+	UpdateEngineSound();
 }
 
 void AATCAircraft::TickTakeoff(float DeltaSeconds)

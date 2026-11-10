@@ -7,6 +7,7 @@
 #include "Engine/SkyLight.h"
 #include "Components/SkyLightComponent.h"
 #include "Engine/DirectionalLight.h"
+#include "Engine/TextureCube.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Engine/PostProcessVolume.h"
 #include "Engine/Engine.h"
@@ -28,6 +29,7 @@
 #include "Engine/StaticMesh.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceConstant.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Engine/Texture.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -2045,6 +2047,134 @@ namespace
 	}
 
 	/**
+	 * The buildings BrightenBuildings left dark: their instance is also used on flat ground (a roof and a car park with the
+	 * same photo texture), so changing it would brighten that ground too. "Airport.BrightenShared [brightness] [contrast]
+	 * [list]" gives every building that uses such an instance its own child instance (<name>_Bldg, same folder) with the
+	 * brightness and contrast, and puts it on the building in the map. "list" only reports, with the other building
+	 * materials that are not M_TerrainVT (largest first).
+	 */
+	void BrightenShared(const TArray<FString>& Args, UWorld* World)
+	{
+		const bool bList = Args.Contains(TEXT("list"));
+		const float Brightness = Args.Num() > 0 && !Args[0].Equals(TEXT("list")) ? FCString::Atof(*Args[0]) : 1.3f;
+		const float Contrast = Args.Num() > 1 && !Args[1].Equals(TEXT("list")) ? FCString::Atof(*Args[1]) : 0.9f;
+		if (!World)
+		{
+			return;
+		}
+		struct FUse { UStaticMeshComponent* Component; int32 Slot; };
+		TMap<UMaterialInstanceConstant*, TArray<FUse>> TallUses;
+		TSet<UMaterialInstanceConstant*> Flat;
+		TMap<FString, double> OtherParents;   // parent -> building area (m2) using it
+		TSet<UMaterialInstanceConstant*> Done;   // buildings that already have their own instance (an earlier run)
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			TInlineComponentArray<UStaticMeshComponent*> Components(*It);
+			for (UStaticMeshComponent* Component : Components)
+			{
+				const FVector Size = Component->Bounds.GetBox().GetSize();
+				const bool bTall = Size.Z > 600.0 && Size.Z < 30000.0 && !Component->IsA<UInstancedStaticMeshComponent>();
+				for (int32 Slot = 0; Slot < Component->GetNumMaterials(); ++Slot)
+				{
+					UMaterialInterface* Material = Component->GetMaterial(Slot);
+					UMaterialInstanceConstant* Instance = Cast<UMaterialInstanceConstant>(Material);
+					if (Instance && Instance->GetName().EndsWith(TEXT("_Bldg")))
+					{
+						Done.Add(Instance);
+						continue;
+					}
+					const bool bTerrain = Instance && Instance->Parent && Instance->Parent->GetName() == TEXT("M_TerrainVT");
+					if (bTerrain)
+					{
+						if (bTall)
+						{
+							TallUses.FindOrAdd(Instance).Add({ Component, Slot });
+						}
+						else
+						{
+							Flat.Add(Instance);
+						}
+					}
+					else if (bTall && Material && !Material->GetPathName().Contains(TEXT("/Vliegtuigen/")) && !Material->GetName().Contains(TEXT("Tree")))
+					{
+						const UMaterialInterface* Parent = Instance && Instance->Parent ? Instance->Parent.Get() : Material;
+						OtherParents.FindOrAdd(Parent->GetName()) += Size.X * Size.Y / 10000.0;
+					}
+				}
+			}
+		}
+
+		int32 Shared = 0, Buildings = 0;
+		TArray<UPackage*> ToSave;
+		for (const TPair<UMaterialInstanceConstant*, TArray<FUse>>& Pair : TallUses)
+		{
+			if (!Flat.Contains(Pair.Key) || Pair.Key->GetName().Contains(TEXT("Street")))
+			{
+				continue;   // BrightenBuildings did this one, or a road on a bridge (not a building)
+			}
+			++Shared;
+			Buildings += Pair.Value.Num();
+			if (bList)
+			{
+				UE_LOG(LogTemp, Display, TEXT("Airport.BrightenShared: %s (on flat ground too) on %d buildings, e.g. %s"), *Pair.Key->GetName(),
+					Pair.Value.Num(), *Pair.Value[0].Component->GetOwner()->GetName());
+				continue;
+			}
+			// Its own instance for the buildings: a child of the shared one, so it keeps the texture and every other setting
+			const FString Folder = FPackageName::GetLongPackagePath(Pair.Key->GetOutermost()->GetName());
+			const FString Name = Pair.Key->GetName() + TEXT("_Bldg");
+			UMaterialInstanceConstant* Child = LoadObject<UMaterialInstanceConstant>(nullptr, *(Folder / Name + TEXT(".") + Name), nullptr, LOAD_NoWarn | LOAD_Quiet);
+			if (!Child)
+			{
+				UPackage* Package = CreatePackage(*(Folder / Name));
+				Child = NewObject<UMaterialInstanceConstant>(Package, *Name, RF_Public | RF_Standalone);
+				FAssetRegistryModule::AssetCreated(Child);
+			}
+			Child->Modify();
+			Child->SetParentEditorOnly(Pair.Key);
+			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Child, TEXT("GroundBrightness"), Brightness);
+			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Child, TEXT("GroundContrast"), Contrast);
+			UMaterialEditingLibrary::UpdateMaterialInstance(Child);
+			ToSave.Add(Child->GetPackage());
+			for (const FUse& Use : Pair.Value)
+			{
+				Use.Component->Modify();
+				Use.Component->SetMaterial(Use.Slot, Child);
+				ToSave.AddUnique(Use.Component->GetOutermost());
+			}
+		}
+
+		// The ones from an earlier run: only new values
+		for (UMaterialInstanceConstant* Child : Done)
+		{
+			if (bList)
+			{
+				UE_LOG(LogTemp, Display, TEXT("Airport.BrightenShared: %s already has its own instance"), *Child->GetName());
+				continue;
+			}
+			Child->Modify();
+			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Child, TEXT("GroundBrightness"), Brightness);
+			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Child, TEXT("GroundContrast"), Contrast);
+			UMaterialEditingLibrary::UpdateMaterialInstance(Child);
+			ToSave.AddUnique(Child->GetPackage());
+			++Shared;
+		}
+
+		TArray<TPair<FString, double>> Others = OtherParents.Array();
+		Others.Sort([](const TPair<FString, double>& A, const TPair<FString, double>& B) { return A.Value > B.Value; });
+		for (int32 Index = 0; Index < FMath::Min(Others.Num(), 15); ++Index)
+		{
+			UE_LOG(LogTemp, Display, TEXT("Airport.BrightenShared: other building material %s (%.0f m2)"), *Others[Index].Key, Others[Index].Value);
+		}
+		if (!bList)
+		{
+			UEditorLoadingAndSavingUtils::SavePackages(ToSave, false);
+		}
+		UE_LOG(LogTemp, Display, TEXT("Airport.BrightenShared: %d shared instances on %d buildings%s"), Shared, Buildings,
+			bList ? TEXT(" (list only)") : *FString::Printf(TEXT(" now brightness %.2f, contrast %.2f, %d packages saved"), Brightness, Contrast, ToSave.Num()));
+	}
+
+	/**
 	 * Puts the materials back to how they were on 13 Oct 10:51, before the last round of fixes: dark patches again
 	 * (masked M_GroundOverlay), no grass grain, engine-plugin parents instead of the Parents copies, old tree cards.
 	 * Afterwards delete /Game/EHAM/Materials/Parents and M_TreeCards*; the level comes from Saved/Backup_before_PlaceFlight.
@@ -2283,6 +2413,11 @@ namespace
 		TEXT("Airport.BrightenBuildings [brightness 1.3] [contrast 0.9]: lighter terminal, piers and other buildings (M_TerrainVT instances on tall meshes)"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&BrightenBuildings));
 
+	FAutoConsoleCommandWithWorldAndArgs BrightenSharedCommand(
+		TEXT("Airport.BrightenShared"),
+		TEXT("Airport.BrightenShared [brightness 1.3] [contrast 0.9] [list]: the buildings BrightenBuildings left dark (instance shared with flat ground) get their own lighter instance; saves the map"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&BrightenShared));
+
 	FAutoConsoleCommand LocalizeMaterialsCommand(
 		TEXT("Airport.LocalizeMaterials"),
 		TEXT("Copy engine-plugin parent materials into the project and reparent to them"),
@@ -2323,6 +2458,12 @@ namespace
 				UE_LOG(LogTemp, Display, TEXT("Airport.InspectParent: scalar param %s default=%.2f"), *Scalar->ParameterName.ToString(), Scalar->DefaultValue);
 			}
 		}
+		// What drives the inputs that decide how much light it gets (AO 0 = no sky light at all)
+		const UMaterialEditorOnlyData* Data = Material->GetEditorOnlyData();
+		auto Input = [](const FExpressionInput& In) { return In.Expression ? FString::Printf(TEXT("%s (output %d)"), *In.Expression->GetClass()->GetName(), In.OutputIndex) : FString(TEXT("not connected")); };
+		UE_LOG(LogTemp, Display, TEXT("Airport.InspectParent: shading model %d, attributes %d, base colour <- %s, AO <- %s, roughness <- %s, emissive <- %s"),
+			static_cast<int32>(Material->GetShadingModels().GetFirstShadingModel()), Material->bUseMaterialAttributes ? 1 : 0, *Input(Data->BaseColor),
+			*Input(Data->AmbientOcclusion), *Input(Data->Roughness), *Input(Data->EmissiveColor));
 		UE_LOG(LogTemp, Display, TEXT("Airport.InspectParent: done"));
 	}
 
@@ -2346,6 +2487,176 @@ namespace
 		TEXT("Recreate missing decal parent materials"),
 		FConsoleCommandDelegate::CreateStatic(&FixDecalMaterials));
 #endif
+
+	/** Play or editor: what lights the shadows. Every sky light, sun and post process volume with its exposure. */
+	void SkyInfo(const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World)
+		{
+			return;
+		}
+		const UEnum* MobilityEnum = StaticEnum<EComponentMobility::Type>();
+		for (TActorIterator<ASkyLight> It(World); It; ++It)
+		{
+			USkyLightComponent* Sky = It->GetLightComponent();
+			// "Airport.SkyInfo intensity 4" / "occlusion 0.3": try a stronger sky or less darkening near buildings (not saved)
+			if (Args.Num() > 1 && Args[0] == TEXT("intensity"))
+			{
+				Sky->SetIntensity(FCString::Atof(*Args[1]));
+			}
+			if (Args.Num() > 1 && Args[0] == TEXT("occlusion"))
+			{
+				Sky->SetMinOcclusion(FCString::Atof(*Args[1]));
+			}
+			// "realtime 0": capture the whole scene once (a sky sphere mesh too) instead of only the sky atmosphere live
+			if (Args.Num() > 1 && Args[0] == TEXT("realtime"))
+			{
+				Sky->SetRealTimeCapture(Args[1] != TEXT("0"));
+				if (Args.Num() > 2)
+				{
+					Sky->SetIntensity(FCString::Atof(*Args[2]));
+				}
+				Sky->RecaptureSky();
+			}
+			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: sky %s mobility=%s intensity=%.2f indirect=%.2f realtime=%d source=%d visible=%d affectsWorld=%d lowerBlack=%d cubemap=%s occlusionMax=%.0f minOcclusion=%.2f"),
+				*It->GetName(), *MobilityEnum->GetNameStringByValue(Sky->Mobility), Sky->Intensity, Sky->IndirectLightingIntensity,
+				Sky->bRealTimeCapture ? 1 : 0, static_cast<int32>(Sky->SourceType), Sky->IsVisible() ? 1 : 0, Sky->bAffectsWorld ? 1 : 0,
+				Sky->bLowerHemisphereIsBlack ? 1 : 0, Sky->Cubemap ? *Sky->Cubemap->GetName() : TEXT("none"), Sky->OcclusionMaxDistance, Sky->MinOcclusion);
+		}
+		for (TActorIterator<ADirectionalLight> It(World); It; ++It)
+		{
+			const UDirectionalLightComponent* Sun = Cast<UDirectionalLightComponent>(It->GetLightComponent());
+			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: sun %s intensity=%.2f visible=%d atmosphereSun=%d pitch=%.1f"), *It->GetName(), Sun->Intensity,
+				Sun->IsVisible() ? 1 : 0, Sun->IsUsedAsAtmosphereSunLight() ? 1 : 0, It->GetActorRotation().Pitch);
+		}
+		for (TActorIterator<APostProcessVolume> It(World); It; ++It)
+		{
+			FPostProcessSettings& Post = It->Settings;
+			// "Airport.SkyInfo grade 0.4 1.2": film toe (0.55 = engine; lower = shadows less crushed) and shadow gamma (1 = none)
+			if (Args.Num() > 2 && Args[0] == TEXT("grade") && It->bUnbound)
+			{
+				Post.bOverride_FilmToe = true;
+				Post.FilmToe = FCString::Atof(*Args[1]);
+				Post.bOverride_ColorGammaShadows = true;
+				Post.ColorGammaShadows = FVector4(1.0, 1.0, 1.0, FCString::Atof(*Args[2]));
+			}
+			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: post %s unbound=%d exposureMethod=%d(%d) bias=%.2f(%d) min=%.2f max=%.2f ao=%.2f(%d) indirect=%.2f(%d)"),
+				*It->GetName(), It->bUnbound ? 1 : 0, static_cast<int32>(Post.AutoExposureMethod), Post.bOverride_AutoExposureMethod ? 1 : 0,
+				Post.AutoExposureBias, Post.bOverride_AutoExposureBias ? 1 : 0, Post.AutoExposureMinBrightness, Post.AutoExposureMaxBrightness,
+				Post.AmbientOcclusionIntensity, Post.bOverride_AmbientOcclusionIntensity ? 1 : 0, Post.IndirectLightingIntensity, Post.bOverride_IndirectLightingIntensity ? 1 : 0);
+		}
+	}
+
+	/** Play: "Airport.Pick 0.25 0.6" - what is at that point of the picture (0..1 across, 0..1 down), with its materials. */
+	void Pick(const TArray<FString>& Args, UWorld* World)
+	{
+		APlayerController* Controller = World ? World->GetFirstPlayerController() : nullptr;
+		int32 SizeX = 0, SizeY = 0;
+		FVector Origin, Direction;
+		if (!Controller || Args.Num() < 2)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Airport.Pick <x 0..1> <y 0..1>: during Play"));
+			return;
+		}
+		Controller->GetViewportSize(SizeX, SizeY);
+		if (!Controller->DeprojectScreenPositionToWorld(FCString::Atof(*Args[0]) * SizeX, FCString::Atof(*Args[1]) * SizeY, Origin, Direction))
+		{
+			return;
+		}
+		auto Describe = [](const UPrimitiveComponent* Component)
+		{
+			FString Text;
+			for (int32 Slot = 0; Component && Slot < Component->GetNumMaterials(); ++Slot)
+			{
+				const UMaterialInterface* Material = Component->GetMaterial(Slot);
+				const UMaterialInstance* Instance = Cast<UMaterialInstance>(Material);
+				Text += FString::Printf(TEXT(" [%s<%s]"), Material ? *Material->GetPathName() : TEXT("none"), Instance && Instance->Parent ? *Instance->Parent->GetName() : TEXT("-"));
+			}
+			return Text;
+		};
+		const FString Where = FString::Printf(TEXT("%s %s"), *Args[0], *Args[1]);
+		FCollisionQueryParams Params(TEXT("AirportPick"), true);
+		Params.bReturnFaceIndex = true;
+		FHitResult Hit;
+		if (World->LineTraceSingleByChannel(Hit, Origin, Origin + Direction * 2000000.0, ECC_Visibility, Params) && Hit.GetComponent())
+		{
+			int32 Section = 0;
+			const UMaterialInterface* Material = Hit.GetComponent()->GetMaterialFromCollisionFaceIndex(Hit.FaceIndex, Section);
+			const UStaticMeshComponent* Mesh = Cast<UStaticMeshComponent>(Hit.GetComponent());
+			UE_LOG(LogTemp, Display, TEXT("Airport.Pick %s: hit %s / %s mesh %s at %.0f m, face material %s; all:%s"), *Where, *Hit.GetActor()->GetName(),
+				*Hit.GetComponent()->GetName(), Mesh && Mesh->GetStaticMesh() ? *Mesh->GetStaticMesh()->GetName() : TEXT("-"), Hit.Distance / 100.0,
+				Material ? *Material->GetPathName() : TEXT("?"), *Describe(Hit.GetComponent()));
+		}
+		// Meshes without collision: the nearest boxes the ray goes into
+		TArray<TPair<double, const UStaticMeshComponent*>> Boxes;
+		for (TObjectIterator<UStaticMeshComponent> It; It; ++It)
+		{
+			const FBox Box = It->Bounds.GetBox();
+			FVector HitLocation, HitNormal;
+			float Time = 0.f;
+			if (It->GetWorld() == World && It->IsVisible() && !Box.IsInside(Origin) && Box.GetExtent().Size2D() < 100000.0
+				&& FMath::LineExtentBoxIntersection(Box, Origin, Origin + Direction * 2000000.0, FVector::ZeroVector, HitLocation, HitNormal, Time))
+			{
+				Boxes.Add({ Time * 20000.0, *It });
+			}
+		}
+		Boxes.Sort([](const TPair<double, const UStaticMeshComponent*>& A, const TPair<double, const UStaticMeshComponent*>& B) { return A.Key < B.Key; });
+		for (int32 Index = 0; Index < FMath::Min(Boxes.Num(), 4); ++Index)
+		{
+			const UStaticMeshComponent* Mesh = Boxes[Index].Value;
+			UE_LOG(LogTemp, Display, TEXT("Airport.Pick %s: box %.0f m %s mesh %s collision=%d:%s"), *Where, Boxes[Index].Key, *Mesh->GetOwner()->GetName(),
+				Mesh->GetStaticMesh() ? *Mesh->GetStaticMesh()->GetName() : TEXT("-"), Mesh->IsCollisionEnabled() ? 1 : 0, *Describe(Mesh));
+		}
+	}
+
+	/**
+	 * Editor: shadows that are not black. "Airport.GradeShadows [toe 0.42] [shadow gamma 1.2]" sets the film toe (0.55 is
+	 * the engine's; lower crushes the darks less) and the shadow gamma on the map's unbound post process volume and saves
+	 * the map. The sky light barely reaches the shade here, so backlit facades were black (measured 10-11-2026: the dark
+	 * part of a terminal view 8 -> 15 of 255, the sky the same).
+	 */
+	void GradeShadows(const TArray<FString>& Args, UWorld* World)
+	{
+		const float Toe = Args.Num() > 0 ? FCString::Atof(*Args[0]) : 0.42f;
+		const float Gamma = Args.Num() > 1 ? FCString::Atof(*Args[1]) : 1.2f;
+		int32 Count = 0;
+		for (TActorIterator<APostProcessVolume> It(World); World && It; ++It)
+		{
+			if (!It->bUnbound)
+			{
+				continue;
+			}
+			It->Modify();
+			It->Settings.bOverride_FilmToe = true;
+			It->Settings.FilmToe = Toe;
+			It->Settings.bOverride_ColorGammaShadows = true;
+			It->Settings.ColorGammaShadows = FVector4(1.0, 1.0, 1.0, Gamma);
+			++Count;
+		}
+#if WITH_EDITOR
+		if (Count > 0 && World->WorldType == EWorldType::Editor)
+		{
+			UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost() }, false);
+		}
+#endif
+		UE_LOG(LogTemp, Display, TEXT("Airport.GradeShadows: film toe %.2f, shadow gamma %.2f on %d post process volume(s)%s"), Toe, Gamma, Count,
+			World && World->WorldType == EWorldType::Editor ? TEXT(", map saved") : TEXT(" (not saved: Play)"));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GradeShadowsCommand(
+		TEXT("Airport.GradeShadows"),
+		TEXT("Airport.GradeShadows [toe 0.42] [shadow gamma 1.2]: shadows that are not black (map's post process volume); saves the map"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&GradeShadows));
+
+	FAutoConsoleCommandWithWorldAndArgs PickCommand(
+		TEXT("Airport.Pick"),
+		TEXT("Airport.Pick <x 0..1> <y 0..1>: during Play, what is at that point of the picture and its materials"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Pick));
+
+	FAutoConsoleCommandWithWorldAndArgs SkyInfoCommand(
+		TEXT("Airport.SkyInfo"),
+		TEXT("Airport.SkyInfo: sky lights, suns and post process exposure of the world (also during Play)"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&SkyInfo));
 
 	/** Lighter shadows: stronger sky light that captures the scene live. Saves the level. */
 	void SoftenShadows(const TArray<FString>& Args, UWorld* World)
@@ -2527,6 +2838,33 @@ namespace
 				Views.Add({ Spot + FVector(-2500.0, -2500.0, 900.0), Spot });
 			}
 			UE_LOG(LogTemp, Display, TEXT("Airport.Shots: %d trees found, %d views"), Trees.Num(), Views.Num());
+		}
+		// "Airport.Shots 20 bldg": the buildings Airport.BrightenShared gave their own material (<name>_Bldg), whole in view
+		else if (Mode == TEXT("bldg"))
+		{
+			for (TActorIterator<AActor> It(World); It && Views.Num() < 6; ++It)
+			{
+				TInlineComponentArray<UStaticMeshComponent*> Components(*It);
+				for (const UStaticMeshComponent* Component : Components)
+				{
+					// By the shared instance's name, so the same buildings are found before (shared) and after (_Bldg)
+					bool bShared = false;
+					for (const UMaterialInterface* Material : Component->GetMaterials())
+					{
+						const FString Name = Material ? Material->GetName() : FString();
+						bShared |= Component->Bounds.GetBox().GetSize().Z > 600.0 && (Name.StartsWith(TEXT("BLDG003_Terminal_1_2_m"))
+							|| Name.StartsWith(TEXT("BLDG107_mat")) || Name.StartsWith(TEXT("Parkplatz_radar_mat")));
+					}
+					if (bShared)
+					{
+						const FBox Box = Component->Bounds.GetBox();
+						const double Reach = FMath::Max(Box.GetExtent().Size2D() * 1.6, 8000.0);
+						Views.Add({ Box.GetCenter() + FVector(-0.7 * Reach, -0.7 * Reach, 0.45 * Reach), Box.GetCenter() });
+						UE_LOG(LogTemp, Display, TEXT("Airport.Shots: building %s at %s, %.0f m"), *It->GetName(), *Box.GetCenter().ToString(), Box.GetSize().Size2D() / 100.0);
+						break;
+					}
+				}
+			}
 		}
 		else if (Mode == TEXT("perf"))
 		{

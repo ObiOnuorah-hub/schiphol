@@ -4,6 +4,7 @@
 #include "AircraftSpawnSubsystem.h"
 #include "AirportData.h"
 #include "ATCAircraft.h"
+#include "ATCScoreSubsystem.h"
 #include "AircraftTypeData.h"
 #include "ATCSimClockSubsystem.h"
 #include "ATCSimSettings.h"
@@ -148,6 +149,11 @@ void UAirportSubsystem::ApplyScenario(UWorld* World, UScenarioData* Scenario)
 	AppliedWorld = World;
 	ActiveScenario = Scenario;
 	ActiveAirport = Scenario->Airport.LoadSynchronous();
+	// A new exercise: the score counts from here
+	if (UATCScoreSubsystem* Score = World->GetSubsystem<UATCScoreSubsystem>())
+	{
+		Score->ResetScore();
+	}
 
 	// An imported airport map has its own sun, sky and fog but no rig: one is added now, so plain Play keeps the map's
 	// own look and the scenario takes over the lighting

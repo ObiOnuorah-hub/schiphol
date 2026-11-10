@@ -131,6 +131,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ATC|Taxi")
 	float StopToleranceCm = 10.f;
 
+	/**
+	 * Taxiing in after its landing: in the taxi network's queues it counts as a landing (LandingHeadStartSeconds), so it
+	 * gets off its runway exit before ground traffic goes; otherwise it holds that exit and the next landings go around.
+	 * The aircraft sets it at the end of the rollout and clears it on the stand.
+	 */
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadWrite, Category = "ATC|Taxi")
+	bool bPriority = false;
+
 	/** Keep distance to other aircraft and only drive on reserved taxiway (see Project Settings > ATC Sim > Traffic). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ATC|Taxi")
 	bool bKeepSeparation = true;

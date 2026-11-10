@@ -41,5 +41,10 @@ private:
 	UFUNCTION()
 	void HandleRadioMessage(const FString& Line);
 
+	/** The session score on the top line (UATCScoreSubsystem). */
+	void HandleScoreChanged();
+	void ShowLines();
+
 	TArray<FString> Lines;
+	FString ScoreLine;
 };

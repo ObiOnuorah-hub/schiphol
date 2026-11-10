@@ -1,4 +1,5 @@
 #include "RadioLogDisplay.h"
+#include "ATCScoreSubsystem.h"
 #include "RadioSubsystem.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/TextRenderComponent.h"
@@ -66,6 +67,34 @@ void ARadioLogDisplay::BeginPlay()
 	{
 		Radio->OnRadioMessage.AddUniqueDynamic(this, &ARadioLogDisplay::HandleRadioMessage);
 	}
+	if (UATCScoreSubsystem* Score = GetWorld()->GetSubsystem<UATCScoreSubsystem>())
+	{
+		Score->OnScoreChanged.AddUObject(this, &ARadioLogDisplay::HandleScoreChanged);
+		HandleScoreChanged();
+	}
+}
+
+void ARadioLogDisplay::HandleScoreChanged()
+{
+	if (const UATCScoreSubsystem* Score = GetWorld() ? GetWorld()->GetSubsystem<UATCScoreSubsystem>() : nullptr)
+	{
+		ScoreLine = Score->GetScore().ToLine();
+		ShowLines();
+	}
+}
+
+void ARadioLogDisplay::ShowLines()
+{
+	if (ScoreLine.IsEmpty() && Lines.Num() == 0)
+	{
+		return;   // the frequencies from the constructor stay
+	}
+	FString Shown = ScoreLine;
+	for (const FString& Line : Lines)
+	{
+		Shown += (Shown.IsEmpty() ? TEXT("") : TEXT("\n")) + Line;
+	}
+	Text->SetText(FText::FromString(Shown));
 }
 
 void ARadioLogDisplay::HandleRadioMessage(const FString& Line)
@@ -87,9 +116,10 @@ void ARadioLogDisplay::HandleRadioMessage(const FString& Line)
 		Lines.Add(Lines.Num() == 0 || Rest.Len() == Line.Len() ? Rest.Left(Cut) : TEXT("   ") + Rest.Left(Cut));
 		Rest = Rest.Mid(Cut).TrimStart();
 	}
-	while (Lines.Num() > MaxLines)
+	// The score line takes one of the lines
+	while (Lines.Num() > FMath::Max(MaxLines - (ScoreLine.IsEmpty() ? 0 : 1), 1))
 	{
 		Lines.RemoveAt(0);
 	}
-	Text->SetText(FText::FromString(FString::Join(Lines, TEXT("\n"))));
+	ShowLines();
 }

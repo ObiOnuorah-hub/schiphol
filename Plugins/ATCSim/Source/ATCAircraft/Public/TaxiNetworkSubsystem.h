@@ -39,7 +39,10 @@ struct ATCAIRCRAFT_API FTaxiClaimRequest
 	/** The aircraft ahead it keeps its distance to and now stands behind: that wait counts in the deadlock check too. */
 	const AActor* HeldBy = nullptr;
 
-	/** A landing: it cannot wait in the air, so in the queues it counts as having waited LandingHeadStartSeconds already. */
+	/**
+	 * A landing (it cannot wait in the air) or an arrival taxiing in (it holds its runway exit until it is through): in
+	 * the queues it counts as having waited LandingHeadStartSeconds already.
+	 */
 	bool bPriority = false;
 };
 
@@ -235,8 +238,10 @@ private:
 		TObjectKey<AActor> Blocker;
 		/** After a deadlock this one lets the others go first until then. */
 		float BackOffUntil = -1.f;
-		/** A landing: in the queues it counts as having waited HeadStartSeconds longer. */
+		/** A landing or an arrival taxiing in: in the queues it counts as having waited HeadStartSeconds longer. */
 		bool bPriority = false;
+		/** Reserved from the air (a landing's runway exit): it cannot back off after a deadlock. */
+		bool bAirborne = false;
 	};
 
 	struct FHeld

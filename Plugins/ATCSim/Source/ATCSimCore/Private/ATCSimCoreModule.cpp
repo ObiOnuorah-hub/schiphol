@@ -26,6 +26,9 @@ UATCSimSettings::UATCSimSettings()
 	VRProfile.Add(TEXT("r.VolumetricCloud.ShadowMap"), TEXT("0"));
 	// Every camera picture renders the scene again: in the headset the two live cameras run at 15 Hz instead of 20
 	VRProfile.Add(TEXT("atc.CameraRateScale"), TEXT("0.75"));
+	// 80 % resolution: 16.0 -> 13.5 ms per frame in stereo at 3440x1440 (p99 17.9 -> 15.1 ms), still sharp with TAA. Simpler
+	// shadows (CSM) saved 0.9 ms but lose the sun's shadows on the cab's desks; cheaper VSM only 0.2 ms (measured 10-11-2026)
+	VRProfile.Add(TEXT("r.ScreenPercentage"), TEXT("80"));
 
 	ValidatedPaths = { TEXT("/Game/Aircraft"), TEXT("/Game/Airports"), TEXT("/Game/Environment"), TEXT("/Game/Camera"), TEXT("/Game/Scenarios"), TEXT("/ATCSim") };
 	AllowedDependencyRoots = { TEXT("/Game/"), TEXT("/ATCSim/"), TEXT("/Script/"), TEXT("/Engine/"), TEXT("/Niagara/") };

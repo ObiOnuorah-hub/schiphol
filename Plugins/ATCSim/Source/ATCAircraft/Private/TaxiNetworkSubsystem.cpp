@@ -710,6 +710,7 @@ float UTaxiNetworkSubsystem::UpdateClaim(const AActor* Aircraft, const FTaxiClai
 	Claim.Aircraft = Aircraft;
 	SetShape(Claim, Request);
 	Claim.bPriority = Request.bPriority;
+	Claim.bAirborne = false;   // on the ground: it drives its own claim
 	const FTrack& Track = Tracks[TrackIndex];
 
 	// A new route (after a pushback, a landing or a lane change): the aircraft is already there, so its body is claimed as it is
@@ -850,6 +851,7 @@ bool UTaxiNetworkSubsystem::ClaimStretch(const AActor* Aircraft, const FTaxiClai
 	Claim.Aircraft = Aircraft;
 	SetShape(Claim, Request);
 	Claim.bPriority = Request.bPriority;
+	Claim.bAirborne = Request.bPriority;   // a stretch with priority is a landing's runway exit, reserved from the air
 	const int32 First = LocalSample(Track, Request.RearCm);
 	const int32 Last = FMath::Min(LocalSample(Track, Request.FrontCm) + 1, Track.Num - 1);
 	TObjectKey<AActor> Blocker;
@@ -1345,7 +1347,7 @@ void UTaxiNetworkSubsystem::CheckDeadlocks()
 			Names.Add(NameOf(Member));
 			const FClaim& Claim = Claims[Member];
 			const bool bAhead = Claim.Last > FrontOf(Member, Claim);
-			if (Claim.bPriority || (!bAhead && Claim.WantedTrack == INDEX_NONE))
+			if (Claim.bAirborne || (!bAhead && Claim.WantedTrack == INDEX_NONE))
 			{
 				continue;
 			}

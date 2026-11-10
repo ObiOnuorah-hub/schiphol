@@ -59,13 +59,17 @@ public:
 	/**
 	 * A landing holds in the stack until its runway exit can be cleared (nobody on it, nobody waiting for it longer),
 	 * at most this long. Then it comes anyway, and goes around when the exit is still taken 1.5 km before the runway.
+	 * 600: at 300 the ones for the busy exits came while the landing before was still taxiing off, and went around.
 	 */
 	UPROPERTY(Config, EditAnywhere, Category = "Traffic", meta = (Units = "s"))
-	float MaxHoldingSeconds = 300.f;
+	float MaxHoldingSeconds = 600.f;
 
-	/** Landings on the same runway come out of the stack at least this far apart. */
+	/**
+	 * Landings on the same runway come out of the stack at least this far apart. 90: at 75 the one before was often still
+	 * on the shared taxiway behind the Schiphol exits when the next one came over the threshold (go-around).
+	 */
 	UPROPERTY(Config, EditAnywhere, Category = "Traffic", meta = (Units = "s"))
-	float LandingSpacingSeconds = 75.f;
+	float LandingSpacingSeconds = 90.f;
 
 	/** Asset paths that must not depend on content outside the project or this plugin (see the reference validator). */
 	UPROPERTY(Config, EditAnywhere, Category = "Validation")

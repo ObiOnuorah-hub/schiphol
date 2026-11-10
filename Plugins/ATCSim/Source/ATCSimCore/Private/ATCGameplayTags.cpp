@@ -17,4 +17,5 @@ UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_ATC_Event_Traffic_Spawned, "Event.Traffic.Spa
 UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_ATC_Event_Traffic_Queued, "Event.Traffic.Queued", "Spawn waits: another aircraft is in the way");
 UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_ATC_Event_Traffic_Removed, "Event.Traffic.Removed", "Aircraft removed (departed or despawned)");
 UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_ATC_Event_Traffic_Takeoff, "Event.Traffic.Takeoff", "Takeoff roll started");
+UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_ATC_Event_Traffic_Landed, "Event.Traffic.Landed", "Landed, rolling out onto the arrival route");
 UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_ATC_Event_Traffic_GateAssigned, "Event.Traffic.GateAssigned", "Arrival assigned to a gate");
