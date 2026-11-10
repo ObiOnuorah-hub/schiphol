@@ -5,6 +5,7 @@
 #include "ATCUnits.h"
 #include "Components/StaticMeshComponent.h"
 #include "Editor.h"
+#include "Engine/PostProcessVolume.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -1223,6 +1224,31 @@ namespace ATCMapSurvey
 		UE_LOG(LogATC, Display, TEXT("ATC.MapFind %s: %d components"), *Args[0], Count);
 	}
 
+	/** The post process volumes of the editor map and their exposure and bloom overrides (only what is overridden). */
+	void MapPostProcess(const TArray<FString>& Args)
+	{
+		UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+		for (TActorIterator<APostProcessVolume> It(World); It; ++It)
+		{
+			const FPostProcessSettings& S = It->Settings;
+			FString Text;
+			auto Add = [&Text](bool bOverride, const TCHAR* Name, float Value) { if (bOverride) { Text += FString::Printf(TEXT(" %s=%.2f"), Name, Value); } };
+			Add(S.bOverride_AutoExposureMethod, TEXT("Method"), static_cast<float>(S.AutoExposureMethod.GetValue()));
+			Add(S.bOverride_AutoExposureBias, TEXT("Bias"), S.AutoExposureBias);
+			Add(S.bOverride_AutoExposureMinBrightness, TEXT("MinEV"), S.AutoExposureMinBrightness);
+			Add(S.bOverride_AutoExposureMaxBrightness, TEXT("MaxEV"), S.AutoExposureMaxBrightness);
+			Add(S.bOverride_AutoExposureApplyPhysicalCameraExposure, TEXT("PhysCam"), S.AutoExposureApplyPhysicalCameraExposure ? 1.f : 0.f);
+			Add(S.bOverride_BloomIntensity, TEXT("Bloom"), S.BloomIntensity);
+			Add(S.bOverride_LocalExposureHighlightContrastScale, TEXT("LocalHighlights"), S.LocalExposureHighlightContrastScale);
+			Add(S.bOverride_LocalExposureShadowContrastScale, TEXT("LocalShadows"), S.LocalExposureShadowContrastScale);
+			Add(S.bOverride_ToneCurveAmount, TEXT("ToneCurve"), S.ToneCurveAmount);
+			UE_LOG(LogATC, Display, TEXT("ATC.MapPostProcess: %s unbound %d priority %.1f blend %.2f enabled %d:%s"), *It->GetActorLabel(), It->bUnbound ? 1 : 0,
+				It->Priority, It->BlendWeight, It->bEnabled ? 1 : 0, Text.IsEmpty() ? TEXT(" no exposure overrides") : *Text);
+		}
+	}
+
+	FAutoConsoleCommand PostProcessCommand(TEXT("ATC.MapPostProcess"), TEXT("Exposure and bloom overrides of the post process volumes in the editor map"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&MapPostProcess));
 	FAutoConsoleCommand FindCommand(TEXT("ATC.MapFind"), TEXT("ATC.MapFind <filter>: mesh components by mesh or material name"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&MapFind));
 	FAutoConsoleCommand NearCommand(TEXT("ATC.MapNear"), TEXT("ATC.MapNear <x m> <y m> <radius m>: meshes around a point plus height profile of the tallest"),

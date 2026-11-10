@@ -1,4 +1,5 @@
 #include "AircraftSpawnSubsystem.h"
+#include "ProfilingDebugging/CsvProfiler.h"
 #include "AircraftIdentityComponent.h"
 #include "AircraftMovementComponent.h"
 #include "AircraftSpawnPoint.h"
@@ -169,6 +170,7 @@ FName UAircraftSpawnSubsystem::RequestSpawn(const FAircraftSpawnRequest& InReque
 
 AATCAircraft* UAircraftSpawnSubsystem::TrySpawn(const FAircraftSpawnRequest& InRequest, AActor*& OutBlocker)
 {
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_TrySpawn);
 	OutBlocker = nullptr;
 	FAircraftSpawnRequest Request = InRequest;
 	if ((!Request.Route && !Request.StandTag.IsValid()) || !Request.Type || !Request.AircraftClass || Request.Callsign.IsNone())
@@ -340,6 +342,7 @@ void UAircraftSpawnSubsystem::ReportSpawned(AATCAircraft* Aircraft, ATaxiRoute* 
 
 void UAircraftSpawnSubsystem::ProcessQueue()
 {
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_SpawnQueue);
 	// First come, first served per place: a later request for the same place waits for the earlier one
 	TArray<FString> Blocked;
 	for (int32 Index = 0; Index < Queue.Num();)

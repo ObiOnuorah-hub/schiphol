@@ -16,6 +16,7 @@
 #include "GMICamera.h"
 #include "GMICameraSubsystem.h"
 #include "LensSetData.h"
+#include "MonitorDisplay.h"
 #include "PTZControllerComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "LightingRigComponent.h"
@@ -613,6 +614,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCParkedModelTest, "ATCSim.Aircraft.ParkedMod
 /**
  * A gate with a parked model of the map: when the traffic starts, an aircraft of the model's type and airline stands on
  * the gate and the model is hidden. Removed before its pushback, the model is back; after its pushback it stays hidden.
+ * With ParkedModelShare 0.5 the second gate's model is taken away instead (gate free), and is back when the traffic stops.
  */
 bool FATCParkedModelTest::RunTest(const FString& Parameters)
 {
@@ -653,7 +655,21 @@ bool FATCParkedModelTest::RunTest(const FString& Parameters)
 	Gate.ParkedModels = { Model };
 	Gate.ParkedType = Type;
 	Gate.ParkedAirline = TEXT("KLM");
+
+	// A second gate with a model: with ParkedModelShare 0.5 only every other model comes to life, this one is taken away
+	AStand* Stand2 = World->SpawnActor<AStand>(FVector(0, 8000, 0), FRotator::ZeroRotator);
+	Stand2->StandTag = FGameplayTag::RequestGameplayTag(TEXT("Stand.Showcase.S2"));
+	AActor* Model2 = World->SpawnActor<AActor>(FVector(0, 8000, 0), FRotator::ZeroRotator);
+	FTrafficGate& Gate2 = Director->Gates.AddDefaulted_GetRef();
+	Gate2.Stand = Stand2->StandTag;
+	Gate2.DepartureRoute = Taxi->RouteTag;
+	Gate2.ParkedModels = { Model2 };
+	Gate2.ParkedType = Type;
+	Gate2.ParkedAirline = TEXT("KLM");
+	Director->ParkedModelShare = 0.5f;
 	Director->StartTraffic();
+	TestTrue(TEXT("second model taken away"), Model2->IsHidden());
+	TestTrue(TEXT("its gate is free"), Stand2->GetOccupant() == nullptr);
 
 	const AATCAircraft* StandIn = Cast<AATCAircraft>(Stand->GetOccupant());
 	const FName Callsign = StandIn ? StandIn->Identity->Callsign : NAME_None;
@@ -681,6 +697,7 @@ bool FATCParkedModelTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("removed after its pushback: the model stays hidden"), Model->IsHidden());
 
 	Director->StopTraffic();
+	TestFalse(TEXT("traffic stopped: the model taken away is back"), Model2->IsHidden());
 	GEngine->DestroyWorldContext(World);
 	World->DestroyWorld(false);
 	return true;
@@ -1136,6 +1153,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCLandingPriorityTest, "ATCSim.Aircraft.Landi
  * A departure queues for a taxiway while an aircraft on it comes the other way. When that one has gone, a landing asks
  * for the same taxiway in that other direction. On the ground whoever waits longest goes first; a landing counts as
  * having waited LandingHeadStartSeconds already, so it goes first, unless the departure has waited longer than that.
+ * An aircraft still at its gate never holds a landing up.
  */
 bool FATCLandingPriorityTest::RunTest(const FString& Parameters)
 {
@@ -1153,6 +1171,9 @@ bool FATCLandingPriorityTest::RunTest(const FString& Parameters)
 	AATCAircraft* Landing = ATCTest::StandOnRoute(World, Type, TEXT("LAND1"), East, SharedStart + 5000.f);
 
 	AActor* Blocker = nullptr;
+	// WEST1 is out on the taxiways already: it holds a place on its own leg, far enough back (closer in the two legs
+	// run side by side and already count as the shared two-way stretch)
+	Network->ClaimBody(Departure, ATCTest::ClaimFor(Type, West, SharedStart - 55000.f, SharedStart - 50000.f));
 	TestTrue(TEXT("EAST1 is on the shared taxiway"), Network->ClaimStretch(Taxiing, ATCTest::ClaimFor(Type, East, SharedStart + 45000.f, SharedStart + 55000.f), Blocker));
 	const FTaxiClaimRequest Ahead = ATCTest::ClaimFor(Type, West, SharedStart - 5000.f, SharedStart + 5000.f);
 	TestFalse(TEXT("WEST1 cannot take it the other way"), Network->ReserveTwoWay(Departure, Ahead, Blocker));
@@ -1177,6 +1198,14 @@ bool FATCLandingPriorityTest::RunTest(const FString& Parameters)
 	ATCTest::Advance(World, GetDefault<UATCSimSettings>()->LandingHeadStartSeconds);
 	TestFalse(TEXT("WEST1, waiting longer than the head start, goes before the next landing"), Network->ClaimStretch(Landing, Exit, Blocker, true));
 	TestTrue(TEXT("held up by WEST1"), Blocker == Departure);
+
+	// At its gate an aircraft holds no taxiway and can wait there: however long it has waited, a landing goes first
+	// (a pushback that waited at its gate sent landings around in the live runs)
+	Network->ReleaseClaim(Departure);
+	AATCAircraft* AtGate = ATCTest::StandOnRoute(World, Type, TEXT("GATE1"), West, SharedStart - 10000.f);
+	TestFalse(TEXT("GATE1 waits for EAST1"), Network->ReserveTwoWay(AtGate, Ahead, Blocker));
+	ATCTest::Advance(World, GetDefault<UATCSimSettings>()->LandingHeadStartSeconds + 10.f);
+	TestTrue(TEXT("a landing does not wait for GATE1, still at its gate"), Network->ClaimStretch(Landing, Exit, Blocker, true));
 	ATCTest::DestroyPlayWorld(World);
 	return true;
 }
@@ -1225,6 +1254,60 @@ bool FATCDeadlockTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("NORTH1 let go of the crossing"), To < 55000.f);
 	TestNull(TEXT("EAST1 now gets the crossing"), Ask(EastOne, East, nullptr));
 	TestTrue(TEXT("EAST1 reserved through it"), Network->GetClaim(EastOne, Route, From, To) && To > 65000.f);
+	ATCTest::DestroyPlayWorld(World);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATCMonitorButtonsTest, "ATCSim.Camera.MonitorButtons", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * The touch buttons on a tower screen: a ray at "CAM>" hits that button (the picture and the back of the screen are no
+ * button), pressing it shows the next camera on that screen and operates it, after the last camera comes the first,
+ * "<CAM" goes back and "PRE>" sends the screen's camera to its next preset.
+ */
+bool FATCMonitorButtonsTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = ATCTest::MakePlayWorld(TEXT("ATCSimButtonsWorld"));
+	auto MakeCamera = [World](const TCHAR* Id, float FirstPanDeg)
+	{
+		FCameraPreset Near;
+		Near.PanDeg = FirstPanDeg;
+		FCameraPreset Far;
+		Far.PanDeg = FirstPanDeg + 90.f;
+		AGMICamera* Camera = World->SpawnActorDeferred<AGMICamera>(AGMICamera::StaticClass(), FTransform::Identity);
+		Camera->CameraId = Id;
+		Camera->PTZ->Presets = { Near, Far };
+		Camera->FinishSpawning(FTransform::Identity);
+		return Camera;
+	};
+	AGMICamera* First = MakeCamera(TEXT("GMI-A"), 0.f);
+	AGMICamera* Second = MakeCamera(TEXT("GMI-B"), 10.f);
+
+	// A screen of the tower model, 40 x 30 cm, facing +X
+	AMonitorDisplay* Monitor = World->SpawnActorDeferred<AMonitorDisplay>(AMonitorDisplay::StaticClass(), FTransform::Identity);
+	Monitor->WidthCm = 40.f;
+	Monitor->HeightCm = 30.f;
+	Monitor->SourceCamera = First;
+	Monitor->FinishSpawning(FTransform::Identity);
+
+	float Distance = 0.f;
+	const FVector Button = Monitor->GetButtonLocation(1);
+	TestEqual(TEXT("looking straight at CAM> from 70 cm"), Monitor->ButtonAt(Button + FVector(70.f, 0.f, 0.f), FVector(-1.f, 0.f, 0.f), Distance), 1);
+	TestEqual(TEXT("70 cm away"), Distance, 70.f, 0.5f);
+	TestEqual(TEXT("the picture is no button"), Monitor->ButtonAt(Monitor->GetPictureCenter() + FVector(70.f, 0.f, 0.f), FVector(-1.f, 0.f, 0.f), Distance), INDEX_NONE);
+	TestEqual(TEXT("from behind the screen nothing"), Monitor->ButtonAt(Button - FVector(70.f, 0.f, 0.f), FVector(1.f, 0.f, 0.f), Distance), INDEX_NONE);
+
+	Monitor->PressButton(1);
+	TestTrue(TEXT("CAM> shows the next camera"), Monitor->SourceCamera == Second);
+	TestTrue(TEXT("and operates it"), World->GetSubsystem<UGMICameraSubsystem>()->GetSelectedCamera() == Second);
+	Monitor->PressButton(1);
+	TestTrue(TEXT("after the last camera the first again"), Monitor->SourceCamera == First);
+	Monitor->PressButton(0);
+	TestTrue(TEXT("<CAM goes back"), Monitor->SourceCamera == Second);
+
+	Monitor->PressButton(3);
+	ATCTest::Advance(World, Second->PTZ->TransitionTime + 1.f);
+	TestEqual(TEXT("PRE> turns the camera to its next preset"), Second->PTZ->PanDeg, 100.f, 0.5f);
 	ATCTest::DestroyPlayWorld(World);
 	return true;
 }

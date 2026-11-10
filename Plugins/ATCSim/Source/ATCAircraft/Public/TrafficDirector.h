@@ -9,6 +9,7 @@ class AATCAircraft;
 class ATaxiRoute;
 class UAircraftTypeData;
 class UTrafficMixData;
+struct FStreamableHandle;
 
 /** A gate in the traffic program: its stand, how arrivals get there and where departures go. */
 USTRUCT(BlueprintType)
@@ -38,6 +39,7 @@ struct ATCAIRCRAFT_API FTrafficGate
 	/**
 	 * The parked aircraft of the map itself (static or skeletal meshes) that stand on this gate, normally one. When the
 	 * traffic starts, an aircraft of ParkedType with a callsign of ParkedAirline takes their place (they are hidden), and departs.
+	 * That is ParkedModelShare of the gates; at the others the models are only hidden.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Parked model")
 	TArray<TObjectPtr<AActor>> ParkedModels;
@@ -95,9 +97,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0", ClampMax = "1"))
 	float InitialOccupancy = 0.6f;
 
-	/** Schiphol handles up to about 70 an hour on two landing runways. */
+	/** Schiphol handles up to about 70 an hour on two landing runways; 30 keeps the game smooth and still busy. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
-	float ArrivalsPerHour = 40.f;
+	float ArrivalsPerHour = 30.f;
+
+	/**
+	 * Share of the map's parked models that come to life when the traffic starts (EHAM has 59). Each one is an aircraft
+	 * that ticks, claims taxiways and pushes back later, so fewer is smoother. The others are taken away (hidden) and
+	 * their gates are free for arrivals; StopTraffic puts them back. Spread evenly: 0.5 is every other one.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0", ClampMax = "1"))
+	float ParkedModelShare = 0.5f;
 
 	/** Time at the gate before pushback, min and max. Real turnarounds take 45-90 minutes; compressed for training. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
@@ -196,8 +206,14 @@ private:
 	/** Aircraft that take the place of a parked model, until they are spawned. */
 	TSet<FName> ParkedModelStandIns;
 
+	/** Gates whose parked models were taken away at the start (ParkedModelShare). */
+	TArray<int32> EmptiedGates;
+
 	/** Runway designator ("36L") -> time from which the next departure or crossing may use it. */
 	TMap<FString, float> RunwayFreeAt;
+
+	/** The fleet's models, loaded in the background at the start and kept: a spawn never waits for its model. */
+	TSharedPtr<FStreamableHandle> FleetModels;
 
 	FTimerHandle ArrivalTimer;
 	FRandomStream Random = FRandomStream(2026);

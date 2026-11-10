@@ -76,8 +76,46 @@ public:
 	/** Size of the picture (cm). */
 	FVector2D GetPictureSize() const;
 
+	/**
+	 * Touch buttons right in the strip under the picture, like on a tower touch screen: 0 "<CAM" and 1 "CAM>" show the
+	 * previous / next camera on this screen, 2 "<PRE" and 3 "PRE>" send its camera to the previous / next preset.
+	 * Pressed by looking at one and clicking, pulling a trigger or pressing A (UGMICameraSubsystem).
+	 */
+	static constexpr int32 NumButtons = 4;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "ATC|Monitor")
+	TArray<TObjectPtr<UStaticMeshComponent>> ButtonFaces;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "ATC|Monitor")
+	TArray<TObjectPtr<UTextRenderComponent>> ButtonLabels;
+
+	/** The button a ray from Eye along Forward hits (INDEX_NONE = none) and how far away it is. */
+	int32 ButtonAt(const FVector& Eye, const FVector& Forward, float& OutDistance) const;
+
+	/** Middle of a button (world). */
+	FVector GetButtonLocation(int32 Index) const;
+
+	/** Lights up the button the viewer looks at (INDEX_NONE = none). */
+	void SetHoveredButton(int32 Index);
+
+	UFUNCTION(BlueprintCallable, Category = "ATC|Monitor")
+	void PressButton(int32 Index);
+
 private:
 	void LayOut();
+	void PlaceButtons(float CenterZ, float FrontX);
+	void UpdateButtonLook();
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> ButtonInstances;
+
+	/** Button middles in the actor's space: X = right-left (Y), Y = up (Z). */
+	TArray<FVector2D> ButtonCenters;
+	FVector2D ButtonSize = FVector2D(10.f, 5.f);
+	float ButtonFrontX = 0.f;
+	int32 HoveredButton = INDEX_NONE;
+	int32 PressedButton = INDEX_NONE;
+	FTimerHandle PressTimer;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> ScreenInstance;

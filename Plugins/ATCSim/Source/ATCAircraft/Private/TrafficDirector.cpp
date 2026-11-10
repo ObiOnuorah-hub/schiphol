@@ -1,4 +1,5 @@
 #include "TrafficDirector.h"
+#include "ProfilingDebugging/CsvProfiler.h"
 #include "AircraftIdentityComponent.h"
 #include "AircraftSpawnPoint.h"
 #include "EngineUtils.h"
@@ -16,6 +17,8 @@
 #include "TrafficSubsystem.h"
 #include "AircraftMovementComponent.h"
 #include "Components/SplineComponent.h"
+#include "Engine/AssetManager.h"
+#include "Engine/StreamableManager.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
 
@@ -47,6 +50,7 @@ float ATrafficDirector::Now() const
 
 void ATrafficDirector::StartTraffic()
 {
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_StartTraffic);
 	UTrafficSubsystem* Traffic = GetWorld()->GetSubsystem<UTrafficSubsystem>();
 	UAircraftSpawnSubsystem* Spawner = GetWorld()->GetSubsystem<UAircraftSpawnSubsystem>();
 	if (bRunning || !Traffic || !Spawner || !TrafficMix || Gates.Num() == 0)
@@ -58,9 +62,29 @@ void ATrafficDirector::StartTraffic()
 	Traffic->OnAircraftEvent.AddUniqueDynamic(this, &ATrafficDirector::HandleAircraftEvent);
 	Spawner->OnAircraftSpawned.AddUniqueDynamic(this, &ATrafficDirector::HandleSpawned);
 
+	// Every model of the fleet in the background now: loading one when its first aircraft spawns stalled the game
+	// (FlushAsyncLoading about once a minute). The types themselves are small data assets
+	TArray<FSoftObjectPath> Models;
+	for (const FTrafficMixEntry& Entry : TrafficMix->Entries)
+	{
+		if (const UAircraftTypeData* Type = Entry.Type.LoadSynchronous())
+		{
+			Models.AddUnique(Type->Mesh.ToSoftObjectPath());
+			for (const FAircraftLivery& Livery : Type->Liveries)
+			{
+				Models.AddUnique(Livery.Mesh.ToSoftObjectPath());
+			}
+		}
+	}
+	Models.RemoveAll([](const FSoftObjectPath& Path) { return Path.IsNull(); });
+	FleetModels = UAssetManager::GetStreamableManager().RequestAsyncLoad(Models);
+	UE_LOG(LogATC, Display, TEXT("%s: loading %d aircraft models in the background"), *GetName(), Models.Num());
+
 	// A normal day is already going: part of the gates have an aircraft in its turnaround, ready at different times.
-	// A gate with a parked model of the map always has one: it takes the model's place and leaves later in the day
-	int32 Parked = 0, StandIns = 0;
+	// A gate with a parked model of the map has one (ParkedModelShare of them): it takes the model's place and leaves
+	// later in the day. The other models are taken away, so fewer aircraft run and their gates are free for arrivals
+	int32 Parked = 0, StandIns = 0, ModelGates = 0;
+	EmptiedGates.Reset();
 	for (int32 Index = 0; Index < Gates.Num(); ++Index)
 	{
 		const AStand* Stand = Traffic->FindStand(Gates[Index].Stand);
@@ -68,6 +92,24 @@ void ATrafficDirector::StartTraffic()
 		if (!Stand || Stand->GetOccupant() || (!ModelType && Random.FRand() > InitialOccupancy))
 		{
 			continue;
+		}
+		if (ModelType)
+		{
+			// Evenly spread: model gate k comes to life when the share's count goes up there (0.5: the 1st, 3rd, 5th ...)
+			const bool bComesToLife = FMath::CeilToInt((ModelGates + 1) * ParkedModelShare) > FMath::CeilToInt(ModelGates * ParkedModelShare);
+			++ModelGates;
+			if (!bComesToLife)
+			{
+				for (AActor* Model : Gates[Index].ParkedModels)
+				{
+					if (Model)
+					{
+						Model->SetActorHiddenInGame(true);
+					}
+				}
+				EmptiedGates.Add(Index);
+				continue;
+			}
 		}
 		UAircraftTypeData* Type = ModelType;
 		TArray<FString> Airlines = { Gates[Index].ParkedAirline };
@@ -127,8 +169,8 @@ void ATrafficDirector::StartTraffic()
 	}
 
 	ScheduleArrival();
-	UE_LOG(LogATC, Display, TEXT("%s: traffic started, %d gates, %d aircraft parked (%d in place of the map's parked models), %d departures queued, %.0f arrivals an hour, clearances %s"),
-		*GetName(), Gates.Num(), Parked, StandIns, Departing, ArrivalsPerHour, bAutoClearances ? TEXT("automatic") : TEXT("by the trainee"));
+	UE_LOG(LogATC, Display, TEXT("%s: traffic started, %d gates, %d aircraft parked (%d in place of the map's parked models, %d models taken away), %d departures queued, %.0f arrivals an hour, clearances %s"),
+		*GetName(), Gates.Num(), Parked, StandIns, EmptiedGates.Num(), Departing, ArrivalsPerHour, bAutoClearances ? TEXT("automatic") : TEXT("by the trainee"));
 }
 
 void ATrafficDirector::StopTraffic()
@@ -144,7 +186,26 @@ void ATrafficDirector::StopTraffic()
 		if (UTrafficSubsystem* Traffic = World->GetSubsystem<UTrafficSubsystem>())
 		{
 			Traffic->OnAircraftEvent.RemoveDynamic(this, &ATrafficDirector::HandleAircraftEvent);
+
+			// The parked models taken away at the start stand there again, where no aircraft stands or is going
+			TArray<int32> Taken;
+			GateOf.GenerateValueArray(Taken);
+			for (const int32 Index : EmptiedGates)
+			{
+				const AStand* Stand = Gates.IsValidIndex(Index) ? Traffic->FindStand(Gates[Index].Stand) : nullptr;
+				if (Stand && !Stand->GetOccupant() && !Taken.Contains(Index))
+				{
+					for (AActor* Model : Gates[Index].ParkedModels)
+					{
+						if (Model)
+						{
+							Model->SetActorHiddenInGame(false);
+						}
+					}
+				}
+			}
 		}
+		EmptiedGates.Reset();
 		if (UAircraftSpawnSubsystem* Spawner = World->GetSubsystem<UAircraftSpawnSubsystem>())
 		{
 			Spawner->OnAircraftSpawned.RemoveDynamic(this, &ATrafficDirector::HandleSpawned);
@@ -278,6 +339,7 @@ void ATrafficDirector::ScheduleArrival()
 
 void ATrafficDirector::SpawnArrival()
 {
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_SpawnArrival);
 	ScheduleArrival();
 	UAircraftSpawnSubsystem* Spawner = GetWorld()->GetSubsystem<UAircraftSpawnSubsystem>();
 	UTrafficSubsystem* Traffic = GetWorld()->GetSubsystem<UTrafficSubsystem>();
@@ -365,6 +427,7 @@ void ATrafficDirector::HandleSpawned(AATCAircraft* Aircraft, FName Callsign)
 
 void ATrafficDirector::Depart(FName Callsign)
 {
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_Depart);
 	UTrafficSubsystem* Traffic = GetWorld()->GetSubsystem<UTrafficSubsystem>();
 	AATCAircraft* Aircraft = Traffic ? Cast<AATCAircraft>(Traffic->FindAircraft(Callsign)) : nullptr;
 	const int32* Gate = GateOf.Find(Callsign);
@@ -430,6 +493,7 @@ void ATrafficDirector::Depart(FName Callsign)
 
 void ATrafficDirector::HandleAircraftEvent(AActor* Actor, FName Callsign, FGameplayTag EventTag, const FString& Detail)
 {
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_DirectorEvent);
 	const int32* Gate = GateOf.Find(Callsign);
 	AATCAircraft* Aircraft = Cast<AATCAircraft>(Actor);
 
@@ -469,6 +533,7 @@ void ATrafficDirector::HandleAircraftEvent(AActor* Actor, FName Callsign, FGamep
 
 void ATrafficDirector::TryClear(FName Callsign, FString StopName)
 {
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_TryClear);
 	UTrafficSubsystem* Traffic = GetWorld()->GetSubsystem<UTrafficSubsystem>();
 	const AATCAircraft* Aircraft = Traffic ? Cast<AATCAircraft>(Traffic->FindAircraft(Callsign)) : nullptr;
 	if (!bRunning || !Aircraft || Aircraft->TaxiController->GetState() != ETaxiState::Holding)

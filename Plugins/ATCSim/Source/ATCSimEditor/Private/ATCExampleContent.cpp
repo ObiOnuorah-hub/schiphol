@@ -54,6 +54,7 @@
 #include "Materials/MaterialExpressionMultiply.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
+#include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "MeshDescription.h"
 #include "Misc/PackageName.h"
@@ -229,6 +230,23 @@ namespace ATCExample
 	FAutoConsoleCommand CreateCameraInputCommand(TEXT("ATC.CreateCameraInput"),
 		TEXT("Input actions and mapping context for the GMI cameras (/ATCSim/Input): keys, gamepad and VR controller"),
 		FConsoleCommandDelegate::CreateLambda([]() { MakeCameraInput(); }));
+
+	/**
+	 * Translucent text for the screens: changing opaque text leaves a ghost in the temporal anti-aliasing. The engine's
+	 * DefaultTextMaterialTranslucent is not cooked by itself; this instance lives in /ATCSim (always cooked) and so
+	 * takes its parent into the package.
+	 */
+	void MakeTextMaterial()
+	{
+		UMaterialInstanceConstant* Text = GetOrCreate<UMaterialInstanceConstant>(TEXT("/ATCSim/Materials"), TEXT("MI_TextTranslucent"));
+		Text->SetParentEditorOnly(LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/EngineMaterials/DefaultTextMaterialTranslucent.DefaultTextMaterialTranslucent")));
+		Text->PostEditChange();
+		UEditorLoadingAndSavingUtils::SavePackages({ Text->GetPackage() }, false);
+		UE_LOG(LogATC, Display, TEXT("ATC.CreateTextMaterial: %s"), *Text->GetPathName());
+	}
+
+	FAutoConsoleCommand CreateTextMaterialCommand(TEXT("ATC.CreateTextMaterial"), TEXT("Translucent text material for the screens (/ATCSim/Materials/MI_TextTranslucent)"),
+		FConsoleCommandDelegate::CreateLambda([]() { MakeTextMaterial(); }));
 
 	/** Yellow taxiway paint. The lights at night are separate meshes along the taxi routes (ATC.CreateTaxiLights). */
 	UMaterial* MakeTaxiLineMaterial()

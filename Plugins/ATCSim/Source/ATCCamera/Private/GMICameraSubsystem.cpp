@@ -186,6 +186,7 @@ void UGMICameraSubsystem::Tick(float DeltaTime)
 	{
 		SetupInput(GetWorld()->GetFirstPlayerController());
 	}
+	UpdateHoveredButton();
 	if (!SelectedCamera.IsValid() && Tracked.Num() > 0)
 	{
 		// The camera on the first screen, otherwise the first camera
@@ -507,6 +508,24 @@ void UGMICameraSubsystem::SetupInput(APlayerController* Controller)
 	InputComponent->BindAction(Actions.NextPreset, ETriggerEvent::Started, this, &UGMICameraSubsystem::OnNextPreset);
 	InputComponent->BindAction(Actions.Preset, ETriggerEvent::Started, this, &UGMICameraSubsystem::OnPreset);
 	InputComponent->BindAction(Actions.Lens, ETriggerEvent::Started, this, &UGMICameraSubsystem::OnLens);
+
+	// The touch buttons on the screens: look at one and click, pull either trigger or press A. Made here, so the input
+	// assets of ATC.CreateCameraInput stay as they are
+	PressAction = NewObject<UInputAction>(this, TEXT("IA_GMI_Press"));
+	PressAction->ValueType = EInputActionValueType::Boolean;
+	PressAction->bConsumeInput = false;
+	PressContext = NewObject<UInputMappingContext>(this, TEXT("IMC_GMI_Press"));
+	PressContext->MapKey(PressAction, EKeys::LeftMouseButton);
+	PressContext->MapKey(PressAction, EKeys::Gamepad_FaceButton_Bottom);
+	for (const TCHAR* Device : { TEXT("OculusTouch"), TEXT("ValveIndex"), TEXT("MixedReality"), TEXT("Vive") })
+	{
+		for (const TCHAR* Hand : { TEXT("Left"), TEXT("Right") })
+		{
+			PressContext->MapKey(PressAction, FKey(*FString::Printf(TEXT("%s_%s_Trigger_Click"), Device, Hand)));
+		}
+	}
+	Input->AddMappingContext(PressContext, 1);
+	InputComponent->BindAction(PressAction, ETriggerEvent::Started, this, &UGMICameraSubsystem::OnPress);
 	Controller->PushInputComponent(InputComponent);
 	InputController = Controller;
 }
@@ -557,6 +576,51 @@ void UGMICameraSubsystem::OnPreset(const FInputActionValue& Value)
 	{
 		Camera->PTZ->GoToPresetIndex(Number - 1);
 		RefreshLabels();
+	}
+}
+
+void UGMICameraSubsystem::UpdateHoveredButton()
+{
+	// The nearest button the view ray hits, at most 4 m away (the screens on the console in front of the player)
+	AMonitorDisplay* Best = nullptr;
+	int32 BestButton = INDEX_NONE;
+	float BestDistance = 400.f;
+	FVector Eye, Forward;
+	if (GetView(Eye, Forward))
+	{
+		for (const TWeakObjectPtr<AMonitorDisplay>& Weak : Monitors)
+		{
+			float Distance = 0.f;
+			const int32 Button = Weak.IsValid() ? Weak->ButtonAt(Eye, Forward, Distance) : INDEX_NONE;
+			if (Button != INDEX_NONE && Distance < BestDistance)
+			{
+				Best = Weak.Get();
+				BestButton = Button;
+				BestDistance = Distance;
+			}
+		}
+	}
+	if (Best != HoveredMonitor.Get() || BestButton != HoveredButton)
+	{
+		if (AMonitorDisplay* Old = HoveredMonitor.Get())
+		{
+			Old->SetHoveredButton(INDEX_NONE);
+		}
+		if (Best)
+		{
+			Best->SetHoveredButton(BestButton);
+		}
+		HoveredMonitor = Best;
+		HoveredButton = BestButton;
+	}
+}
+
+void UGMICameraSubsystem::OnPress(const FInputActionValue& Value)
+{
+	UpdateHoveredButton();
+	if (AMonitorDisplay* Monitor = HoveredMonitor.Get())
+	{
+		Monitor->PressButton(HoveredButton);
 	}
 }
 

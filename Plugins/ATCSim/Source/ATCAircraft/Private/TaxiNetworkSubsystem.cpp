@@ -1,4 +1,5 @@
 #include "TaxiNetworkSubsystem.h"
+#include "ProfilingDebugging/CsvProfiler.h"
 #include "AircraftCommands.h"
 #include "AircraftMovementComponent.h"
 #include "AircraftTypeData.h"
@@ -175,6 +176,7 @@ void UTaxiNetworkSubsystem::EnsureBuilt()
 
 void UTaxiNetworkSubsystem::Build()
 {
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_NetworkBuild);
 	const double StartSeconds = FPlatformTime::Seconds();
 
 	// Claims survive a rebuild as stretches of their route
@@ -530,13 +532,16 @@ bool UTaxiNetworkSubsystem::IsFree(const TObjectKey<AActor>& Me, const FClaim* M
 
 	// The queue: whoever has waited longer for a piece of taxiway that conflicts with this one goes first (a landing
 	// with its head start), unless it is (through one other) waiting for this aircraft itself. A wait for a two-way
-	// stretch only holds up the other direction (IsTwoWayFree)
+	// stretch only holds up the other direction (IsTwoWayFree). A landing never waits for an aircraft still at its gate
+	// (holding no taxiway): that one can wait there, the landing would have to go around
 	const float MySince = MyClaim ? QueueSince(*MyClaim) : GetNow();
+	const bool bLanding = MyClaim && MyClaim->bPriority;
 	for (const TPair<TObjectKey<AActor>, FClaim>& Pair : Claims)
 	{
 		const FClaim& Other = Pair.Value;
 		if (Pair.Key == Me || Other.WaitingSince < 0.f || QueueSince(Other) >= MySince || !Tracks.IsValidIndex(Other.WantedTrack)
-			|| Other.WantedTwoWay != INDEX_NONE || Other.Blocker == Me || Other.WantedBox.ComputeSquaredDistanceToPoint(Mine.Location) > Reach * Reach)
+			|| Other.WantedTwoWay != INDEX_NONE || Other.Blocker == Me || Other.WantedBox.ComputeSquaredDistanceToPoint(Mine.Location) > Reach * Reach
+			|| (bLanding && Other.Last < Other.First))
 		{
 			continue;
 		}
@@ -603,10 +608,10 @@ bool UTaxiNetworkSubsystem::IsTwoWayFree(const TObjectKey<AActor>& Me, const FCl
 			}
 		}
 		// Waiting longer for an opposite stretch (a landing with its head start): it goes first, unless it waits
-		// (through one other) for this aircraft
+		// (through one other) for this aircraft, or it is still at its gate and this one is a landing (see IsFree)
 		const FClaim* Behind = Claims.Find(Other.Blocker);
 		if (Other.WantedTwoWay != INDEX_NONE && Other.WaitingSince >= 0.f && QueueSince(Other) < MySince && Other.Blocker != Me
-			&& !(Behind && Behind->WaitingSince >= 0.f && Behind->Blocker == Me)
+			&& !(Behind && Behind->WaitingSince >= 0.f && Behind->Blocker == Me) && !(MyClaim.bPriority && Other.Last < Other.First)
 			&& Meet(TwoWays[Other.WantedTwoWay], Other.WantedTrack, Other.WantedFirst, Other.HalfSpanCm, Mine, Track, From, MyClaim.HalfSpanCm))
 		{
 			OutBlocker = Pair.Key;
@@ -1240,6 +1245,7 @@ bool UTaxiNetworkSubsystem::Overlap(const UAircraftTypeData* Type, const FTransf
 
 void UTaxiNetworkSubsystem::CheckOverlaps()
 {
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_CheckOverlaps);
 	const UTrafficSubsystem* Traffic = GetWorld() ? GetWorld()->GetSubsystem<UTrafficSubsystem>() : nullptr;
 	if (!Traffic)
 	{
@@ -1283,6 +1289,7 @@ void UTaxiNetworkSubsystem::CheckOverlaps()
 
 void UTaxiNetworkSubsystem::CheckDeadlocks()
 {
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_CheckDeadlocks);
 	const float Now = GetNow();
 	TArray<TArray<TObjectKey<AActor>>> Circles;
 	for (const TPair<TObjectKey<AActor>, FClaim>& Pair : Claims)

@@ -50,8 +50,9 @@ void ARadioLogDisplay::BeginPlay()
 {
 	Super::BeginPlay();
 	Layout();
-	// Opaque text that scrolls leaves a ghost of the old lines in the temporal anti-aliasing; translucent text does not
-	if (UMaterialInterface* TextMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/EngineMaterials/DefaultTextMaterialTranslucent.DefaultTextMaterialTranslucent"), nullptr, LOAD_NoWarn | LOAD_Quiet))
+	// Opaque text that scrolls leaves a ghost of the old lines in the temporal anti-aliasing; translucent text does not.
+	// The /ATCSim instance (ATC.CreateTextMaterial): the engine's own translucent text material is not in a package
+	if (UMaterialInterface* TextMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/ATCSim/Materials/MI_TextTranslucent.MI_TextTranslucent"), nullptr, LOAD_NoWarn | LOAD_Quiet))
 	{
 		Text->SetTextMaterial(TextMaterial);
 	}

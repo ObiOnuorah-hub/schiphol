@@ -157,6 +157,10 @@ private:
 	void OnNextPreset(const FInputActionValue& Value);
 	void OnPreset(const FInputActionValue& Value);
 	void OnLens(const FInputActionValue& Value);
+	/** Presses the touch button on a screen that the view points at. */
+	void OnPress(const FInputActionValue& Value);
+	/** Which screen button the view points at (within reach); lights it up. */
+	void UpdateHoveredButton();
 
 	TArray<FTrackedCamera> Tracked;
 	TArray<TWeakObjectPtr<AMonitorDisplay>> Monitors;
@@ -167,6 +171,16 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UInputMappingContext> InputContext;
+
+	/** Made in code, not an asset: click, a trigger or A presses the screen button looked at. */
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> PressAction;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UInputMappingContext> PressContext;
+
+	TWeakObjectPtr<AMonitorDisplay> HoveredMonitor;
+	int32 HoveredButton = INDEX_NONE;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UEnhancedInputComponent> InputComponent;

@@ -32,6 +32,7 @@
 #include "Engine/Texture.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "MaterialEditingLibrary.h"
+#include "MaterialShared.h"
 #include "Materials/MaterialExpressionConstant.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionMultiply.h"
@@ -1670,10 +1671,20 @@ namespace
 		Roughness->R = 0.85f;
 		UMaterialEditingLibrary::ConnectMaterialProperty(Roughness, TEXT(""), MP_Roughness);
 
+		// No sun glare on the leaves (Airport.MatteAll)
 		UMaterialExpressionConstant* Specular = Cast<UMaterialExpressionConstant>(
 			UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionConstant::StaticClass(), -300, 350));
-		Specular->R = 0.2f;
+		Specular->R = 0.f;
 		UMaterialEditingLibrary::ConnectMaterialProperty(Specular, TEXT(""), MP_Specular);
+
+		// Leaves let light through: lit like foliage, the side away from the sun gets half the leaf colour instead of
+		// going black (the cards looked like dark cut-outs)
+		Material->SetShadingModel(MSM_TwoSidedFoliage);
+		UMaterialExpressionMultiply* Through = Cast<UMaterialExpressionMultiply>(
+			UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionMultiply::StaticClass(), -300, 450));
+		Through->ConstB = 0.5f;
+		UMaterialEditingLibrary::ConnectMaterialExpressions(Leaves, TEXT("RGB"), Through, TEXT("A"));
+		UMaterialEditingLibrary::ConnectMaterialProperty(Through, TEXT(""), MP_SubsurfaceColor);
 
 		Material->BlendMode = BLEND_Masked;
 		Material->OpacityMaskClipValue = 0.4f;
@@ -1799,6 +1810,238 @@ namespace
 			}
 		}
 		UE_LOG(LogTemp, Display, TEXT("Airport.FixTrees: %d tree materials fixed (%d normal, %d virtual), saved"), Normal.Num() + Virtual.Num(), Normal.Num(), Virtual.Num());
+	}
+
+	/**
+	 * The aerial photo under the airport is pale and already lit: with the sun on top the ground looked washed out.
+	 * "Airport.SoftenGround [brightness] [contrast] [specular]" puts GroundContrast (a power, default 1.15) and
+	 * GroundBrightness (0.85) between the photo and the base colour of M_TerrainVT and sets its specular (0).
+	 * Specular 0, not just low: below 0.02 the engine treats it as no reflection at all, while 0.1 still gave a
+	 * mirror-like sun glare over the land when looking towards a low sun. The photo has its own lighting anyway.
+	 * Run it again with other numbers to tune; "Airport.SoftenGround 1 1 0.2" gives the look from before.
+	 */
+	void SoftenGround(const TArray<FString>& Args)
+	{
+		const float Brightness = Args.Num() > 0 ? FCString::Atof(*Args[0]) : 0.85f;
+		const float Contrast = Args.Num() > 1 ? FCString::Atof(*Args[1]) : 1.15f;
+		const float SpecularValue = Args.Num() > 2 ? FCString::Atof(*Args[2]) : 0.f;
+		UMaterial* Terrain = LoadObject<UMaterial>(nullptr, TEXT("/Game/EHAM/Materials/M_TerrainVT.M_TerrainVT"));
+		if (!Terrain)
+		{
+			UE_LOG(LogTemp, Error, TEXT("Airport.SoftenGround: no /Game/EHAM/Materials/M_TerrainVT"));
+			return;
+		}
+		Terrain->Modify();
+
+		// The parameters from an earlier run, else put them in front of the base colour
+		UMaterialExpressionScalarParameter* BrightnessParam = nullptr;
+		UMaterialExpressionScalarParameter* ContrastParam = nullptr;
+		for (UMaterialExpression* Expression : Terrain->GetExpressions())
+		{
+			if (UMaterialExpressionScalarParameter* Scalar = Cast<UMaterialExpressionScalarParameter>(Expression))
+			{
+				BrightnessParam = Scalar->ParameterName == TEXT("GroundBrightness") ? Scalar : BrightnessParam;
+				ContrastParam = Scalar->ParameterName == TEXT("GroundContrast") ? Scalar : ContrastParam;
+			}
+		}
+		if (!BrightnessParam || !ContrastParam)
+		{
+			UMaterialExpression* Photo = UMaterialEditingLibrary::GetMaterialPropertyInputNode(Terrain, MP_BaseColor);
+			const FString PhotoOutput = UMaterialEditingLibrary::GetMaterialPropertyInputNodeOutputName(Terrain, MP_BaseColor);
+			if (!Photo)
+			{
+				UE_LOG(LogTemp, Error, TEXT("Airport.SoftenGround: M_TerrainVT has nothing on its base colour"));
+				return;
+			}
+			ContrastParam = Cast<UMaterialExpressionScalarParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(Terrain, UMaterialExpressionScalarParameter::StaticClass(), -350, -200));
+			ContrastParam->ParameterName = TEXT("GroundContrast");
+			UMaterialExpression* Power = UMaterialEditingLibrary::CreateMaterialExpression(Terrain, UMaterialExpressionPower::StaticClass(), -250, -50);
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Photo, PhotoOutput, Power, TEXT("Base"));
+			UMaterialEditingLibrary::ConnectMaterialExpressions(ContrastParam, TEXT(""), Power, TEXT("Exponent"));
+
+			BrightnessParam = Cast<UMaterialExpressionScalarParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(Terrain, UMaterialExpressionScalarParameter::StaticClass(), -250, -200));
+			BrightnessParam->ParameterName = TEXT("GroundBrightness");
+			UMaterialExpression* Dimmed = UMaterialEditingLibrary::CreateMaterialExpression(Terrain, UMaterialExpressionMultiply::StaticClass(), -120, -50);
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Power, TEXT(""), Dimmed, TEXT("A"));
+			UMaterialEditingLibrary::ConnectMaterialExpressions(BrightnessParam, TEXT(""), Dimmed, TEXT("B"));
+			UMaterialEditingLibrary::ConnectMaterialProperty(Dimmed, TEXT(""), MP_BaseColor);
+		}
+		BrightnessParam->DefaultValue = Brightness;
+		ContrastParam->DefaultValue = Contrast;
+		if (UMaterialExpressionConstant* Specular = Cast<UMaterialExpressionConstant>(UMaterialEditingLibrary::GetMaterialPropertyInputNode(Terrain, MP_Specular)))
+		{
+			Specular->R = SpecularValue;
+		}
+		UMaterialEditingLibrary::RecompileMaterial(Terrain);
+		TArray<UPackage*> ToSave = { Terrain->GetPackage() };
+
+		// The asphalt patches over the photo (runways, aprons) and the painted letters get the same specular
+		for (const TCHAR* Path : { TEXT("/Game/EHAM/Materials/M_GroundOverlay.M_GroundOverlay"), TEXT("/Game/EHAM/Materials/M_RunwayLetters.M_RunwayLetters") })
+		{
+			UMaterial* Overlay = LoadObject<UMaterial>(nullptr, Path);
+			if (UMaterialExpressionConstant* OverlaySpecular = Overlay ? Cast<UMaterialExpressionConstant>(UMaterialEditingLibrary::GetMaterialPropertyInputNode(Overlay, MP_Specular)) : nullptr)
+			{
+				Overlay->Modify();
+				OverlaySpecular->R = SpecularValue;
+				UMaterialEditingLibrary::RecompileMaterial(Overlay);
+				ToSave.Add(Overlay->GetPackage());
+			}
+		}
+		UEditorLoadingAndSavingUtils::SavePackages(ToSave, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.SoftenGround: M_TerrainVT brightness %.2f, contrast %.2f, specular %.2f, saved"), Brightness, Contrast, SpecularValue);
+	}
+
+	/**
+	 * No sun glare anywhere: the ground, buildings, aircraft, the tower and the glass of the airport reflect nothing.
+	 * "Airport.MatteAll [specular] [roughness]" (default 0 and 1) on the materials in /Game/EHAM, /Game/Datasmith
+	 * (aircraft, tower cab) and /Game/Aircraft: a parent gets constants on Specular, Metallic (0: a metal ignores
+	 * Specular and reflects its own colour, like the aircraft's 0131_Silver) and Roughness, also where a texture drove
+	 * them; an instance gets its Specular, SpecularColor, Metallic, Roughness and Shininess parameters set and the
+	 * texture weights of those to 0. Glass stays transparent but turns matte. Decals keep theirs.
+	 * Backup: Saved/Backup_before_MatteAll.
+	 */
+	void MatteAll(const TArray<FString>& Args)
+	{
+		const float SpecularValue = Args.Num() > 0 ? FCString::Atof(*Args[0]) : 0.f;
+		const float RoughnessValue = Args.Num() > 1 ? FCString::Atof(*Args[1]) : 1.f;
+		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+		FARFilter Filter;
+		Filter.PackagePaths = { TEXT("/Game/EHAM"), TEXT("/Game/Datasmith"), TEXT("/Game/Aircraft") };
+		Filter.bRecursivePaths = true;
+		Filter.ClassPaths.Add(UMaterial::StaticClass()->GetClassPathName());
+		Filter.ClassPaths.Add(UMaterialInstanceConstant::StaticClass()->GetClassPathName());
+		TArray<FAssetData> Assets;
+		Registry.GetAssets(Filter, Assets);
+
+		// A constant on a material input, unless that input already is that constant. True = changed
+		auto SetConstant = [](UMaterial* Material, EMaterialProperty Property, float Value, int32 NodeY)
+		{
+			UMaterialExpressionConstant* Constant = Cast<UMaterialExpressionConstant>(UMaterialEditingLibrary::GetMaterialPropertyInputNode(Material, Property));
+			if (Constant && FMath::IsNearlyEqual(Constant->R, Value))
+			{
+				return false;
+			}
+			if (!Constant)
+			{
+				Constant = Cast<UMaterialExpressionConstant>(UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionConstant::StaticClass(), -300, NodeY));
+				UMaterialEditingLibrary::ConnectMaterialProperty(Constant, TEXT(""), Property);
+			}
+			Constant->R = Value;
+			return true;
+		};
+		const TPair<const TCHAR*, float> ScalarTargets[] = { { TEXT("Specular"), SpecularValue }, { TEXT("Metallic"), 0.f }, { TEXT("Roughness"), RoughnessValue },
+			{ TEXT("Shininess"), 0.f }, { TEXT("SpecularColorMapWeight"), 0.f }, { TEXT("ShininessMapWeight"), 0.f }, { TEXT("MetallicMapWeight"), 0.f },
+			{ TEXT("RoughnessMapWeight"), 0.f } };
+
+		TArray<UPackage*> ToSave;
+		int32 Parents = 0, Instances = 0, Skipped = 0, Done = 0;
+		for (const FAssetData& Asset : Assets)
+		{
+			// In batches: all ~2200 materials with their textures at once ran the GPU out of memory (E_OUTOFMEMORY)
+			if (++Done % 200 == 0)
+			{
+				UEditorLoadingAndSavingUtils::SavePackages(ToSave, false);
+				ToSave.Reset();
+				CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+				UE_LOG(LogTemp, Display, TEXT("Airport.MatteAll: %d of %d"), Done, Assets.Num());
+			}
+			UMaterialInterface* Material = Cast<UMaterialInterface>(Asset.GetAsset());
+			const UMaterial* Base = Material ? Material->GetMaterial() : nullptr;
+			if (!Base || Base->MaterialDomain != MD_Surface || Base->GetShadingModels().HasShadingModel(MSM_Unlit))
+			{
+				++Skipped;
+				continue;
+			}
+			if (UMaterial* Parent = Cast<UMaterial>(Material))
+			{
+				Parent->Modify();
+				bool bChanged = SetConstant(Parent, MP_Specular, SpecularValue, 400);
+				bChanged |= SetConstant(Parent, MP_Metallic, 0.f, 500);
+				bChanged |= SetConstant(Parent, MP_Roughness, RoughnessValue, 600);
+				if (bChanged)
+				{
+					UMaterialEditingLibrary::RecompileMaterial(Parent);
+					ToSave.Add(Parent->GetPackage());
+					++Parents;
+				}
+				continue;
+			}
+			UMaterialInstanceConstant* Instance = Cast<UMaterialInstanceConstant>(Material);
+			bool bChanged = false;
+			for (const TPair<const TCHAR*, float>& Target : ScalarTargets)
+			{
+				float Current = 0.f;
+				if (Instance->GetScalarParameterValue(FMaterialParameterInfo(Target.Key), Current) && !FMath::IsNearlyEqual(Current, Target.Value))
+				{
+					bChanged |= UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Instance, Target.Key, Target.Value);
+				}
+			}
+			FLinearColor Color;
+			if (Instance->GetVectorParameterValue(FMaterialParameterInfo(TEXT("SpecularColor")), Color) && Color.GetLuminance() > SpecularValue + 0.001f)
+			{
+				bChanged |= UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(Instance, TEXT("SpecularColor"), FLinearColor(SpecularValue, SpecularValue, SpecularValue));
+			}
+			if (bChanged)
+			{
+				UMaterialEditingLibrary::UpdateMaterialInstance(Instance);
+				ToSave.Add(Instance->GetPackage());
+				++Instances;
+			}
+		}
+		UEditorLoadingAndSavingUtils::SavePackages(ToSave, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.MatteAll: specular %.2f, metallic 0, roughness %.2f on %d parent materials and %d instances (%d decals and unlit materials left alone), saved"),
+			SpecularValue, RoughnessValue, Parents, Instances, Skipped);
+	}
+
+	/**
+	 * The terminal, piers, tower and the other buildings use M_TerrainVT too, so SoftenGround made them darker as well;
+	 * their photo textures were dark to begin with. "Airport.BrightenBuildings [brightness] [contrast]" overrides
+	 * GroundBrightness (default 1.3) and GroundContrast (0.9: lighter shadows) on the instances of the buildings only.
+	 * A building = an instance used on a mesh more than 6 m high and on nothing flat.
+	 */
+	void BrightenBuildings(const TArray<FString>& Args, UWorld* World)
+	{
+		const float Brightness = Args.Num() > 0 ? FCString::Atof(*Args[0]) : 1.3f;
+		const float Contrast = Args.Num() > 1 ? FCString::Atof(*Args[1]) : 0.9f;
+		if (!World)
+		{
+			return;
+		}
+		TSet<UMaterialInstanceConstant*> Tall, Flat;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			TInlineComponentArray<UStaticMeshComponent*> Components(*It);
+			for (const UStaticMeshComponent* Component : Components)
+			{
+				const double Height = Component->Bounds.GetBox().GetSize().Z;
+				for (UMaterialInterface* Material : Component->GetMaterials())
+				{
+					UMaterialInstanceConstant* Instance = Cast<UMaterialInstanceConstant>(Material);
+					if (Instance && Instance->Parent && Instance->Parent->GetName() == TEXT("M_TerrainVT"))
+					{
+						(Height > 600.0 ? Tall : Flat).Add(Instance);
+					}
+				}
+			}
+		}
+		TArray<UPackage*> ToSave;
+		for (UMaterialInstanceConstant* Instance : Tall)
+		{
+			if (Flat.Contains(Instance))
+			{
+				continue;
+			}
+			Instance->Modify();
+			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Instance, TEXT("GroundBrightness"), Brightness);
+			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Instance, TEXT("GroundContrast"), Contrast);
+			UMaterialEditingLibrary::UpdateMaterialInstance(Instance);
+			ToSave.Add(Instance->GetPackage());
+		}
+		UEditorLoadingAndSavingUtils::SavePackages(ToSave, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.BrightenBuildings: %d building materials brightness %.2f, contrast %.2f (%d also on flat ground, left alone), saved"),
+			ToSave.Num(), Brightness, Contrast, Tall.Intersect(Flat).Num());
 	}
 
 	/**
@@ -2024,6 +2267,21 @@ namespace
 		TEXT("Airport.FixTrees"),
 		TEXT("Masked two-sided material for the tree cards"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&FixTrees));
+
+	FAutoConsoleCommand SoftenGroundCommand(
+		TEXT("Airport.SoftenGround"),
+		TEXT("Airport.SoftenGround [brightness 0.85] [contrast 1.15] [specular 0]: a less washed-out aerial photo under the airport"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&SoftenGround));
+
+	FAutoConsoleCommand MatteAllCommand(
+		TEXT("Airport.MatteAll"),
+		TEXT("Airport.MatteAll [specular 0] [roughness 1]: no sun glare on ground, buildings, aircraft, tower and glass (metallic 0; decals keep theirs)"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&MatteAll));
+
+	FAutoConsoleCommandWithWorldAndArgs BrightenBuildingsCommand(
+		TEXT("Airport.BrightenBuildings"),
+		TEXT("Airport.BrightenBuildings [brightness 1.3] [contrast 0.9]: lighter terminal, piers and other buildings (M_TerrainVT instances on tall meshes)"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&BrightenBuildings));
 
 	FAutoConsoleCommand LocalizeMaterialsCommand(
 		TEXT("Airport.LocalizeMaterials"),

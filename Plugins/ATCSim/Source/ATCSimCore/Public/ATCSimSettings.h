@@ -48,11 +48,13 @@ public:
 
 	/**
 	 * In the queues a landing counts as having waited this long already: it goes before everybody on the ground who has
-	 * waited less. Whoever has waited longer goes first and keeps the landing in the stack, so a stream of landings
-	 * never keeps a departure waiting for good.
+	 * waited less. A landing cannot wait in the air, so this is long: with 120 s a pushback that waited at its gate for
+	 * somebody else kept the 36C exits taken until the landings in the stack went around (11 in 40 minutes). Landings
+	 * still never keep a departure waiting for good: they are at least LandingSpacingSeconds apart and only hold the
+	 * exit for their rollout.
 	 */
 	UPROPERTY(Config, EditAnywhere, Category = "Traffic", meta = (Units = "s"))
-	float LandingHeadStartSeconds = 120.f;
+	float LandingHeadStartSeconds = 900.f;
 
 	/**
 	 * A landing holds in the stack until its runway exit can be cleared (nobody on it, nobody waiting for it longer),
