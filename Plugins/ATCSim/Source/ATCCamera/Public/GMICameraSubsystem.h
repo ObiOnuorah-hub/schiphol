@@ -11,6 +11,7 @@ class UEnhancedInputComponent;
 class UGMICameraPanel;
 class UInputAction;
 class UInputMappingContext;
+class UStaticMeshComponent;
 struct FInputActionValue;
 
 /** The operator's actions for the GMI cameras (all Axis1D: buttons give +1 or -1 through modifiers). */
@@ -121,6 +122,26 @@ public:
 	static void PlanCaptures(TArray<FGMICaptureState>& States, float DeltaTime, int32 MaxLive, float BackgroundRateHz, int32 MaxPerFrame,
 		TArray<int32>& OutCapture);
 
+	/** What points at the screens: the view (Hand = INDEX_NONE) or a tracked VR controller (0 = left, 1 = right). */
+	struct FPointer
+	{
+		FVector Origin = FVector::ZeroVector;
+		FVector Direction = FVector::ForwardVector;
+		int32 Hand = INDEX_NONE;
+	};
+
+	/**
+	 * The pointers now: the tracked VR controllers (right first), and only without any of them the view itself, so in
+	 * the headset the screens react to where a hand points, not to every glance.
+	 */
+	TArray<FPointer> GetPointers() const;
+
+	/** The nearest screen a ray points at within reach (4 m), and the button on it under the ray (INDEX_NONE = none). */
+	AMonitorDisplay* MonitorAt(const FVector& Origin, const FVector& Direction, float& OutDistance, int32& OutButton) const;
+
+	/** Presses what Hand points at (INDEX_NONE: what any pointer points at). */
+	void Press(int32 Hand);
+
 	/**
 	 * Default operator mapping. Keys: arrows pan and tilt, PageUp/PageDown or +/- zoom, Tab next camera, comma and
 	 * period presets, 1-9 a preset, L the next lens. Gamepad: right stick, triggers, shoulders, d-pad, Y. VR: left
@@ -157,10 +178,14 @@ private:
 	void OnNextPreset(const FInputActionValue& Value);
 	void OnPreset(const FInputActionValue& Value);
 	void OnLens(const FInputActionValue& Value);
-	/** Presses the touch button on a screen that the view points at. */
+	/** Presses the touch button on a screen that is pointed at: click or A (the view), or the trigger of a hand. */
 	void OnPress(const FInputActionValue& Value);
-	/** Which screen button the view points at (within reach); lights it up. */
+	void OnPressLeft(const FInputActionValue& Value);
+	void OnPressRight(const FInputActionValue& Value);
+	/** Which screen and button is pointed at (within reach): that screen shows its big buttons, the button lights up. */
 	void UpdateHoveredButton();
+	/** A dot where the pointer meets the screen, and from a VR controller a thin beam to it. */
+	void ShowPointer(const FPointer* Pointer, float Distance);
 
 	TArray<FTrackedCamera> Tracked;
 	TArray<TWeakObjectPtr<AMonitorDisplay>> Monitors;
@@ -177,10 +202,26 @@ private:
 	TObjectPtr<UInputAction> PressAction;
 
 	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> PressLeftAction;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> PressRightAction;
+
+	UPROPERTY(Transient)
 	TObjectPtr<UInputMappingContext> PressContext;
 
+	/** The screen pointed at (it shows its big buttons) and the button under the pointer. */
 	TWeakObjectPtr<AMonitorDisplay> HoveredMonitor;
 	int32 HoveredButton = INDEX_NONE;
+
+	UPROPERTY(Transient)
+	TObjectPtr<AActor> PointerActor;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> PointerDot;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> PointerBeam;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UEnhancedInputComponent> InputComponent;

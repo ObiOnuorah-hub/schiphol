@@ -1312,6 +1312,21 @@ bool FATCMonitorButtonsTest::RunTest(const FString& Parameters)
 	Monitor->PressButton(3);
 	ATCTest::Advance(World, Second->PTZ->TransitionTime + 1.f);
 	TestEqual(TEXT("PRE> turns the camera to its next preset"), Second->PTZ->PanDeg, 100.f, 0.5f);
+
+	// Pointed at, the screen shows its big buttons along the top of the picture: four keys over the whole width
+	UGMICameraSubsystem* Cameras = World->GetSubsystem<UGMICameraSubsystem>();
+	const FVector2D Picture = Monitor->GetPictureSize();
+	int32 Hit = INDEX_NONE;
+	TestTrue(TEXT("a ray at the picture meets the screen"), Cameras->MonitorAt(Monitor->GetPictureCenter() + FVector(120.f, 0.f, 0.f), FVector(-1.f, 0.f, 0.f), Distance, Hit) == Monitor);
+	TestEqual(TEXT("120 cm away"), Distance, 120.f, 1.f);
+	TestTrue(TEXT("a ray past the screen meets nothing"), Cameras->MonitorAt(Monitor->GetPictureCenter() + FVector(120.f, 60.f, 0.f), FVector(-1.f, 0.f, 0.f), Distance, Hit) == nullptr);
+	Monitor->SetFocused(true);
+	const FVector Big = Monitor->GetButtonLocation(1);
+	TestTrue(TEXT("big buttons lie in the top of the picture"), Big.Z > Monitor->GetPictureCenter().Z + Picture.Y * 0.25f);
+	TestEqual(TEXT("a hand pointing 3 cm beside the middle of CAM> still hits it"), Monitor->ButtonAt(Big + FVector(100.f, 3.f, 1.f), FVector(-1.f, 0.f, 0.f), Distance), 1);
+	TestEqual(TEXT("the leftmost key is <CAM"), Monitor->ButtonAt(Monitor->GetButtonLocation(0) + FVector(100.f, 0.f, 0.f), FVector(-1.f, 0.f, 0.f), Distance), 0);
+	Monitor->SetFocused(false);
+	TestTrue(TEXT("not pointed at: small in the label strip again"), Monitor->GetButtonLocation(1).Z < Monitor->GetPictureCenter().Z - Picture.Y * 0.5f);
 	ATCTest::DestroyPlayWorld(World);
 	return true;
 }

@@ -64,6 +64,23 @@ namespace ATCSetup
 	/** OSM runways in the map; with evidence (runway paint) each one is shifted sideways onto it. */
 	TArray<FMapRunway> MapRunways(const FGeo& Geo, const TArray<ATCOsm::FRunway>& Runways, const TArray<FVector>& Evidence);
 
+	/** A parking place: the stretch of a stand's lead-in line where the aircraft stands (from the nose stop back). */
+	struct FStandZone
+	{
+		FString Ref;
+		FVector Nose = FVector::ZeroVector;
+		FVector Back = FVector::ZeroVector;
+		/** A taxi line closer than this to the stretch runs through the parking place. */
+		float ReachCm = 800.f;
+		/** The nodes of the site's network in it. */
+		TArray<int32> Nodes;
+
+		bool Contains(const FVector& Point) const
+		{
+			return FMath::PointDistToSegment(FVector(Point.X, Point.Y, 0.0), Nose, Back) < ReachCm;
+		}
+	};
+
 	/** Everything the route builder needs to know about one airport map. */
 	struct FSite
 	{
@@ -78,7 +95,36 @@ namespace ATCSetup
 		TArray<FVector> HoldMarkings;
 		/** OSM aprons in the map; the apron speed limit ends where a route leaves them. */
 		TArray<TArray<FVector2D>> Aprons;
+		/** The parking places (AddStandZones): a route only goes through its own. Empty = no such rule. */
+		TArray<FStandZone> Stands;
+		/**
+		 * A cost factor per network node (AddSideLines): 1 on a centreline, 30 on a line beside one (a taxiway edge
+		 * line), 10 on paint away from every taxiway. Empty = not known (the network's own LineCost is all there is).
+		 */
+		TArray<float> SideCost;
+
+		bool IsSideLine(int32 Node) const { return SideCost.IsValidIndex(Node) && SideCost[Node] > 1.f; }
 	};
+
+	/**
+	 * Which painted lines are centrelines: the OSM taxiways, taxilanes and lead-in lines are drawn along the real
+	 * centrelines, so of two painted lines that run side by side the one nearer the OSM line is the centreline and the
+	 * other a taxiway edge line. Aircraft follow the centreline: the route builder stays off the others (Site.SideCost).
+	 */
+	void AddSideLines(FSite& Site);
+
+	/**
+	 * The parking places of the airport: every OSM parking position from its nose end (the end away from the taxiways)
+	 * back over 65 % of its lead-in line, and every stand in the world (20 m ahead of the main gear to 15 m behind).
+	 */
+	void AddStandZones(FSite& Site, UWorld* World);
+
+	/**
+	 * A cost factor per network node for FNetwork::FindPath: 1, and Factor in every parking place that is not the
+	 * route's own (the zone with OwnRef, and any zone within 25 m of OwnSpot). Lead-in lines of stands that stand nose
+	 * to nose make a short cut between two taxilanes otherwise, straight through both parking places.
+	 */
+	TArray<float> StandCosts(const FSite& Site, const FString& OwnRef, const FVector& OwnSpot, float Factor = 100.f);
 
 	/** OSM holding positions (as hold markings) and aprons. */
 	void AddOsmHoldingAndAprons(FSite& Site);

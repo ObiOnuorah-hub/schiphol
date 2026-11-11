@@ -519,6 +519,103 @@ namespace ATCSetup
 		return Points;
 	}
 
+	/**
+	 * Not a centreline to begin or end a route on. With OSM centrelines to compare with (Site.SideCost) those decide;
+	 * the paint alone (a line with paint on one side only is an edge line) calls a centreline with one edge line an
+	 * edge too, as on the 36R exit of Schiphol.
+	 */
+	bool IsBesideCentreline(const FSite& Site, int32 Node)
+	{
+		return Site.SideCost.Num() > 0 ? Site.IsSideLine(Node) : Site.Network->LineCost(Node) > 1.f;
+	}
+
+	/**
+	 * Where a stand's routes begin: the end of its lead-in line that points at the taxilane. A stand made by hand has no
+	 * line: the nearest centreline within 60 m of the point behind it that is not another stand's parking place.
+	 */
+	int32 StandTail(const FSite& Site, const FStandSpot& Stand, const TArray<float>& Cost)
+	{
+		const ATCMapSurvey::FNetwork& Network = *Site.Network;
+		int32 Tail = Network.Nearest(Stand.TailEnd, Stand.bSynthetic ? 5000.f : 500.f);
+		if (Stand.bSynthetic)
+		{
+			TArray<int32> Around;
+			Network.Query(Stand.TailEnd, 6000.f, Around);
+			double Best = TNumericLimits<double>::Max();
+			for (const int32 Node : Around)
+			{
+				const double Distance = FVector::DistSquared2D(Network.Nodes[Node], Stand.TailEnd);
+				if (Cost[Node] <= 1.f && Distance < Best)
+				{
+					Best = Distance;
+					Tail = Node;
+				}
+			}
+		}
+		return Tail;
+	}
+
+	/**
+	 * The nodes that can be reached from Start over centrelines alone (cost 1): not over a taxiway edge line, a loose
+	 * mark or another stand's parking place. A route's far end (holding point, runway exit) is picked among these: a
+	 * shoulder stripe on a taxiway edge can lie nearer the runway than the centreline does, but only the edge line
+	 * leads to it.
+	 */
+	TBitArray<> CentrelineReach(const ATCMapSurvey::FNetwork& Network, const TArray<float>& Cost, int32 Start)
+	{
+		TBitArray<> Reached(false, Network.Nodes.Num());
+		if (!Network.Nodes.IsValidIndex(Start))
+		{
+			return Reached;
+		}
+		TArray<int32> Open = { Start };
+		Reached[Start] = true;
+		while (Open.Num() > 0)
+		{
+			const int32 Node = Open.Pop(EAllowShrinking::No);
+			for (const int32 Next : Network.Links[Node])
+			{
+				if (Reached[Next])
+				{
+					continue;
+				}
+				if (Cost[Next] <= 1.f)
+				{
+					Reached[Next] = true;
+					Open.Add(Next);
+				}
+				else if (Cost[Next] < 100.f)
+				{
+					// A few nodes of another line in the way (where a centreline crosses a stop bar or the edge line of the
+					// taxiway it joins): across them, at most 8 nodes far, to the centreline behind
+					TArray<TPair<int32, int32>> Across = { TPair<int32, int32>(Next, 1) };
+					TSet<int32> Seen = { Next };
+					while (Across.Num() > 0)
+					{
+						const TPair<int32, int32> At = Across.Pop(EAllowShrinking::No);
+						for (const int32 Beyond : Network.Links[At.Key])
+						{
+							if (Cost[Beyond] <= 1.f)
+							{
+								if (!Reached[Beyond])
+								{
+									Reached[Beyond] = true;
+									Open.Add(Beyond);
+								}
+							}
+							else if (Cost[Beyond] < 100.f && At.Value < 8 && !Seen.Contains(Beyond))
+							{
+								Seen.Add(Beyond);
+								Across.Add(TPair<int32, int32>(Beyond, At.Value + 1));
+							}
+						}
+					}
+				}
+			}
+		}
+		return Reached;
+	}
+
 	bool BuildDeparture(const FSite& Site, FDeparture& D)
 	{
 		const ATCMapSurvey::FNetwork& Network = *Site.Network;
@@ -538,8 +635,12 @@ namespace ATCSetup
 		}
 		const FMapRunway& Runway = Site.Runways[D.RunwayIndex];
 
+		// Centrelines only, and never through another stand's parking place: stands that stand nose to nose would be a
+		// short cut between two taxilanes
+		const TArray<float> Cost = StandCosts(Site, D.StandRef, MainGear);
+
 		// The route starts at the end of the lead-in line that points at the taxilane
-		const int32 Tail = Network.Nearest(Stand.TailEnd, Stand.bSynthetic ? 5000.f : 500.f);
+		const int32 Tail = StandTail(Site, Stand, Cost);
 		if (Tail == INDEX_NONE)
 		{
 			UE_LOG(LogATC, Error, TEXT("%s: stand %s is not near any taxi line"), *Site.ICAO, *D.StandRef);
@@ -555,21 +656,30 @@ namespace ATCSetup
 		double BestScore = TNumericLimits<double>::Max();
 		const FVector FromStand = MainGear - RunwayStart;
 		const double StandSide = FromStand.X * -RunwayDirection.Y + FromStand.Y * RunwayDirection.X;
-		for (int32 Node : Nearby)
+		// Among the nodes that centrelines lead to from the stand; only when there are none, any centreline node
+		const TBitArray<> Reach = CentrelineReach(Network, Cost, Tail);
+		for (const bool bReachedOnly : { true, false })
 		{
-			const FVector Delta = Network.Nodes[Node] - RunwayStart;
-			if (Network.Part[Node] != Network.Part[Tail] || Network.LineCost(Node) > 1.f
-				|| (Delta.X * -RunwayDirection.Y + Delta.Y * RunwayDirection.X) * StandSide < 0.0)
+			for (int32 Node : Nearby)
 			{
-				continue;
+				const FVector Delta = Network.Nodes[Node] - RunwayStart;
+				if (Network.Part[Node] != Network.Part[Tail] || IsBesideCentreline(Site, Node) || (bReachedOnly && !Reach[Node])
+					|| (Delta.X * -RunwayDirection.Y + Delta.Y * RunwayDirection.X) * StandSide < 0.0)
+				{
+					continue;
+				}
+				const double Along = Delta.X * RunwayDirection.X + Delta.Y * RunwayDirection.Y;
+				const double Side = FMath::Abs(Delta.X * -RunwayDirection.Y + Delta.Y * RunwayDirection.X);
+				const double Score = Side + 0.25 * FMath::Abs(Along - 3000.0);
+				if (Along > -5000.0 && Score < BestScore)
+				{
+					BestScore = Score;
+					Goal = Node;
+				}
 			}
-			const double Along = Delta.X * RunwayDirection.X + Delta.Y * RunwayDirection.Y;
-			const double Side = FMath::Abs(Delta.X * -RunwayDirection.Y + Delta.Y * RunwayDirection.X);
-			const double Score = Side + 0.25 * FMath::Abs(Along - 3000.0);
-			if (Along > -5000.0 && Score < BestScore)
+			if (Goal != INDEX_NONE)
 			{
-				BestScore = Score;
-				Goal = Node;
+				break;
 			}
 		}
 		if (Goal == INDEX_NONE)
@@ -579,7 +689,7 @@ namespace ATCSetup
 		}
 
 		// First the route from the end of the lead-in: where it joins the taxilane and which way it goes from there
-		const TArray<int32> First = Network.FindPath(Tail, Goal);
+		const TArray<int32> First = Network.FindPath(Tail, Goal, &Cost);
 		if (First.IsEmpty())
 		{
 			UE_LOG(LogATC, Error, TEXT("%s: no route from stand %s to runway %s (stand line end node %d in part %d, goal in part %d; main part %d)"), *Site.ICAO,
@@ -607,21 +717,59 @@ namespace ATCSetup
 		const FVector TaxiDirection = (Ahead - Join).GetSafeNormal2D();
 		D.Face = CompassWord(Site, TaxiDirection);
 
-		// Pushback: tail first the other way along the taxilane, until the aircraft stands straight on it
+		// Pushback: tail first the other way along the taxilane, until the aircraft stands straight on it. A stand placed
+		// by hand has no line to follow: straight back to the taxilane first
+		const int32 PushStart = Stand.bSynthetic ? Tail : Network.Nearest(MainGear, 1000.f);
 		int32 PushEnd = Network.Nearest(Join - TaxiDirection * (Wheelbase + 3000.f), 2500.f);
-		if (PushEnd == INDEX_NONE)
+		TArray<int32> PushPath = PushEnd != INDEX_NONE && Cost[PushEnd] <= 1.f ? Network.FindPath(PushStart, PushEnd, &Cost) : TArray<int32>();
+		TArray<FVector> PushPoints, TaxiPoints;
+		TArray<int32> TaxiPath;
+		if (PushPath.Num() > 0 && !PushPath.ContainsByPredicate([&Cost](int32 Node) { return Cost[Node] >= 100.f; }))
 		{
-			PushEnd = First[JoinIndex];
+			PushPoints = ToPoints(Network, PushPath);
+			// Taxi: from the end of the pushback to the runway
+			TaxiPath = Network.FindPath(PushEnd, Goal, &Cost);
+			TaxiPoints = ToPoints(Network, TaxiPath);
 		}
-		// A stand placed by hand has no line to follow: straight back to the taxilane first
-		TArray<FVector> PushPoints = ToPoints(Network, Network.FindPath(Stand.bSynthetic ? Tail : Network.Nearest(MainGear, 1000.f), PushEnd));
+		else
+		{
+			// No centreline that way (the end of a taxilane), or only through the parking place of the stand next door:
+			// back along its own lead-in and from there tail first onto the taxilane's own line, as far as that stays out
+			// of the other parking places; then it taxis out over the way found first
+			auto InOtherPlace = [&Site, &D, &MainGear](const FVector& Point)
+			{
+				const FVector Spot(MainGear.X, MainGear.Y, 0.0);
+				return Site.Stands.ContainsByPredicate([&](const FStandZone& Zone)
+				{
+					return Zone.Ref != D.StandRef && FMath::PointDistToSegment(Spot, Zone.Nose, Zone.Back) >= 2500.f && Zone.Contains(Point);
+				});
+			};
+			PushPath = Network.FindPath(PushStart, First[JoinIndex], &Cost);
+			PushPoints = ToPoints(Network, PushPath);
+			TaxiPath = TArray<int32>(First.GetData() + JoinIndex, First.Num() - JoinIndex);
+			TaxiPoints = ToPoints(Network, TaxiPath);
+			for (const float Back : { Wheelbase + 3000.f, Wheelbase + 1500.f, Wheelbase + 500.f })
+			{
+				const FVector End = Join - TaxiDirection * Back;
+				if (!InOtherPlace(End) && !InOtherPlace((End + Join) * 0.5))
+				{
+					PushPoints.Add(End);
+					TaxiPoints.Insert(End, 0);
+					break;
+				}
+			}
+			UE_LOG(LogATC, Display, TEXT("%s stand %s: no centreline to push back along, pushback onto the line of its taxilane (%d points)"), *Site.ICAO,
+				*D.StandRef, PushPoints.Num());
+		}
+		if (PushPoints.Num() == 0 || TaxiPoints.Num() == 0)
+		{
+			UE_LOG(LogATC, Error, TEXT("%s: no pushback or taxi route for stand %s"), *Site.ICAO, *D.StandRef);
+			return false;
+		}
 		PushPoints.Insert(MainGear, 0);
 		// Simplify: the nodes of painted lines zigzag a few decimetres, which the curve speed limit would read as bends
 		D.Push = ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(PushPoints, 50.f), 2000.f);
 
-		// Taxi: from the end of the pushback to the runway, then onto the centerline and lined up
-		const TArray<int32> TaxiPath = Network.FindPath(PushEnd, Goal);
-		TArray<FVector> TaxiPoints = ToPoints(Network, TaxiPath);
 		const FVector Last = TaxiPoints.Last();
 		const double LastAlong = (Last - RunwayStart) | RunwayDirection;
 		FVector OnCenterline = RunwayStart + RunwayDirection * LastAlong;
@@ -683,7 +831,9 @@ namespace ATCSetup
 		}
 		const float Wheelbase = D.Type->WheelbaseM * ATCUnits::MetersToCm;
 		const FVector MainGear = Stand.NoseStop - Stand.Direction * Wheelbase;
-		const int32 Tail = Network.Nearest(Stand.TailEnd, Stand.bSynthetic ? 5000.f : 500.f);
+		// Centrelines only, and never through another stand's parking place (see StandCosts)
+		const TArray<float> BaseCost = StandCosts(Site, D.StandRef, MainGear);
+		const int32 Tail = StandTail(Site, Stand, BaseCost);
 		const int32 Parked = Network.Nearest(MainGear, 1500.f);
 		FVector Threshold, LandingDirection;
 		if (Tail == INDEX_NONE || Parked == INDEX_NONE || !FindTakeoff(Site, D.ArrivalRunway, Threshold, LandingDirection, D.ArrivalRunwayIndex))
@@ -700,25 +850,35 @@ namespace ATCSetup
 		int32 Exit = INDEX_NONE;
 		double ExitAlong = 0.0;
 		double BestScore = TNumericLimits<double>::Max();
-		for (int32 Node : Nearby)
+		// Among the nodes that centrelines lead to from the stand (a shoulder stripe on the taxiway edge lies nearer the
+		// runway, but from it the way in runs along the edge line); only when there are none, any centreline node
+		const TBitArray<> Reach = CentrelineReach(Network, BaseCost, Tail);
+		for (const bool bReachedOnly : { true, false })
 		{
-			if (Network.Part[Node] != Network.Part[Tail] || Network.LineCost(Node) > 1.f)
+			for (int32 Node : Nearby)
 			{
-				continue;
+				if (Network.Part[Node] != Network.Part[Tail] || IsBesideCentreline(Site, Node) || (bReachedOnly && !Reach[Node]))
+				{
+					continue;
+				}
+				const FVector Delta = Network.Nodes[Node] - Threshold;
+				const double Along = Delta.X * LandingDirection.X + Delta.Y * LandingDirection.Y;
+				const double Side = FMath::Abs(Delta.X * -LandingDirection.Y + Delta.Y * LandingDirection.X);
+				if (Along < 140000.0 || Along > 260000.0 || Side < Runway.HalfWidthCm + 800.0 || Side > Runway.HalfWidthCm + 15000.0)
+				{
+					continue;
+				}
+				const double Score = Side + 0.1 * FMath::Abs(Along - 190000.0);
+				if (Score < BestScore)
+				{
+					BestScore = Score;
+					Exit = Node;
+					ExitAlong = Along;
+				}
 			}
-			const FVector Delta = Network.Nodes[Node] - Threshold;
-			const double Along = Delta.X * LandingDirection.X + Delta.Y * LandingDirection.Y;
-			const double Side = FMath::Abs(Delta.X * -LandingDirection.Y + Delta.Y * LandingDirection.X);
-			if (Along < 140000.0 || Along > 260000.0 || Side < Runway.HalfWidthCm + 800.0 || Side > Runway.HalfWidthCm + 15000.0)
+			if (Exit != INDEX_NONE)
 			{
-				continue;
-			}
-			const double Score = Side + 0.1 * FMath::Abs(Along - 190000.0);
-			if (Score < BestScore)
-			{
-				BestScore = Score;
-				Exit = Node;
-				ExitAlong = Along;
+				break;
 			}
 		}
 		if (Exit == INDEX_NONE)
@@ -729,8 +889,7 @@ namespace ATCSetup
 		// To the far end of the stand's lead-in line and along it onto the stand: nose-in, also where another painted
 		// line passes closer to the main gear than the lead-in does. Into the lead-in only at that far end: coming in
 		// from the nose end and turning back would be a U-turn on the stand
-		TArray<float> Cost;
-		Cost.Init(1.f, Network.Nodes.Num());
+		TArray<float> Cost = BaseCost;
 		for (int32 Node : Stand.LineNodes)
 		{
 			Cost[Node] = Node == Tail ? 1.f : 1000.f;
@@ -740,6 +899,22 @@ namespace ATCSetup
 		{
 			UE_LOG(LogATC, Warning, TEXT("%s: no taxi route from the %s exit to stand %s"), *Site.ICAO, *D.ArrivalRunway, *D.StandRef);
 			return false;
+		}
+		// Worth knowing: a taxi-in that could not stay on the centrelines
+		int32 Beside = 0;
+		FVector FirstBeside = FVector::ZeroVector;
+		for (const int32 Node : Path)
+		{
+			if (Site.IsSideLine(Node) && Beside++ == 0)
+			{
+				FirstBeside = Network.Nodes[Node];
+			}
+		}
+		if (Beside > 50)
+		{
+			UE_LOG(LogATC, Warning, TEXT("%s %s -> %s: %d of %d points of the taxi-in lie on a line beside the centreline, from X=%.0f Y=%.0f m (exit at X=%.0f Y=%.0f m, part %d, main %d; line part %d of exit, main line %d)"),
+				*Site.ICAO, *D.ArrivalRunway, *D.StandRef, Beside, Path.Num(), FirstBeside.X / 100.0, FirstBeside.Y / 100.0, Network.Nodes[Exit].X / 100.0,
+				Network.Nodes[Exit].Y / 100.0, Network.Part[Exit], Network.MainPart, Network.LinePart[Exit], Network.MainLinePart);
 		}
 
 		// Rollout on the centreline, turn off towards the exit, taxi in, last metres straight onto the stand
@@ -1765,6 +1940,8 @@ namespace ATCSetup
 		Site.Network = &ATCMapSurvey::PaintNetwork(World);
 		Site.Runways = MapRunways(Site.Geo, ATCOsm::Runways(Site.Osm), ATCMapSurvey::RunwayMarkingPoints(World));
 		Site.HoldMarkings = ATCMapSurvey::HoldMarkingPoints(World);
+		AddStandZones(Site, World);
+		AddSideLines(Site);
 		return true;
 	}
 
@@ -2058,6 +2235,403 @@ namespace ATCSetup
 		TEXT("Find taxi routes of the open EHAM map that leave the pavement (log and Saved/ATC/route_check.png); stores the runway behind arrival routes"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&CheckRoutes));
 
+	void AddStandZones(FSite& Site, UWorld* World)
+	{
+		struct FSegment
+		{
+			FVector A;
+			FVector B;
+		};
+		TArray<FSegment> Taxi;
+		for (const ATCOsm::FElement& Element : Site.Osm.Elements)
+		{
+			const FString Kind = Element.Tag(TEXT("aeroway"));
+			for (int32 Index = 1; Element.bWay && (Kind == TEXT("taxiway") || Kind == TEXT("taxilane")) && Index < Element.Points.Num(); ++Index)
+			{
+				Taxi.Add({ Site.Geo.ToMap(Element.Points[Index - 1]) * FVector(1, 1, 0), Site.Geo.ToMap(Element.Points[Index]) * FVector(1, 1, 0) });
+			}
+		}
+		auto ToTaxi = [&Taxi](const FVector& Point)
+		{
+			double Best = 1e9;
+			for (const FSegment& Segment : Taxi)
+			{
+				Best = FMath::Min(Best, double(FMath::PointDistToSegment(Point, Segment.A, Segment.B)));
+			}
+			return Best;
+		};
+		TArray<FStandZone>& Zones = Site.Stands;
+		Zones.Reset();
+		for (const ATCOsm::FElement* Element : Site.Osm.WithTag(TEXT("aeroway"), TEXT("parking_position")))
+		{
+			FStandZone Zone;
+			Zone.Ref = Element->Tag(TEXT("ref"));
+			if (Element->bWay && Element->Points.Num() >= 2)
+			{
+				const FVector A = Site.Geo.ToMap(Element->Points[0]) * FVector(1, 1, 0);
+				const FVector B = Site.Geo.ToMap(Element->Points.Last()) * FVector(1, 1, 0);
+				const bool bNoseIsA = ToTaxi(A) > ToTaxi(B);
+				Zone.Nose = bNoseIsA ? A : B;
+				Zone.Back = FMath::Lerp(Zone.Nose, bNoseIsA ? B : A, 0.65);
+				// A short lead-in (a small stand right beside its taxilane): the taxilane itself must stay outside. Up to
+				// 10 m: the map's painted line lies a few metres beside the OSM line
+				Zone.ReachCm = FMath::Clamp(FVector::Dist2D(A, B) * 0.25, 300.0, 1000.0);
+			}
+			else
+			{
+				Zone.Nose = Zone.Back = Site.Geo.ToMap(Element->Center()) * FVector(1, 1, 0);
+				Zone.ReachCm = 1000.f;
+			}
+			Zones.Add(Zone);
+		}
+		if (World)
+		{
+			for (TActorIterator<AStand> It(World); It; ++It)
+			{
+				FStandZone Zone;
+				Zone.Ref = It->StandTag.ToString().RightChop(FString(TEXT("Stand.EHAM.")).Len());
+				const FTransform Parking = It->GetParkingTransform();
+				const FVector At = Parking.GetLocation() * FVector(1, 1, 0);
+				const FVector Forward = Parking.GetUnitAxis(EAxis::X).GetSafeNormal2D();
+				Zone.Nose = At + Forward * 2000.0;
+				Zone.Back = At - Forward * 1500.0;
+				Zones.Add(Zone);
+			}
+		}
+		for (FStandZone& Zone : Zones)
+		{
+			TArray<int32> Near;
+			if (Site.Network)
+			{
+				Site.Network->Query((Zone.Nose + Zone.Back) * 0.5, FVector::Dist2D(Zone.Nose, Zone.Back) * 0.5 + Zone.ReachCm, Near);
+			}
+			for (const int32 Node : Near)
+			{
+				if (Zone.Contains(Site.Network->Nodes[Node]))
+				{
+					Zone.Nodes.Add(Node);
+				}
+			}
+		}
+	}
+
+	void AddSideLines(FSite& Site)
+	{
+		const ATCMapSurvey::FNetwork& Network = *Site.Network;
+		// The OSM centrelines as points every metre, in cells of 5 m
+		TMap<FIntPoint, TArray<FVector2D>> Grid;
+		auto CellOf = [](const FVector2D& Point) { return FIntPoint(FMath::FloorToInt(Point.X / 500.0), FMath::FloorToInt(Point.Y / 500.0)); };
+		for (const ATCOsm::FElement& Element : Site.Osm.Elements)
+		{
+			const FString Kind = Element.Tag(TEXT("aeroway"));
+			if (!Element.bWay || Element.Tag(TEXT("area")) == TEXT("yes")
+				|| (Kind != TEXT("taxiway") && Kind != TEXT("taxilane") && Kind != TEXT("parking_position")))
+			{
+				continue;
+			}
+			for (int32 Index = 1; Index < Element.Points.Num(); ++Index)
+			{
+				const FVector2D A(Site.Geo.ToMap(Element.Points[Index - 1]));
+				const FVector2D B(Site.Geo.ToMap(Element.Points[Index]));
+				const int32 Steps = FMath::Max(1, FMath::CeilToInt(FVector2D::Distance(A, B) / 100.0));
+				for (int32 Step = 0; Step <= Steps; ++Step)
+				{
+					const FVector2D Point = FMath::Lerp(A, B, double(Step) / Steps);
+					Grid.FindOrAdd(CellOf(Point)).Add(Point);
+				}
+			}
+		}
+
+		// How far every painted node lies from the nearest OSM centreline (25 m and more: away from every taxiway)
+		const float Far = 2500.f;
+		TArray<float> ToOsm;
+		ToOsm.Init(Far, Network.Nodes.Num());
+		for (int32 Node = 0; Node < Network.Nodes.Num(); ++Node)
+		{
+			const FVector2D Point(Network.Nodes[Node]);
+			const FIntPoint Cell = CellOf(Point);
+			double Best = double(Far) * Far;
+			for (int32 DX = -5; DX <= 5; ++DX)
+			{
+				for (int32 DY = -5; DY <= 5; ++DY)
+				{
+					if (const TArray<FVector2D>* Points = Grid.Find(Cell + FIntPoint(DX, DY)))
+					{
+						for (const FVector2D& Other : *Points)
+						{
+							Best = FMath::Min(Best, FVector2D::DistSquared(Point, Other));
+						}
+					}
+				}
+			}
+			ToOsm[Node] = FMath::Sqrt(Best);
+		}
+
+		// Beside a line that runs the same way 4 to 25 m away and lies at least 3 m nearer its OSM centreline: an edge line
+		Site.SideCost.Init(1.f, Network.Nodes.Num());
+		int32 Edges = 0, Away = 0;
+		for (int32 Node = 0; Node < Network.Nodes.Num(); ++Node)
+		{
+			if (ToOsm[Node] >= Far)
+			{
+				Site.SideCost[Node] = 10.f;
+				++Away;
+				continue;
+			}
+			const FVector2D Along = Network.LineDirection(Node);
+			const FVector2D Side(-Along.Y, Along.X);
+			TArray<int32> Near;
+			Network.Query(Network.Nodes[Node], 2500.f, Near);
+			for (const int32 Other : Near)
+			{
+				const FVector2D Delta = FVector2D(Network.Nodes[Other]) - FVector2D(Network.Nodes[Node]);
+				if (FMath::Abs(Delta | Along) < 150.0 && FMath::Abs(Delta | Side) > 400.0 && ToOsm[Other] + 300.f < ToOsm[Node]
+					&& FMath::Abs(Network.LineDirection(Other) | Along) > 0.94)
+				{
+					Site.SideCost[Node] = 30.f;
+					++Edges;
+					break;
+				}
+			}
+		}
+		UE_LOG(LogATC, Display, TEXT("%s: %d painted nodes: %d on lines beside a centreline (edge lines), %d away from every taxiway, the rest centreline"),
+			*Site.ICAO, Network.Nodes.Num(), Edges, Away);
+	}
+
+	TArray<float> StandCosts(const FSite& Site, const FString& OwnRef, const FVector& OwnSpot, float Factor)
+	{
+		// Centrelines first: a taxiway edge line or a loose mark only where nothing else leads there
+		TArray<float> Cost = Site.SideCost;
+		if (Cost.Num() == 0)
+		{
+			Cost.Init(1.f, Site.Network ? Site.Network->Nodes.Num() : 0);
+		}
+		const FVector Spot(OwnSpot.X, OwnSpot.Y, 0.0);
+		for (const FStandZone& Zone : Site.Stands)
+		{
+			if (Zone.Ref == OwnRef || FMath::PointDistToSegment(Spot, Zone.Nose, Zone.Back) < 2500.f)
+			{
+				continue;
+			}
+			for (const int32 Node : Zone.Nodes)
+			{
+				Cost[Node] = FMath::Max(Cost[Node], Factor);
+			}
+		}
+		return Cost;
+	}
+
+	/** The parking places a route runs through that are not its own (its stand's zone, or any zone within 25 m of that stand). */
+	TMap<int32, float> StandCuts(const TArray<FStandZone>& Zones, const ATaxiRoute* Route, const FString& OwnRef, const FVector* OwnStand, TArray<FVector>* OutPoints = nullptr)
+	{
+		TArray<int32> Foreign;
+		for (int32 Index = 0; Index < Zones.Num(); ++Index)
+		{
+			const FStandZone& Zone = Zones[Index];
+			if (Zone.Ref != OwnRef && !(OwnStand && FMath::PointDistToSegment(*OwnStand, Zone.Nose, Zone.Back) < 2500.f))
+			{
+				Foreign.Add(Index);
+			}
+		}
+		TMap<int32, float> Cuts;
+		const float Length = Route->GetLength();
+		for (float D = 0.f; D <= Length; D += 200.f)
+		{
+			const FVector Point = Route->Spline->GetLocationAtDistanceAlongSpline(D, ESplineCoordinateSpace::World);
+			bool bCut = false;
+			for (const int32 Index : Foreign)
+			{
+				const FStandZone& Zone = Zones[Index];
+				if (FMath::Abs(Point.X - Zone.Nose.X) < 12000.0 && FMath::Abs(Point.Y - Zone.Nose.Y) < 12000.0 && Zone.Contains(Point))
+				{
+					Cuts.FindOrAdd(Index) += 2.f;
+					bCut = true;
+				}
+			}
+			if (bCut && OutPoints)
+			{
+				OutPoints->Add(Point);
+			}
+		}
+		return Cuts;
+	}
+
+	/**
+	 * ATC.CheckStands: which taxi routes of the open EHAM map run through a parking place that is not their own (the
+	 * lead-in line of another stand, where its aircraft stands). Logs them and plots the worst areas from above with the
+	 * map's painted lines (Saved/ATC/stand_cuts_<n>.png: paint brown, parking places yellow, routes green, cuts red).
+	 */
+	void CheckStands(const TArray<FString>& Args)
+	{
+		UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+		FSite Site;
+		if (!World)
+		{
+			return;
+		}
+		ATCMapSurvey::LoadWholeWorld(World);
+		if (!MakeEHAMSite(World, Site))
+		{
+			UE_LOG(LogATC, Error, TEXT("ATC.CheckStands: open the EHAM map first"));
+			return;
+		}
+		const TArray<FStandZone>& Zones = Site.Stands;
+		TMap<FString, FVector> StandAt;
+		for (TActorIterator<AStand> It(World); It; ++It)
+		{
+			StandAt.Add(It->StandTag.ToString().RightChop(FString(TEXT("Stand.EHAM.")).Len()), It->GetParkingTransform().GetLocation() * FVector(1, 1, 0));
+		}
+
+		int32 Routes = 0, CutRoutes = 0, SideRoutes = 0;
+		float CutMetres = 0.f, SideMetres = 0.f;
+		TSet<int32> CutZones;
+		TArray<FVector> CutPoints, SidePoints;
+		for (TActorIterator<ATaxiRoute> It(World); It; ++It)
+		{
+			FString Ref = It->RouteTag.ToString().RightChop(FString(TEXT("Route.EHAM.")).Len());
+			Ref.Split(TEXT("."), &Ref, nullptr);
+			++Routes;
+			// Beside the centreline: on a taxiway edge line or a loose mark (within 1.5 m of such a painted line)
+			float Beside = 0.f;
+			for (float D = 0.f; D <= It->GetLength(); D += 200.f)
+			{
+				const FVector Point = It->Spline->GetLocationAtDistanceAlongSpline(D, ESplineCoordinateSpace::World);
+				if (Site.IsSideLine(Site.Network->Nearest(Point, 150.f)))
+				{
+					Beside += 2.f;
+					SidePoints.Add(Point);
+				}
+			}
+			if (Beside >= 20.f)
+			{
+				++SideRoutes;
+				SideMetres += Beside;
+				UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: SIDE %s follows a line beside the centreline for %.0f m"), *It->RouteTag.ToString(), Beside);
+			}
+			const TMap<int32, float> Cuts = StandCuts(Zones, *It, Ref, StandAt.Find(Ref), &CutPoints);
+			if (Cuts.Num() == 0)
+			{
+				continue;
+			}
+			++CutRoutes;
+			FString Text;
+			for (const TPair<int32, float>& Cut : Cuts)
+			{
+				Text += FString::Printf(TEXT(" %s (%.0f m)"), Zones[Cut.Key].Ref.IsEmpty() ? TEXT("?") : *Zones[Cut.Key].Ref, Cut.Value);
+				CutZones.Add(Cut.Key);
+				CutMetres += Cut.Value;
+			}
+			UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: CUT %s%s through%s"), *It->RouteTag.ToString(), It->ActorHasTag(TEXT("ATCParallel")) ? TEXT(" (parallel lane)") : TEXT(""), *Text);
+		}
+
+		// The areas with the most cuts and side lines, 600 m squares at 3 pixels a metre
+		TMap<FIntPoint, int32> Cells;
+		for (const TArray<FVector>* Points : { &CutPoints, &SidePoints })
+		{
+			for (const FVector& Point : *Points)
+			{
+				++Cells.FindOrAdd(FIntPoint(FMath::FloorToInt(Point.X / 60000.0), FMath::FloorToInt(Point.Y / 60000.0)));
+			}
+		}
+		Cells.ValueSort([](int32 A, int32 B) { return A > B; });
+		// "ATC.CheckStands at <x m> <y m> <half m>": one picture of that square instead, with the routes' names
+		const bool bZoom = Args.Num() >= 4 && Args[0] == TEXT("at");
+		if (bZoom)
+		{
+			Cells.Reset();
+			Cells.Add(FIntPoint(0, 0), 0);
+		}
+		int32 Tile = 0;
+		for (const TPair<FIntPoint, int32>& Cell : Cells)
+		{
+			if (++Tile > (Args.Num() > 0 && !bZoom ? FCString::Atoi(*Args[0]) : 6))
+			{
+				break;
+			}
+			FBox2D Area(FVector2D(Cell.Key.X * 60000.0 - 3000.0, Cell.Key.Y * 60000.0 - 3000.0), FVector2D((Cell.Key.X + 1) * 60000.0 + 3000.0, (Cell.Key.Y + 1) * 60000.0 + 3000.0));
+			if (bZoom)
+			{
+				const FVector2D Center(FCString::Atod(*Args[1]) * 100.0, FCString::Atod(*Args[2]) * 100.0);
+				const double Half = FCString::Atod(*Args[3]) * 100.0;
+				Area = FBox2D(Center - FVector2D(Half, Half), Center + FVector2D(Half, Half));
+			}
+			ATCMapSurvey::FPlot Plot(Area, 1980);
+			Plot.Grid(bZoom ? 2000.f : 10000.f, FColor(40, 44, 52), true);
+			// The map's painted lines: centrelines brown (loose ones, stand lead-ins, purple), lines beside a centreline
+			// (taxiway edges) dark red, paint away from every taxiway grey
+			for (int32 Index = 0; Index < Site.Network->Nodes.Num(); ++Index)
+			{
+				const FVector& Node = Site.Network->Nodes[Index];
+				if (Area.IsInside(FVector2D(Node)))
+				{
+					const float Side = Site.SideCost.IsValidIndex(Index) ? Site.SideCost[Index] : 1.f;
+					Plot.Point(Node, Side > 20.f ? FColor(150, 40, 40) : Side > 1.f ? FColor(90, 90, 100)
+						: Site.Network->LinePart[Index] == Site.Network->MainLinePart ? FColor(170, 140, 50) : FColor(190, 90, 160), bZoom ? 1 : 0);
+				}
+			}
+			for (const FStandZone& Zone : Zones)
+			{
+				if (Area.IsInside(FVector2D(Zone.Nose)))
+				{
+					Plot.Line(Zone.Nose, Zone.Back, FColor(235, 215, 60), 3);
+					Plot.Label(Zone.Nose, Zone.Ref, FColor(235, 215, 60), 1);
+				}
+			}
+			for (TActorIterator<ATaxiRoute> It(World); It; ++It)
+			{
+				const FString Name = It->RouteTag.ToString();
+				// "ATC.CheckStands at x y half <text>": only the routes with that text in their name
+				if (bZoom && Args.Num() > 4 && !Name.Contains(Args[4]))
+				{
+					continue;
+				}
+				const FColor Color = Name.Contains(TEXT(".Pushback")) ? FColor(60, 200, 220) : Name.Contains(TEXT(".Arr")) ? FColor(80, 130, 255) : FColor(70, 200, 90);
+				FVector Last = It->Spline->GetLocationAtDistanceAlongSpline(0.f, ESplineCoordinateSpace::World);
+				if (bZoom && Area.IsInside(FVector2D(Last)))
+				{
+					Plot.Label(Last, Name.RightChop(11), Color, 1);
+				}
+				for (float D = 300.f; D <= It->GetLength(); D += 300.f)
+				{
+					const FVector Point = It->Spline->GetLocationAtDistanceAlongSpline(D, ESplineCoordinateSpace::World);
+					if (Area.IsInside(FVector2D(Point)) || Area.IsInside(FVector2D(Last)))
+					{
+						Plot.Line(Last, Point, Color, 1);
+					}
+					Last = Point;
+				}
+			}
+			for (const FVector& Point : SidePoints)
+			{
+				if (Area.IsInside(FVector2D(Point)))
+				{
+					Plot.Point(Point, FColor(255, 150, 30), 2);
+				}
+			}
+			for (const FVector& Point : CutPoints)
+			{
+				if (Area.IsInside(FVector2D(Point)))
+				{
+					Plot.Point(Point, FColor(255, 40, 40), 2);
+				}
+			}
+			if (bZoom)
+			{
+				Plot.Save(FString::Printf(TEXT("stand_zoom_%s_%s%s"), *Args[1], *Args[2], Args.Num() > 4 ? *(TEXT("_") + Args[4]) : TEXT("")));
+				break;
+			}
+			Plot.Save(FString::Printf(TEXT("stand_cuts_%d"), Tile));
+			UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: stand_cuts_%d.png around X=%.0f Y=%.0f m (%d cut points)"), Tile, (Cell.Key.X + 0.5) * 600.0, (Cell.Key.Y + 0.5) * 600.0, Cell.Value);
+		}
+		UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: %d routes follow a line beside the centreline for 20 m or more, %.0f m in all"), SideRoutes, SideMetres);
+		UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: %d of %d routes run through %d parking places that are not their own, %.0f m in all (%d parking places known)"),
+			CutRoutes, Routes, CutZones.Num(), CutMetres, Zones.Num());
+	}
+
+	FAutoConsoleCommand CheckStandsCommand(TEXT("ATC.CheckStands"),
+		TEXT("ATC.CheckStands [pictures 6]: taxi routes of the open EHAM map that run through another stand's parking place (log and Saved/ATC/stand_cuts_<n>.png)"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&CheckStands));
+
 	const FName ParallelTag(TEXT("ATCParallel"));
 
 	/**
@@ -2191,6 +2765,17 @@ namespace ATCSetup
 			// Apron and stand lines are for the route's own start and end only (no short cuts between stands); the
 			// route's middle, 150 m from where it starts and ends, costs double: where a parallel taxiway runs close
 			// by, that one is cheaper, elsewhere the route stays as it is
+			FString OwnRef = Tag.RightChop(FString(TEXT("Route.EHAM.")).Len());
+			OwnRef.Split(TEXT("."), &OwnRef, nullptr);
+			FVector OwnSpot(1e9, 1e9, 0.0);
+			for (TActorIterator<AStand> StandIt(World); StandIt; ++StandIt)
+			{
+				if (StandIt->StandTag.ToString() == TEXT("Stand.EHAM.") + OwnRef)
+				{
+					OwnSpot = StandIt->GetParkingTransform().GetLocation();
+				}
+			}
+			const TArray<float> StandCost = StandCosts(Site, OwnRef, OwnSpot);
 			TArray<float> Cost;
 			Cost.Init(1.f, Network.Nodes.Num());
 			for (int32 Node = 0; Node < Network.Nodes.Num(); ++Node)
@@ -2214,6 +2799,11 @@ namespace ATCSetup
 				{
 					Cost[Node] = 2.f;
 				}
+			}
+			// And like the route itself never through another stand's parking place
+			for (int32 Node = 0; Node < Network.Nodes.Num(); ++Node)
+			{
+				Cost[Node] = FMath::Max(Cost[Node], StandCost[Node]);
 			}
 			const TArray<int32> Path = Network.FindPath(Start, Goal, &Cost);
 			if (Path.Num() < 2)

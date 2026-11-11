@@ -16,6 +16,12 @@
 #include "InputModifiers.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "Misc/Paths.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/Texture.h"
+#include "GameFramework/Pawn.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "MotionControllerComponent.h"
 #include "MonitorDisplay.h"
 #include "Slate/WidgetRenderer.h"
 #include "PTZControllerComponent.h"
@@ -511,21 +517,29 @@ void UGMICameraSubsystem::SetupInput(APlayerController* Controller)
 
 	// The touch buttons on the screens: look at one and click, pull either trigger or press A. Made here, so the input
 	// assets of ATC.CreateCameraInput stay as they are
-	PressAction = NewObject<UInputAction>(this, TEXT("IA_GMI_Press"));
-	PressAction->ValueType = EInputActionValueType::Boolean;
-	PressAction->bConsumeInput = false;
+	// In VR: point a controller at the button and pull that hand's trigger
+	auto MakeAction = [this](const TCHAR* Name)
+	{
+		UInputAction* Action = NewObject<UInputAction>(this, Name);
+		Action->ValueType = EInputActionValueType::Boolean;
+		Action->bConsumeInput = false;
+		return Action;
+	};
+	PressAction = MakeAction(TEXT("IA_GMI_Press"));
+	PressLeftAction = MakeAction(TEXT("IA_GMI_PressLeft"));
+	PressRightAction = MakeAction(TEXT("IA_GMI_PressRight"));
 	PressContext = NewObject<UInputMappingContext>(this, TEXT("IMC_GMI_Press"));
 	PressContext->MapKey(PressAction, EKeys::LeftMouseButton);
 	PressContext->MapKey(PressAction, EKeys::Gamepad_FaceButton_Bottom);
 	for (const TCHAR* Device : { TEXT("OculusTouch"), TEXT("ValveIndex"), TEXT("MixedReality"), TEXT("Vive") })
 	{
-		for (const TCHAR* Hand : { TEXT("Left"), TEXT("Right") })
-		{
-			PressContext->MapKey(PressAction, FKey(*FString::Printf(TEXT("%s_%s_Trigger_Click"), Device, Hand)));
-		}
+		PressContext->MapKey(PressLeftAction, FKey(*FString::Printf(TEXT("%s_Left_Trigger_Click"), Device)));
+		PressContext->MapKey(PressRightAction, FKey(*FString::Printf(TEXT("%s_Right_Trigger_Click"), Device)));
 	}
 	Input->AddMappingContext(PressContext, 1);
 	InputComponent->BindAction(PressAction, ETriggerEvent::Started, this, &UGMICameraSubsystem::OnPress);
+	InputComponent->BindAction(PressLeftAction, ETriggerEvent::Started, this, &UGMICameraSubsystem::OnPressLeft);
+	InputComponent->BindAction(PressRightAction, ETriggerEvent::Started, this, &UGMICameraSubsystem::OnPressRight);
 	Controller->PushInputComponent(InputComponent);
 	InputController = Controller;
 }
@@ -579,49 +593,201 @@ void UGMICameraSubsystem::OnPreset(const FInputActionValue& Value)
 	}
 }
 
-void UGMICameraSubsystem::UpdateHoveredButton()
+TArray<UGMICameraSubsystem::FPointer> UGMICameraSubsystem::GetPointers() const
 {
-	// The nearest button the view ray hits, at most 4 m away (the screens on the console in front of the player)
-	AMonitorDisplay* Best = nullptr;
-	int32 BestButton = INDEX_NONE;
-	float BestDistance = 400.f;
-	FVector Eye, Forward;
-	if (GetView(Eye, Forward))
+	TArray<FPointer> Pointers;
+	const APlayerController* Controller = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+	if (const APawn* Pawn = Controller ? Controller->GetPawn() : nullptr)
 	{
-		for (const TWeakObjectPtr<AMonitorDisplay>& Weak : Monitors)
+		// The pawn's motion controllers that are tracked now; per hand the aim pose when the pawn has one (VR template:
+		// LeftAim / RightAim), else the grip
+		TInlineComponentArray<UMotionControllerComponent*> Hands(Pawn);
+		for (int32 Hand = 1; Hand >= 0; --Hand)
 		{
-			float Distance = 0.f;
-			const int32 Button = Weak.IsValid() ? Weak->ButtonAt(Eye, Forward, Distance) : INDEX_NONE;
-			if (Button != INDEX_NONE && Distance < BestDistance)
+			const UMotionControllerComponent* Best = nullptr;
+			for (const UMotionControllerComponent* Component : Hands)
 			{
-				Best = Weak.Get();
-				BestButton = Button;
-				BestDistance = Distance;
+				const FString Source = Component->MotionSource.ToString();
+				if (Component->IsTracked() && Source.StartsWith(Hand == 0 ? TEXT("Left") : TEXT("Right")) && (!Best || Source.EndsWith(TEXT("Aim"))))
+				{
+					Best = Component;
+				}
+			}
+			if (Best)
+			{
+				Pointers.Add({ Best->GetComponentLocation(), Best->GetForwardVector(), Hand });
 			}
 		}
 	}
-	if (Best != HoveredMonitor.Get() || BestButton != HoveredButton)
+	FVector Eye, Forward;
+	if (Pointers.Num() == 0 && GetView(Eye, Forward))
 	{
+		Pointers.Add({ Eye, Forward, INDEX_NONE });
+	}
+	return Pointers;
+}
+
+AMonitorDisplay* UGMICameraSubsystem::MonitorAt(const FVector& Origin, const FVector& Direction, float& OutDistance, int32& OutButton) const
+{
+	// The nearest screen the ray meets, at most 4 m away (the screens on the consoles around the player)
+	AMonitorDisplay* Best = nullptr;
+	OutDistance = 400.f;
+	OutButton = INDEX_NONE;
+	for (const TWeakObjectPtr<AMonitorDisplay>& Weak : Monitors)
+	{
+		float Distance = 0.f;
+		if (Weak.IsValid() && Weak->RayHit(Origin, Direction, Distance) && Distance < OutDistance)
+		{
+			Best = Weak.Get();
+			OutDistance = Distance;
+		}
+	}
+	if (Best)
+	{
+		float Distance = 0.f;
+		OutButton = Best->ButtonAt(Origin, Direction, Distance);
+	}
+	return Best;
+}
+
+void UGMICameraSubsystem::UpdateHoveredButton()
+{
+	// The first pointer that points at a screen (a hand before the view)
+	const TArray<FPointer> Pointers = GetPointers();
+	AMonitorDisplay* Best = nullptr;
+	const FPointer* Active = nullptr;
+	int32 BestButton = INDEX_NONE;
+	float Distance = 0.f;
+	for (const FPointer& Pointer : Pointers)
+	{
+		Best = MonitorAt(Pointer.Origin, Pointer.Direction, Distance, BestButton);
+		if (Best)
+		{
+			Active = &Pointer;
+			break;
+		}
+	}
+	if (Best != HoveredMonitor.Get())
+	{
+		// Another screen: the old one puts its buttons away, the new one shows its big ones
 		if (AMonitorDisplay* Old = HoveredMonitor.Get())
 		{
 			Old->SetHoveredButton(INDEX_NONE);
-		}
-		if (Best)
-		{
-			Best->SetHoveredButton(BestButton);
+			Old->SetFocused(false);
 		}
 		HoveredMonitor = Best;
+		HoveredButton = INDEX_NONE;
+		if (Best)
+		{
+			Best->SetFocused(true);
+			float Unused = 0.f;
+			BestButton = Best->ButtonAt(Active->Origin, Active->Direction, Unused);   // the buttons just moved
+		}
+	}
+	if (Best && BestButton != HoveredButton)
+	{
+		Best->SetHoveredButton(BestButton);
 		HoveredButton = BestButton;
+	}
+	ShowPointer(Active, Distance);
+}
+
+void UGMICameraSubsystem::ShowPointer(const FPointer* Pointer, float Distance)
+{
+	UWorld* World = GetWorld();
+	if (!PointerActor && Pointer && World && World->IsGameWorld())
+	{
+		// Made on first use: a small bright dot and a thin beam, lit like the screens (the screen material, white)
+		FActorSpawnParameters Spawn;
+		Spawn.ObjectFlags |= RF_Transient;
+		PointerActor = World->SpawnActor<AActor>(AActor::StaticClass(), FTransform::Identity, Spawn);
+		USceneComponent* Root = PointerActor ? NewObject<USceneComponent>(PointerActor, TEXT("Root")) : nullptr;
+		if (!Root)
+		{
+			return;
+		}
+		PointerActor->SetRootComponent(Root);
+		Root->RegisterComponent();
+		UMaterialInterface* Material = LoadObject<UMaterialInterface>(nullptr, TEXT("/ATCSim/Materials/M_Monitor.M_Monitor"), nullptr, LOAD_NoWarn | LOAD_Quiet);
+		UTexture* White = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"), nullptr, LOAD_NoWarn | LOAD_Quiet);
+		auto Make = [&](const TCHAR* Name, const TCHAR* Mesh, float Brightness)
+		{
+			UStaticMeshComponent* Component = NewObject<UStaticMeshComponent>(PointerActor, Name);
+			Component->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, Mesh));
+			Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			Component->SetCastShadow(false);
+			Component->bHiddenInSceneCapture = true;
+			Component->SetMobility(EComponentMobility::Movable);
+			Component->SetupAttachment(Root);
+			Component->RegisterComponent();
+			if (Material)
+			{
+				UMaterialInstanceDynamic* Instance = Component->CreateDynamicMaterialInstance(0, Material);
+				Instance->SetTextureParameterValue(TEXT("Feed"), White);
+				Instance->SetScalarParameterValue(TEXT("Brightness"), Brightness);
+			}
+			return Component;
+		};
+		PointerDot = Make(TEXT("Dot"), TEXT("/Engine/BasicShapes/Sphere.Sphere"), 1.f);
+		PointerBeam = Make(TEXT("Beam"), TEXT("/Engine/BasicShapes/Cylinder.Cylinder"), 0.5f);
+	}
+	if (!PointerDot || !PointerBeam)
+	{
+		return;
+	}
+	PointerDot->SetVisibility(Pointer != nullptr);
+	PointerBeam->SetVisibility(Pointer != nullptr && Pointer->Hand != INDEX_NONE);
+	if (!Pointer)
+	{
+		return;
+	}
+	// The dot just in front of the glass, 1.4 cm across; the beam (a cylinder 1 m high along Z) from the hand to it
+	const FVector Hit = Pointer->Origin + Pointer->Direction * (Distance - 0.4f);
+	PointerDot->SetWorldTransform(FTransform(FQuat::Identity, Hit, FVector(0.014f)));
+	if (Pointer->Hand != INDEX_NONE)
+	{
+		const float Length = FMath::Max(Distance - 6.f, 1.f);
+		PointerBeam->SetWorldTransform(FTransform(FRotationMatrix::MakeFromZ(Pointer->Direction).ToQuat(), Pointer->Origin + Pointer->Direction * (5.f + Length * 0.5f),
+			FVector(0.003f, 0.003f, Length / 100.f)));
+	}
+}
+
+void UGMICameraSubsystem::Press(int32 Hand)
+{
+	UpdateHoveredButton();
+	AMonitorDisplay* Monitor = HoveredMonitor.Get();
+	int32 Button = HoveredButton;
+	// The hand that pulled its trigger, when it points at a button itself (the other hand may hold the focus)
+	for (const FPointer& Pointer : GetPointers())
+	{
+		float Distance = 0.f;
+		int32 Own = INDEX_NONE;
+		AMonitorDisplay* Pointed = Hand != INDEX_NONE && Pointer.Hand == Hand ? MonitorAt(Pointer.Origin, Pointer.Direction, Distance, Own) : nullptr;
+		if (Pointed && Own != INDEX_NONE)
+		{
+			Monitor = Pointed;
+			Button = Own;
+		}
+	}
+	if (Monitor && Button != INDEX_NONE)
+	{
+		Monitor->PressButton(Button);
 	}
 }
 
 void UGMICameraSubsystem::OnPress(const FInputActionValue& Value)
 {
-	UpdateHoveredButton();
-	if (AMonitorDisplay* Monitor = HoveredMonitor.Get())
-	{
-		Monitor->PressButton(HoveredButton);
-	}
+	Press(INDEX_NONE);
+}
+
+void UGMICameraSubsystem::OnPressLeft(const FInputActionValue& Value)
+{
+	Press(0);
+}
+
+void UGMICameraSubsystem::OnPressRight(const FInputActionValue& Value)
+{
+	Press(1);
 }
 
 void UGMICameraSubsystem::OnLens(const FInputActionValue& Value)

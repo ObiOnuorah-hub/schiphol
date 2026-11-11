@@ -30,8 +30,8 @@ namespace
 	const TCHAR* const ButtonTexts[AMonitorDisplay::NumButtons] = { TEXT("<CAM"), TEXT("CAM>"), TEXT("<PRE"), TEXT("PRE>") };
 
 	// Brightness of a button face: idle, looked at, pressed
-	constexpr float ButtonIdle = 0.08f;
-	constexpr float ButtonHover = 0.35f;
+	constexpr float ButtonIdle = 0.16f;
+	constexpr float ButtonHover = 0.5f;
 	constexpr float ButtonPressed = 0.9f;
 }
 
@@ -120,6 +120,7 @@ void AMonitorDisplay::LayOut()
 		Label->SetRelativeTransform(FTransform(FRotator::ZeroRotator, FVector(2.f, PictureSize.X * 0.5f, -PictureSize.Y * 0.5f - 2.f)));
 		Label->SetVerticalAlignment(EVRTA_TextTop);
 		Label->SetWorldSize(LabelSizeCm);
+		PictureCenterZ = 0.f;
 		PlaceButtons(-PictureSize.Y * 0.5f - 2.f - LabelSizeCm, 2.f);
 		return;
 	}
@@ -141,25 +142,79 @@ void AMonitorDisplay::LayOut()
 	Label->SetRelativeTransform(FTransform(FRotator::ZeroRotator, FVector(0.5f, PictureSize.X * 0.5f, -HeightCm * 0.5f + Margin)));
 	Label->SetVerticalAlignment(EVRTA_TextBottom);
 	Label->SetWorldSize(LabelSizeCm);
+	PictureCenterZ = PictureZ;
 	PlaceButtons(-HeightCm * 0.5f + Margin + LabelSizeCm, 0.45f);
 }
 
 void AMonitorDisplay::PlaceButtons(float CenterZ, float FrontX)
 {
-	// Right-aligned with the picture, level with the two label lines. Left in the picture is +Y
-	ButtonSize = FVector2D(ButtonWidth, ButtonHeight) * LabelSizeCm;
-	const float Gap = ButtonGap * LabelSizeCm;
-	const float Total = NumButtons * ButtonSize.X + (NumButtons - 1) * Gap;
+	StripZ = CenterZ;
 	ButtonFrontX = FrontX;
+	ArrangeButtons();
+}
+
+void AMonitorDisplay::ArrangeButtons()
+{
+	float Margin = 0.f, Total = 0.f, CenterZ = StripZ;
+	if (bFocused)
+	{
+		// Pointed at: a touch bar of four big keys over the whole width, along the top of the picture (that is sky)
+		ButtonGapCm = PictureSize.X * 0.015f;
+		Margin = ButtonGapCm;
+		Total = PictureSize.X - 2.f * Margin;
+		ButtonSize = FVector2D((Total - (NumButtons - 1) * ButtonGapCm) / NumButtons, FMath::Max(PictureSize.Y * 0.17f, 3.f));
+		CenterZ = PictureCenterZ + PictureSize.Y * 0.5f - Margin - ButtonSize.Y * 0.5f;
+	}
+	else
+	{
+		// Small, right-aligned with the picture, level with the two label lines
+		ButtonSize = FVector2D(ButtonWidth, ButtonHeight) * LabelSizeCm;
+		ButtonGapCm = ButtonGap * LabelSizeCm;
+		Total = NumButtons * ButtonSize.X + (NumButtons - 1) * ButtonGapCm;
+	}
 	ButtonCenters.SetNum(NumButtons);
 	for (int32 Index = 0; Index < NumButtons && Index < ButtonFaces.Num(); ++Index)
 	{
-		const float Y = -PictureSize.X * 0.5f + Total - Index * (ButtonSize.X + Gap) - ButtonSize.X * 0.5f;
+		// Left in the picture is +Y: button 0 is the left one
+		const float Y = -PictureSize.X * 0.5f + Margin + Total - Index * (ButtonSize.X + ButtonGapCm) - ButtonSize.X * 0.5f;
 		ButtonCenters[Index] = FVector2D(Y, CenterZ);
-		ButtonFaces[Index]->SetRelativeTransform(FTransform(FRotator::ZeroRotator, FVector(FrontX, Y, CenterZ), FVector(0.001f, ButtonSize.X / 100.f, ButtonSize.Y / 100.f)));
-		ButtonLabels[Index]->SetRelativeLocation(FVector(FrontX + 0.1f, Y, CenterZ));
-		ButtonLabels[Index]->SetWorldSize(ButtonSize.Y * 0.5f);
+		ButtonFaces[Index]->SetRelativeTransform(FTransform(FRotator::ZeroRotator, FVector(ButtonFrontX, Y, CenterZ), FVector(0.001f, ButtonSize.X / 100.f, ButtonSize.Y / 100.f)));
+		ButtonLabels[Index]->SetRelativeLocation(FVector(ButtonFrontX + 0.1f, Y, CenterZ));
+		ButtonLabels[Index]->SetWorldSize(ButtonSize.Y * (bFocused ? 0.42f : 0.5f));
 	}
+}
+
+void AMonitorDisplay::SetFocused(bool bInFocused)
+{
+	if (bFocused != bInFocused)
+	{
+		bFocused = bInFocused;
+		HoveredButton = INDEX_NONE;
+		ArrangeButtons();
+		UpdateButtonLook();
+	}
+}
+
+bool AMonitorDisplay::RayHit(const FVector& Eye, const FVector& Forward, float& OutDistance) const
+{
+	const FVector Normal = GetActorForwardVector();
+	const float Along = Forward | Normal;
+	if (Along > -0.1f)
+	{
+		return false;   // from behind, or almost along the glass
+	}
+	const FTransform& Transform = GetActorTransform();
+	OutDistance = ((Transform.TransformPosition(FVector(ButtonFrontX, 0.f, 0.f)) - Eye) | Normal) / Along;
+	if (OutDistance <= 0.f)
+	{
+		return false;
+	}
+	const FVector Local = Transform.InverseTransformPosition(Eye + Forward * OutDistance);
+	// A monitor of its own: the picture and the label under it; over a tower screen: that whole screen. 2 cm around it
+	const float HalfWidth = (HeightCm > 0.f ? WidthCm : PictureSize.X) * 0.5f + 2.f;
+	const float Top = (HeightCm > 0.f ? HeightCm * 0.5f : PictureSize.Y * 0.5f) + 2.f;
+	const float Bottom = (HeightCm > 0.f ? -HeightCm * 0.5f : -PictureSize.Y * 0.5f - 2.f - 2.5f * LabelSizeCm) - 2.f;
+	return FMath::Abs(Local.Y) <= HalfWidth && Local.Z <= Top && Local.Z >= Bottom;
 }
 
 int32 AMonitorDisplay::ButtonAt(const FVector& Eye, const FVector& Forward, float& OutDistance) const
@@ -178,9 +233,10 @@ int32 AMonitorDisplay::ButtonAt(const FVector& Eye, const FVector& Forward, floa
 		return INDEX_NONE;
 	}
 	const FVector Local = Transform.InverseTransformPosition(Eye + Forward * OutDistance);
+	// A little beside a key still counts: half the gap to the next one, a quarter of the height above and below
 	for (int32 Index = 0; Index < NumButtons; ++Index)
 	{
-		if (FMath::Abs(Local.Y - ButtonCenters[Index].X) <= ButtonSize.X * 0.5f && FMath::Abs(Local.Z - ButtonCenters[Index].Y) <= ButtonSize.Y * 0.5f)
+		if (FMath::Abs(Local.Y - ButtonCenters[Index].X) <= (ButtonSize.X + ButtonGapCm) * 0.5f && FMath::Abs(Local.Z - ButtonCenters[Index].Y) <= ButtonSize.Y * 0.75f)
 		{
 			return Index;
 		}

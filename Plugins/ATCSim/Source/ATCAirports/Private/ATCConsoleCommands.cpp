@@ -227,7 +227,10 @@ namespace ATCCommands
 		}
 	}
 
-	/** ATC.LookAt <callsign | Screen<number>> [field of view]: look at an aircraft (binoculars: a small field of view) or at a tower screen. */
+	/**
+	 * ATC.LookAt <callsign | Screen<number>[.<button>]> [field of view]: look at an aircraft (binoculars: a small field of
+	 * view), at a tower screen, or at one of its touch buttons (Screen1.1 = "CAM>" of screen 1, where it is now).
+	 */
 	void LookAt(const TArray<FString>& Args, UWorld* World)
 	{
 		APlayerController* Controller = World ? World->GetFirstPlayerController() : nullptr;
@@ -241,9 +244,11 @@ namespace ATCCommands
 		{
 			for (TActorIterator<AMonitorDisplay> It(World); It; ++It)
 			{
-				if (It->MonitorNumber == FCString::Atoi(*Args[0].RightChop(6)))
+				FString Number = Args[0].RightChop(6), Button;
+				Number.Split(TEXT("."), &Number, &Button);
+				if (It->MonitorNumber == FCString::Atoi(*Number))
 				{
-					Target = It->GetPictureCenter();
+					Target = Button.IsEmpty() ? It->GetPictureCenter() : It->GetButtonLocation(FCString::Atoi(*Button));
 				}
 			}
 		}

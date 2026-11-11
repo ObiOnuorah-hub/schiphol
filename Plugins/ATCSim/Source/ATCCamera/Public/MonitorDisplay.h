@@ -101,10 +101,27 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ATC|Monitor")
 	void PressButton(int32 Index);
 
+	/**
+	 * The viewer points at this screen (UGMICameraSubsystem): the four buttons become a big touch bar along the top of
+	 * the picture (over the sky), easy to hit with a VR controller or the eyes. Off: small in the label strip again.
+	 */
+	void SetFocused(bool bInFocused);
+	bool IsFocused() const { return bFocused; }
+
+	/** Where a ray from Eye along Forward meets this screen (picture and label strip); false = beside or behind it. */
+	bool RayHit(const FVector& Eye, const FVector& Forward, float& OutDistance) const;
+
 private:
 	void LayOut();
 	void PlaceButtons(float CenterZ, float FrontX);
+	void ArrangeButtons();
 	void UpdateButtonLook();
+
+	bool bFocused = false;
+	/** Height of the label strip's middle and of the picture's middle, in the actor's space. */
+	float StripZ = 0.f;
+	float PictureCenterZ = 0.f;
+	float ButtonGapCm = 1.f;
 
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UMaterialInstanceDynamic>> ButtonInstances;

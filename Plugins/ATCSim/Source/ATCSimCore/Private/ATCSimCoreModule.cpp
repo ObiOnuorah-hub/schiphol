@@ -21,7 +21,12 @@ UATCSimSettings::UATCSimSettings()
 	// (measured 13-10-2026, see section N of the design document); 64 instead of 128 samples: 4.7 -> 3.5 ms (02-11-2026).
 	// Mode 3 (meant for clouds in the sky only) costs 13 ms in stereo: keep 2.
 	VRProfile.Add(TEXT("r.VolumetricRenderTarget.Mode"), TEXT("2"));
-	VRProfile.Add(TEXT("r.VolumetricCloud.ViewRaySampleMaxCount"), TEXT("64"));
+	// The clouds are traced once for each eye: in plain Play with traffic they were 6.3 of the 15.4 ms of a stereo frame
+	// (GPU profile, 11-11-2026). Half the cloud resolution: 2.3 ms; 32 instead of 64 samples: 1.9 ms; 16 shadow samples
+	// towards the sun: 1.0 ms. The sky looks the same from the tower, a little softer at the cloud edges
+	VRProfile.Add(TEXT("r.VolumetricRenderTarget.Scale"), TEXT("0.5"));
+	VRProfile.Add(TEXT("r.VolumetricCloud.ViewRaySampleMaxCount"), TEXT("32"));
+	VRProfile.Add(TEXT("r.VolumetricCloud.Shadow.ViewRaySampleMaxCount"), TEXT("16"));
 	VRProfile.Add(TEXT("r.VolumetricCloud.SkyAO"), TEXT("0"));
 	VRProfile.Add(TEXT("r.VolumetricCloud.ShadowMap"), TEXT("0"));
 	// Every camera picture renders the scene again: in the headset the two live cameras run at 15 Hz instead of 20
