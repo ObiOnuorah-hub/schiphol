@@ -616,6 +616,53 @@ namespace ATCSetup
 		return Reached;
 	}
 
+	/** True when the points run through the parking place of another stand (same rule as StandCuts). */
+	bool CutsOtherPlace(const FSite& Site, const FString& OwnRef, const FVector& OwnSpot, const TArray<FVector>& Points)
+	{
+		const FVector Spot(OwnSpot.X, OwnSpot.Y, 0.0);
+		for (const FStandZone& Zone : Site.Stands)
+		{
+			if (Zone.Ref == OwnRef || FMath::PointDistToSegment(Spot, Zone.Nose, Zone.Back) < 2500.f)
+			{
+				continue;
+			}
+			for (int32 Index = 1; Index < Points.Num(); ++Index)
+			{
+				const int32 Steps = FMath::Max(1, FMath::CeilToInt(FVector::Dist2D(Points[Index - 1], Points[Index]) / 200.f));
+				for (int32 Step = 0; Step <= Steps; ++Step)
+				{
+					if (Zone.Contains(FMath::Lerp(Points[Index - 1], Points[Index], float(Step) / Steps)))
+					{
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	/** True when the path follows an edge line beside the centreline for 10 m or more in a row. */
+	bool FollowsSideLine(const FSite& Site, const TArray<int32>& Path)
+	{
+		double Run = 0.0;
+		for (int32 Index = 1; Index < Path.Num(); ++Index)
+		{
+			if (Site.IsSideLine(Path[Index]) && Site.IsSideLine(Path[Index - 1]))
+			{
+				Run += FVector::Dist2D(Site.Network->Nodes[Path[Index]], Site.Network->Nodes[Path[Index - 1]]);
+				if (Run >= 1000.0)
+				{
+					return true;
+				}
+			}
+			else
+			{
+				Run = 0.0;
+			}
+		}
+		return false;
+	}
+
 	bool BuildDeparture(const FSite& Site, FDeparture& D)
 	{
 		const ATCMapSurvey::FNetwork& Network = *Site.Network;
@@ -767,6 +814,11 @@ namespace ATCSetup
 			return false;
 		}
 		PushPoints.Insert(MainGear, 0);
+		if (CutsOtherPlace(Site, D.StandRef, MainGear, PushPoints) || CutsOtherPlace(Site, D.StandRef, MainGear, TaxiPoints) || FollowsSideLine(Site, TaxiPath))
+		{
+			UE_LOG(LogATC, Warning, TEXT("%s: stand %s skipped, its way out runs through another parking place or along an edge line"), *Site.ICAO, *D.StandRef);
+			return false;
+		}
 		// Simplify: the nodes of painted lines zigzag a few decimetres, which the curve speed limit would read as bends
 		D.Push = ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(PushPoints, 50.f), 2000.f);
 
@@ -898,6 +950,11 @@ namespace ATCSetup
 		if (Path.IsEmpty())
 		{
 			UE_LOG(LogATC, Warning, TEXT("%s: no taxi route from the %s exit to stand %s"), *Site.ICAO, *D.ArrivalRunway, *D.StandRef);
+			return false;
+		}
+		if (FollowsSideLine(Site, Path) || CutsOtherPlace(Site, D.StandRef, MainGear, ToPoints(Network, Path)))
+		{
+			UE_LOG(LogATC, Warning, TEXT("%s: stand %s skipped for %s, its taxi-in runs through another parking place or along an edge line"), *Site.ICAO, *D.StandRef, *D.ArrivalRunway);
 			return false;
 		}
 		// Worth knowing: a taxi-in that could not stay on the centrelines
