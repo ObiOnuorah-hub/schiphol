@@ -2866,7 +2866,17 @@ namespace ATCSetup
 			}
 			else if (It->RouteTag.ToString().Contains(TEXT(".Rwy")) || It->RouteTag.ToString().Contains(TEXT(".Arr")))
 			{
-				Routes.Add(*It);
+				// "ATC.AddParallelRoutes Arr36C Rwy36L": only routes with one of these in their tag (16-11-2026: lanes
+				// only where 36C arrivals meet 36L departures head-on north of the terminal; elsewhere fewer splines)
+				bool bWanted = Args.Num() == 0;
+				for (const FString& Part : Args)
+				{
+					bWanted |= It->RouteTag.ToString().Contains(TEXT(".") + Part);
+				}
+				if (bWanted)
+				{
+					Routes.Add(*It);
+				}
 			}
 		}
 		for (AActor* Actor : Old)

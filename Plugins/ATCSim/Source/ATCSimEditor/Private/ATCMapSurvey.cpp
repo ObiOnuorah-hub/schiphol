@@ -407,8 +407,49 @@ namespace ATCMapSurvey
 		}
 	}
 
+	void FNetwork::ComputePartners() const
+	{
+		PartnerSide.Init(FVector2D::ZeroVector, Nodes.Num());
+		int32 Paired = 0;
+		for (int32 Node = 0; Node < Nodes.Num(); ++Node)
+		{
+			if (LinePart[Node] != MainLinePart || Links[Node].Num() < 2)
+			{
+				continue;
+			}
+			const FVector2D Along = LineDirection(Node);
+			const FVector2D Across(-Along.Y, Along.X);
+			FVector2D Found = FVector2D::ZeroVector;
+			int32 Sides = 0;
+			for (const double Side : { 1.0, -1.0 })
+			{
+				for (double Distance = 4500.0; Distance <= 11000.0; Distance += 1300.0)
+				{
+					const FVector Probe(FVector2D(Nodes[Node]) + Across * Side * Distance, Nodes[Node].Z);
+					const int32 Other = Nearest(Probe, 400.f);
+					if (Other != INDEX_NONE && LinePart[Other] == MainLinePart && FMath::Abs(LineDirection(Other) | Along) > 0.97)
+					{
+						Found = Across * Side;
+						++Sides;
+						break;
+					}
+				}
+			}
+			if (Sides == 1)
+			{
+				PartnerSide[Node] = Found;
+				++Paired;
+			}
+		}
+		UE_LOG(LogTemp, Display, TEXT("Paint network: %d of %d nodes on a taxiway with a parallel twin (keep right)"), Paired, Nodes.Num());
+	}
+
 	TArray<int32> FNetwork::FindPath(int32 Start, int32 Goal, const TArray<float>* NodeCost, const FVector2D* StartHeading) const
 	{
+		if (PartnerSide.Num() != Nodes.Num())
+		{
+			ComputePartners();
+		}
 		if (!Nodes.IsValidIndex(Start) || !Nodes.IsValidIndex(Goal))
 		{
 			return {};
@@ -453,7 +494,13 @@ namespace ATCMapSurvey
 			const float Step = FVector::Dist2D(Nodes[From], Nodes[To]);
 			const int32 Line = LinePart[To];
 			const bool bOffNetwork = Line != MainLinePart && Line != LinePart[Start] && Line != LinePart[Goal];
-			return Step * 0.5f * (LineCost(From) + LineCost(To)) * (Step > CellCm ? 1.5f : 1.f) * (bOffNetwork ? 3.f : 1.f) * (NodeCost ? (*NodeCost)[To] : 1.f);
+			// Twin taxiways one way each, like the inner and outer ring at Schiphol: keep right. On the left one of a
+			// pair (its twin lies to the right of the way it goes) a metre counts double, so traffic in opposite
+			// directions takes different taxiways instead of meeting head-on
+			const FVector2D Way = FVector2D(Nodes[To] - Nodes[From]);
+			const bool bWrongTwin = !PartnerSide[To].IsZero() && (PartnerSide[To] | FVector2D(-Way.Y, Way.X)) > 0.0;
+			return Step * 0.5f * (LineCost(From) + LineCost(To)) * (Step > CellCm ? 1.5f : 1.f) * (bOffNetwork ? 3.f : 1.f) * (NodeCost ? (*NodeCost)[To] : 1.f)
+				* (bWrongTwin ? 2.f : 1.f);
 		};
 		auto Heuristic = [&](int32 Node) { return static_cast<float>(FVector::Dist2D(Nodes[Node], Nodes[Goal])); };
 

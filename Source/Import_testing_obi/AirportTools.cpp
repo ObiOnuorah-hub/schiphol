@@ -299,6 +299,65 @@ namespace
 		UE_LOG(LogTemp, Display, TEXT("Airport.TreesNoNanite: %d tree components now render without Nanite, map saved"), Fixed);
 	}
 
+	/**
+	 * "Airport.TreeMask alpha": M_TreeCards cuts out by the leaf texture's own alpha only (the textures have a real
+	 * alpha, 16-11-2026), without the old white key. "Airport.TreeMask hide": the tree card components are hidden in
+	 * the map instead (they rendered as white boards). Saves.
+	 */
+	void TreeMask(const TArray<FString>& Args, UWorld* World)
+	{
+		const FString Mode = Args.Num() > 0 ? Args[0] : TEXT("alpha");
+		if (Mode == TEXT("hide") && World)
+		{
+			int32 Hidden = 0;
+			for (TActorIterator<AActor> It(World); It; ++It)
+			{
+				TInlineComponentArray<UStaticMeshComponent*> Components(*It);
+				for (UStaticMeshComponent* Component : Components)
+				{
+					bool bTree = false;
+					for (const UMaterialInterface* Material : Component->GetMaterials())
+					{
+						const UMaterial* Base = Material ? Material->GetMaterial() : nullptr;
+						bTree |= Base && Base->GetName().StartsWith(TEXT("M_TreeCards"));
+					}
+					if (bTree && Component->IsVisible())
+					{
+						It->Modify();
+						Component->Modify();
+						Component->SetVisibility(false);
+						++Hidden;
+					}
+				}
+			}
+			UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost() }, false);
+			UE_LOG(LogTemp, Display, TEXT("Airport.TreeMask: %d tree card components hidden, map saved"), Hidden);
+			return;
+		}
+		UMaterial* Trees = LoadObject<UMaterial>(nullptr, TEXT("/Game/EHAM/Materials/M_TreeCards.M_TreeCards"));
+		UMaterialExpressionTextureSampleParameter2D* Leaves = nullptr;
+		for (UMaterialExpression* Expression : Trees ? Trees->GetExpressions() : TConstArrayView<TObjectPtr<UMaterialExpression>>())
+		{
+			Leaves = Leaves ? Leaves : Cast<UMaterialExpressionTextureSampleParameter2D>(Expression);
+		}
+		if (!Trees || !Leaves)
+		{
+			UE_LOG(LogTemp, Error, TEXT("Airport.TreeMask: no M_TreeCards or no leaf texture in it"));
+			return;
+		}
+		Trees->Modify();
+		UMaterialEditingLibrary::ConnectMaterialProperty(Leaves, TEXT("A"), MP_OpacityMask);
+		Trees->OpacityMaskClipValue = 0.5f;
+		UMaterialEditingLibrary::RecompileMaterial(Trees);
+		UEditorLoadingAndSavingUtils::SavePackages({ Trees->GetPackage() }, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.TreeMask: M_TreeCards cuts out by the texture alpha (clip 0.5), saved"));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs TreeMaskCommand(
+		TEXT("Airport.TreeMask"),
+		TEXT("Airport.TreeMask alpha|hide: tree cards cut out by their alpha, or hidden"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TreeMask));
+
 	/** "Airport.MeshInfo <mesh path>": triangles per LOD, Nanite and its fallback settings, bounds (log). */
 	void MeshInfo(const TArray<FString>& Args, UWorld* World)
 	{

@@ -50,6 +50,9 @@ namespace ATCMapSurvey
 
 	private:
 		void Attach(int32 Node, float MaxBridgeCm, TArray<int32>& OutLocal, int32& OutMain) const;
+		/** Per node of the main lines: towards the parallel centreline 45-110 m beside it (zero: none, or both sides). */
+		void ComputePartners() const;
+		mutable TArray<FVector2D> PartnerSide;
 		void ComputeParts();
 		void AddBridges(float MaxBridgeCm, int32 MinPartNodes);
 
