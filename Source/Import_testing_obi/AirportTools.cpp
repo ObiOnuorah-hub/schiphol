@@ -257,6 +257,78 @@ namespace
 		UE_LOG(LogTemp, Display, TEXT("Airport.FixAll: saved"));
 	}
 
+	/**
+	 * The tree cards (M_TreeCards, masked by the leaf alpha) came out as white boards with grey tree shapes through
+	 * Nanite, and as trees without it ("r.Nanite 0", 16-11-2026). "Airport.TreesNoNanite" renders every component with a
+	 * tree card material without Nanite (like the glass in FixAll) and saves the map.
+	 */
+	void TreesNoNanite(const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World)
+		{
+			return;
+		}
+		int32 Fixed = 0;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			TInlineComponentArray<UStaticMeshComponent*> Components(*It);
+			for (UStaticMeshComponent* Component : Components)
+			{
+				if (Component->bDisallowNanite || !Component->GetStaticMesh())
+				{
+					continue;
+				}
+				bool bTree = false;
+				for (const UMaterialInterface* Material : Component->GetMaterials())
+				{
+					const UMaterial* Base = Material ? Material->GetMaterial() : nullptr;
+					bTree |= Base && Base->GetName().StartsWith(TEXT("M_TreeCards"));
+				}
+				if (!bTree)
+				{
+					continue;
+				}
+				It->Modify();
+				Component->Modify();
+				Component->bDisallowNanite = true;
+				Component->MarkRenderStateDirty();
+				++Fixed;
+			}
+		}
+		UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost() }, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.TreesNoNanite: %d tree components now render without Nanite, map saved"), Fixed);
+	}
+
+	/** "Airport.MeshInfo <mesh path>": triangles per LOD, Nanite and its fallback settings, bounds (log). */
+	void MeshInfo(const TArray<FString>& Args, UWorld* World)
+	{
+		UStaticMesh* Mesh = Args.Num() > 0 ? LoadObject<UStaticMesh>(nullptr, *Args[0]) : nullptr;
+		if (!Mesh)
+		{
+			UE_LOG(LogTemp, Error, TEXT("Airport.MeshInfo: no mesh %s"), Args.Num() > 0 ? *Args[0] : TEXT("(none)"));
+			return;
+		}
+		FString Lods;
+		for (int32 Lod = 0; Lod < Mesh->GetNumLODs(); ++Lod)
+		{
+			Lods += FString::Printf(TEXT(" LOD%d=%d tris"), Lod, Mesh->GetNumTriangles(Lod));
+		}
+		const FMeshNaniteSettings& Nanite = Mesh->NaniteSettings;
+		UE_LOG(LogTemp, Display, TEXT("Airport.MeshInfo: %s%s nanite=%d fallbackPercent=%.3f fallbackError=%.2f keepPercent=%.2f bounds %s, %d sections, source tris %d"),
+			*Mesh->GetName(), *Lods, Nanite.bEnabled ? 1 : 0, Nanite.FallbackPercentTriangles, Nanite.FallbackRelativeError, Nanite.KeepPercentTriangles,
+			*Mesh->GetBounds().BoxExtent.ToString(), Mesh->GetNumSections(0), Mesh->IsMeshDescriptionValid(0) ? Mesh->GetMeshDescription(0)->Triangles().Num() : -1);
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs MeshInfoCommand(
+		TEXT("Airport.MeshInfo"),
+		TEXT("Airport.MeshInfo <mesh path>: triangles per LOD and Nanite fallback settings"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&MeshInfo));
+
+	FAutoConsoleCommandWithWorldAndArgs TreesNoNaniteCommand(
+		TEXT("Airport.TreesNoNanite"),
+		TEXT("Render the tree cards without Nanite (they came out as white boards through Nanite); saves the map"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TreesNoNanite));
+
 	FAutoConsoleCommandWithWorldAndArgs FixAllCommand(
 		TEXT("Airport.FixAll"),
 		TEXT("Fix tree materials, Nanite usage flag and glass on Nanite meshes, then save"),
@@ -1977,6 +2049,52 @@ namespace
 		UE_LOG(LogTemp, Display, TEXT("Airport.FacadeGloss: facades specular %.2f roughness %.2f (power %.1f), ground stays matte; saved"), SpecularValue, RoughnessValue, PowerValue);
 	}
 
+	/**
+	 * The residential blocks and houses around the airport have white walls in their texture and lit up as white boxes
+	 * on the horizon (16-11-2026). "Airport.DimMaterials <brightness> <contrast> <name part> [...]" sets GroundBrightness
+	 * and GroundContrast (M_TerrainVT) on every instance under /Game/EHAM whose name contains one of the parts, and
+	 * GrassAmount 0 there (no grass colour on their roofs); saves them.
+	 */
+	void DimMaterials(const TArray<FString>& Args)
+	{
+		if (Args.Num() < 3)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Airport.DimMaterials <brightness> <contrast> <name part> [...]"));
+			return;
+		}
+		const float Brightness = FCString::Atof(*Args[0]);
+		const float Contrast = FCString::Atof(*Args[1]);
+		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+		FARFilter Filter;
+		Filter.PackagePaths.Add(TEXT("/Game/EHAM"));
+		Filter.bRecursivePaths = true;
+		Filter.ClassPaths.Add(UMaterialInstanceConstant::StaticClass()->GetClassPathName());
+		TArray<FAssetData> Assets;
+		Registry.GetAssets(Filter, Assets);
+		TArray<UPackage*> ToSave;
+		for (const FAssetData& Asset : Assets)
+		{
+			const FString Name = Asset.AssetName.ToString();
+			bool bMatch = false;
+			for (int32 Index = 2; Index < Args.Num(); ++Index)
+			{
+				bMatch |= Name.Contains(Args[Index]);
+			}
+			UMaterialInstanceConstant* Instance = bMatch ? Cast<UMaterialInstanceConstant>(Asset.GetAsset()) : nullptr;
+			if (!Instance || !Instance->GetMaterial() || Instance->GetMaterial()->GetName() != TEXT("M_TerrainVT"))
+			{
+				continue;
+			}
+			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Instance, TEXT("GroundBrightness"), Brightness);
+			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Instance, TEXT("GroundContrast"), Contrast);
+			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Instance, TEXT("GrassAmount"), 0.f);
+			ToSave.Add(Instance->GetPackage());
+			UE_LOG(LogTemp, Display, TEXT("Airport.DimMaterials: %s brightness %.2f contrast %.2f"), *Name, Brightness, Contrast);
+		}
+		UEditorLoadingAndSavingUtils::SavePackages(ToSave, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.DimMaterials: %d instances, saved"), ToSave.Num());
+	}
+
 	/** "Airport.MatInfo <material path>": what feeds each input of a material (log), to find a dark AO or odd roughness. */
 	void MatInfo(const TArray<FString>& Args)
 	{
@@ -2121,9 +2239,29 @@ namespace
 			Connect(Param(TEXT("GrassSatScale"), 150, 800), TEXT(""), Scaled, TEXT("B"));
 			UMaterialExpression* Mask = Make(UMaterialExpressionSaturate::StaticClass(), 700);
 			Connect(Scaled, TEXT(""), Mask, TEXT(""));
-			UMaterialExpression* Weight = Make(UMaterialExpressionMultiply::StaticClass(), 750);
-			Connect(Mask, TEXT(""), Weight, TEXT("A"));
-			Connect(Param(TEXT("GrassAmount"), 150, 900), TEXT(""), Weight, TEXT("B"));
+			UMaterialExpression* Weight0 = Make(UMaterialExpressionMultiply::StaticClass(), 750);
+			Connect(Mask, TEXT(""), Weight0, TEXT("A"));
+			Connect(Param(TEXT("GrassAmount"), 150, 900), TEXT(""), Weight0, TEXT("B"));
+			// Only on the ground: up to GrassMaxZ (cm, the land lies around 0), fading out over 2 m above it, so brown
+			// roofs and walls that share the photo material stay as they are
+			UMaterialExpression* Position = Make(UMaterialExpressionWorldPosition::StaticClass(), 950);
+			UMaterialExpressionComponentMask* PositionZ = Cast<UMaterialExpressionComponentMask>(Make(UMaterialExpressionComponentMask::StaticClass(), 950));
+			PositionZ->R = false;
+			PositionZ->G = false;
+			PositionZ->B = true;
+			PositionZ->A = false;
+			Connect(Position, TEXT(""), PositionZ, TEXT(""));
+			UMaterialExpression* Below = Make(UMaterialExpressionSubtract::StaticClass(), 950);
+			Connect(Param(TEXT("GrassMaxZ"), 150, 1000), TEXT(""), Below, TEXT("A"));
+			Connect(PositionZ, TEXT(""), Below, TEXT("B"));
+			UMaterialExpressionMultiply* BelowScaled = Cast<UMaterialExpressionMultiply>(Make(UMaterialExpressionMultiply::StaticClass(), 950));
+			BelowScaled->ConstB = 1.f / 200.f;
+			Connect(Below, TEXT(""), BelowScaled, TEXT("A"));
+			UMaterialExpression* Ground = Make(UMaterialExpressionSaturate::StaticClass(), 950);
+			Connect(BelowScaled, TEXT(""), Ground, TEXT(""));
+			UMaterialExpression* Weight = Make(UMaterialExpressionMultiply::StaticClass(), 975);
+			Connect(Weight0, TEXT(""), Weight, TEXT("A"));
+			Connect(Ground, TEXT(""), Weight, TEXT("B"));
 			// Light and dark of the photo: luminance against the reference, clamped
 			UMaterialExpressionConstant3Vector* Rec709 = Cast<UMaterialExpressionConstant3Vector>(Make(UMaterialExpressionConstant3Vector::StaticClass(), 1000));
 			Rec709->Constant = FLinearColor(0.2126f, 0.7152f, 0.0722f);
@@ -2157,6 +2295,7 @@ namespace
 		FindScalar(TEXT("GrassSatLow"))->DefaultValue = SatLow;
 		FindScalar(TEXT("GrassSatScale"))->DefaultValue = 1.f / FMath::Max(SatHigh - SatLow, 0.01f);
 		FindScalar(TEXT("GrassRefLum"))->DefaultValue = FMath::Max(RefLum, 0.001f);
+		FindScalar(TEXT("GrassMaxZ"))->DefaultValue = Args.Num() > 7 ? FCString::Atof(*Args[7]) : 300.f;
 		TintParam->DefaultValue = Tint;
 		UMaterialEditingLibrary::RecompileMaterial(Terrain);
 		TArray<UPackage*> ToSave = { Terrain->GetPackage() };
@@ -2697,6 +2836,11 @@ namespace
 		TEXT("Airport.FacadeGloss [specular 0.5] [roughness 0.3] [power 4]: facades of the photo material reflect the sky again, the ground stays matte"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&FacadeGloss));
 
+	FAutoConsoleCommand DimMaterialsCommand(
+		TEXT("Airport.DimMaterials"),
+		TEXT("Airport.DimMaterials <brightness> <contrast> <name part> [...]: darker photo material on matching instances (no grass colour there)"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&DimMaterials));
+
 	FAutoConsoleCommand MatInfoCommand(
 		TEXT("Airport.MatInfo"),
 		TEXT("Airport.MatInfo <material path>: what feeds each input of the material (log)"),
@@ -2840,9 +2984,19 @@ namespace
 			// "Airport.SkyInfo fog 0.02 0.2 1500": density, height falloff, start distance (m) to try (not saved)
 			if (Args.Num() > 3 && Args[0] == TEXT("fog"))
 			{
+				Fog->Modify();
 				Fog->SetFogDensity(FCString::Atof(*Args[1]));
 				Fog->SetFogHeightFalloff(FCString::Atof(*Args[2]));
 				Fog->SetStartDistance(FCString::Atof(*Args[3]) * 100.f);
+#if WITH_EDITOR
+				// "... fog 0.004 0.2 1000 save" in the editor: kept in the map (the light haze of a Dutch summer day)
+				if (Args.Num() > 4 && Args[4] == TEXT("save") && !World->IsGameWorld())
+				{
+					It->Modify();
+					UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost() }, false);
+					UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: fog saved in the map"));
+				}
+#endif
 			}
 			++Fogs;
 			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: fog %s visible=%d density=%.4f falloff=%.3f start=%.0f m z=%.0f m volumetric=%d inscattering=%s"), *It->GetName(),
@@ -2874,6 +3028,22 @@ namespace
 			{
 				Post.bOverride_AmbientOcclusionIntensity = true;
 				Post.AmbientOcclusionIntensity = FCString::Atof(*Args[1]);
+			}
+			// "Airport.SkyInfo shadowtint 0.92 0.98 1.12 0.8 [save]": gain (r g b) and saturation of the shadows
+			if (Args.Num() > 4 && Args[0] == TEXT("shadowtint") && It->bUnbound)
+			{
+				Post.bOverride_ColorGainShadows = true;
+				Post.ColorGainShadows = FVector4(FCString::Atof(*Args[1]), FCString::Atof(*Args[2]), FCString::Atof(*Args[3]), 1.0);
+				Post.bOverride_ColorSaturationShadows = true;
+				Post.ColorSaturationShadows = FVector4(1.0, 1.0, 1.0, FCString::Atof(*Args[4]));
+#if WITH_EDITOR
+				if (Args.Num() > 5 && Args[5] == TEXT("save") && !World->IsGameWorld())
+				{
+					It->Modify();
+					UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost() }, false);
+					UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: shadow tint saved in the map"));
+				}
+#endif
 			}
 			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: post %s unbound=%d exposureMethod=%d(%d) bias=%.2f(%d) min=%.2f max=%.2f ao=%.2f(%d) indirect=%.2f(%d) gi=%d(%d) reflections=%d(%d) skylightLeak=%.2f(%d)"),
 				*It->GetName(), It->bUnbound ? 1 : 0, static_cast<int32>(Post.AutoExposureMethod), Post.bOverride_AutoExposureMethod ? 1 : 0,
@@ -2931,7 +3101,8 @@ namespace
 			const FBox Box = It->Bounds.GetBox();
 			FVector HitLocation, HitNormal;
 			float Time = 0.f;
-			if (It->GetWorld() == World && It->IsVisible() && !Box.IsInside(Origin) && Box.GetExtent().Size2D() < 100000.0
+			if (It->GetWorld() == World && It->IsVisible() && !Box.IsInside(Origin) && Box.GetExtent().Size2D() < 300000.0
+				&& !(It->GetStaticMesh() && (It->GetStaticMesh()->GetName().StartsWith(TEXT("TreeMidSummer")) || It->GetStaticMesh()->GetName().StartsWith(TEXT("SM_TaxiLight"))))
 				&& FMath::LineExtentBoxIntersection(Box, Origin, Origin + Direction * 2000000.0, FVector::ZeroVector, HitLocation, HitNormal, Time))
 			{
 				Boxes.Add({ Time * 20000.0, *It });
@@ -2941,8 +3112,9 @@ namespace
 		for (int32 Index = 0; Index < FMath::Min(Boxes.Num(), 4); ++Index)
 		{
 			const UStaticMeshComponent* Mesh = Boxes[Index].Value;
-			UE_LOG(LogTemp, Display, TEXT("Airport.Pick %s: box %.0f m %s mesh %s collision=%d:%s"), *Where, Boxes[Index].Key, *Mesh->GetOwner()->GetName(),
-				Mesh->GetStaticMesh() ? *Mesh->GetStaticMesh()->GetName() : TEXT("-"), Mesh->IsCollisionEnabled() ? 1 : 0, *Describe(Mesh));
+			UE_LOG(LogTemp, Display, TEXT("Airport.Pick %s: box %.0f m %s mesh %s collision=%d nanite=%d size %.0f m:%s"), *Where, Boxes[Index].Key, *Mesh->GetOwner()->GetName(),
+				Mesh->GetStaticMesh() ? *Mesh->GetStaticMesh()->GetName() : TEXT("-"), Mesh->IsCollisionEnabled() ? 1 : 0, Mesh->bDisallowNanite ? 0 : 1,
+				Mesh->Bounds.BoxExtent.Size2D() * 2.0 / 100.0, *Describe(Mesh));
 		}
 	}
 
@@ -3238,6 +3410,32 @@ namespace
 			}
 			UE_LOG(LogTemp, Display, TEXT("Airport.Shots: %d runway number views"), Views.Num());
 		}
+		// "Airport.Shots 30 mesh <prefix> <mesh name part>": close-ups of a few vertices of the meshes with that name
+		// (a cluster mesh can span kilometres: its bounds centre is often empty)
+		else if (Mode == TEXT("mesh") && Args.Num() > 3)
+		{
+#if WITH_EDITOR
+			for (TObjectIterator<UStaticMeshComponent> It; It && Views.Num() < 6; ++It)
+			{
+				const UStaticMesh* Mesh = It->GetStaticMesh();
+				const FMeshDescription* Description = Mesh && It->GetWorld() == World && Mesh->GetName().Contains(Args[3]) ? Mesh->GetMeshDescription(0) : nullptr;
+				if (!Description || Description->Vertices().Num() == 0)
+				{
+					continue;
+				}
+				FStaticMeshConstAttributes Attributes(*Description);
+				const TVertexAttributesConstRef<FVector3f> Positions = Attributes.GetVertexPositions();
+				const int32 Count = Description->Vertices().Num();
+				for (const int32 Pick : { Count / 5, (Count * 3) / 5 })
+				{
+					const FVector Spot = It->GetComponentTransform().TransformPosition(FVector(Positions[FVertexID(Pick)]));
+					Views.Add({ Spot + FVector(-3500.0, -3500.0, 2500.0), Spot });
+					UE_LOG(LogTemp, Display, TEXT("Airport.Shots: %s vertex %d at %s, materials:%s"), *Mesh->GetName(), Pick, *Spot.ToString(),
+						*FString::JoinBy(It->GetMaterials(), TEXT(" "), [](const UMaterialInterface* Material) { return Material ? Material->GetPathName() : FString(TEXT("none")); }));
+				}
+			}
+#endif
+		}
 		// "Airport.Shots 60 planes": only close-ups of parked aircraft, from both sides
 		else if (Mode == TEXT("planes") || Mode == TEXT("hq"))
 		{
@@ -3276,7 +3474,7 @@ namespace
 		TSharedRef<int32> Step = MakeShared<int32>(0);
 		FTimerHandle Handle;
 		const bool bPerf = Mode == TEXT("perf");
-		const bool bPick = Args.Num() > 3 && Args[3] == TEXT("pick");
+		const bool bPick = (Args.Num() > 3 && Args[3] == TEXT("pick")) || (Args.Num() > 4 && Args[4] == TEXT("pick"));
 		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([World, Views, Folder, Step, bPerf, bPick]()
 		{
 			APlayerController* Controller = World->GetFirstPlayerController();

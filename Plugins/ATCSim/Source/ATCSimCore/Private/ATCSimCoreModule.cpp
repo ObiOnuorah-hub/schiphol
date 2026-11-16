@@ -34,6 +34,17 @@ UATCSimSettings::UATCSimSettings()
 	// 80 % resolution: 16.0 -> 13.5 ms per frame in stereo at 3440x1440 (p99 17.9 -> 15.1 ms), still sharp with TAA. Simpler
 	// shadows (CSM) saved 0.9 ms but lose the sun's shadows on the cab's desks; cheaper VSM only 0.2 ms (measured 10-11-2026)
 	VRProfile.Add(TEXT("r.ScreenPercentage"), TEXT("80"));
+	VRProfile.Add(TEXT("r.SkyLight.RealTimeReflectionCapture.TimeSlice"), TEXT("1"));
+
+	// Desktop, plain Play with traffic at 1920x1080 on a GTX 1080 Ti: 11.4 ms GPU, p99 17 ms (16-11-2026). Of it the
+	// clouds 2.4 ms, TSR at epic quality 2.4 ms and the sky light capture redrawing the clouds into its cube map every
+	// frame 1.8 ms. The cloud settings of the headset (the sky looks the same), the sky capture spread over frames and
+	// the TSR history at screen resolution instead of double
+	DesktopProfile.Add(TEXT("r.VolumetricRenderTarget.Scale"), TEXT("0.5"));
+	DesktopProfile.Add(TEXT("r.VolumetricCloud.ViewRaySampleMaxCount"), TEXT("32"));
+	DesktopProfile.Add(TEXT("r.VolumetricCloud.Shadow.ViewRaySampleMaxCount"), TEXT("16"));
+	DesktopProfile.Add(TEXT("r.SkyLight.RealTimeReflectionCapture.TimeSlice"), TEXT("1"));
+	DesktopProfile.Add(TEXT("r.TSR.History.ScreenPercentage"), TEXT("100"));
 
 	ValidatedPaths = { TEXT("/Game/Aircraft"), TEXT("/Game/Airports"), TEXT("/Game/Environment"), TEXT("/Game/Camera"), TEXT("/Game/Scenarios"), TEXT("/ATCSim") };
 	AllowedDependencyRoots = { TEXT("/Game/"), TEXT("/ATCSim/"), TEXT("/Script/"), TEXT("/Engine/"), TEXT("/Niagara/") };
