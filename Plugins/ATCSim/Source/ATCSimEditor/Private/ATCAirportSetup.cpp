@@ -766,12 +766,62 @@ namespace ATCSetup
 
 		// Pushback: tail first the other way along the taxilane, until the aircraft stands straight on it. A stand placed
 		// by hand has no line to follow: straight back to the taxilane first
-		const int32 PushStart = Stand.bSynthetic ? Tail : Network.Nearest(MainGear, 1000.f);
-		int32 PushEnd = Network.Nearest(Join - TaxiDirection * (Wheelbase + 3000.f), 2500.f);
-		TArray<int32> PushPath = PushEnd != INDEX_NONE && Cost[PushEnd] <= 1.f ? Network.FindPath(PushStart, PushEnd, &Cost) : TArray<int32>();
 		TArray<FVector> PushPoints, TaxiPoints;
 		TArray<int32> TaxiPath;
-		if (PushPath.Num() > 0 && !PushPath.ContainsByPredicate([&Cost](int32 Node) { return Cost[Node] >= 100.f; }))
+		// As a tug does it: straight back out of the stand, then one turn of at most 20 m radius (main gear) that ends
+		// on the taxilane, tail towards the other way than the aircraft will taxi; the taxi starts there, straight ahead
+		{
+			const FVector2D Axis = -FVector2D(Stand.Direction).GetSafeNormal();
+			const FVector2D Along = FVector2D(TaxiDirection).GetSafeNormal();
+			const double Across = Axis ^ Along;
+			// Straight back to where the stand's axis crosses the taxilane
+			const double Back = ((FVector2D(Join) - FVector2D(MainGear)) ^ Along) / (FMath::Abs(Across) > 1e-3 ? Across : 1e-3);
+			const double Turn = FMath::Acos(FMath::Clamp(Axis | -Along, -1.0, 1.0));
+			// Only where the stand's axis meets the taxilane near the end of its lead-in, not somewhere far down the line
+			const bool bNear = Back < 12000.0 && FVector2D::Distance(FVector2D(MainGear) + Axis * Back, FVector2D(Join)) < 4000.0;
+			if (FMath::Abs(Across) > 0.5 && Back > 1000.0 && bNear && Turn < FMath::DegreesToRadians(150.0))
+			{
+				const double Tan = FMath::Tan(Turn * 0.5);
+				const double Radius = FMath::Clamp((Back - 500.0) / Tan, 600.0, 2000.0);
+				const double Tangent = FMath::Min(Radius * Tan, Back);
+				const double Bend = Tangent / Tan;
+				const FVector2D Corner = FVector2D(MainGear) + Axis * Back;
+				const FVector2D ArcStart = Corner - Axis * Tangent;
+				// Turning left (Axis x -Along > 0): the centre lies left of the way back
+				const double Side = (Axis ^ -Along) > 0.0 ? 1.0 : -1.0;
+				const FVector2D Center = ArcStart + FVector2D(-Axis.Y, Axis.X) * Side * Bend;
+				TArray<FVector> Arc = { MainGear };
+				const int32 Steps = FMath::Clamp(FMath::CeilToInt(Bend * Turn / 100.0), 4, 60);
+				for (int32 Step = 0; Step <= Steps; ++Step)
+				{
+					const FVector2D Point = Center + (ArcStart - Center).GetRotated(FMath::RadiansToDegrees(Side * Turn * Step / Steps));
+					Arc.Add(FVector(Point, MainGear.Z));
+				}
+				for (const float Extra : { Wheelbase + 3000.f, Wheelbase + 1500.f, Wheelbase + 500.f })
+				{
+					const FVector End(Corner - Along * FMath::Max<double>(Extra, Tangent + 100.0), Join.Z);
+					TArray<FVector> Candidate = Arc;
+					Candidate.Add(End);
+					if (!CutsOtherPlace(Site, D.StandRef, MainGear, Candidate))
+					{
+						PushPoints = Candidate;
+						PushPoints.RemoveAt(0);   // MainGear goes in again below
+						TaxiPath = TArray<int32>(First.GetData() + JoinIndex, First.Num() - JoinIndex);
+						TaxiPoints = ToPoints(Network, TaxiPath);
+						TaxiPoints.Insert(End, 0);
+						break;
+					}
+				}
+			}
+		}
+		const int32 PushStart = Stand.bSynthetic ? Tail : Network.Nearest(MainGear, 1000.f);
+		int32 PushEnd = Network.Nearest(Join - TaxiDirection * (Wheelbase + 3000.f), 2500.f);
+		TArray<int32> PushPath = PushPoints.IsEmpty() && PushEnd != INDEX_NONE && Cost[PushEnd] <= 1.f ? Network.FindPath(PushStart, PushEnd, &Cost) : TArray<int32>();
+		if (!PushPoints.IsEmpty())
+		{
+			// Done above
+		}
+		else if (PushPath.Num() > 0 && !PushPath.ContainsByPredicate([&Cost](int32 Node) { return Cost[Node] >= 100.f; }))
 		{
 			PushPoints = ToPoints(Network, PushPath);
 			// Taxi: from the end of the pushback to the runway
@@ -814,13 +864,20 @@ namespace ATCSetup
 			return false;
 		}
 		PushPoints.Insert(MainGear, 0);
-		if (CutsOtherPlace(Site, D.StandRef, MainGear, PushPoints) || CutsOtherPlace(Site, D.StandRef, MainGear, TaxiPoints) || FollowsSideLine(Site, TaxiPath))
+		// Simplify: the nodes of painted lines zigzag a few decimetres, which the curve speed limit would read as bends.
+		// No bend tighter than a tug turns an airliner (about 11 m at the main gear)
+		// A tug turns the aircraft almost about its main gear: down to 6 m there. But no loops: a pushback turns the
+		// aircraft at most about half round
+		bool bPushSmooth = true;
+		D.Push = ATCMapSurvey::SmoothBends(ATCMapSurvey::Simplify(PushPoints, 20.f), 600.f, &bPushSmooth);
+		double PushTurn = 0.0;
+		for (int32 Index = 2; Index < D.Push.Num(); ++Index)
 		{
-			UE_LOG(LogATC, Warning, TEXT("%s: stand %s skipped, its way out runs through another parking place or along an edge line"), *Site.ICAO, *D.StandRef);
-			return false;
+			const FVector2D In = FVector2D(D.Push[Index - 1] - D.Push[Index - 2]).GetSafeNormal();
+			const FVector2D Out = FVector2D(D.Push[Index] - D.Push[Index - 1]).GetSafeNormal();
+			PushTurn += FMath::Acos(FMath::Clamp(In | Out, -1.0, 1.0));
 		}
-		// Simplify: the nodes of painted lines zigzag a few decimetres, which the curve speed limit would read as bends
-		D.Push = ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(PushPoints, 50.f), 2000.f);
+		bPushSmooth &= PushTurn < FMath::DegreesToRadians(200.0);
 
 		const FVector Last = TaxiPoints.Last();
 		const double LastAlong = (Last - RunwayStart) | RunwayDirection;
@@ -831,7 +888,19 @@ namespace ATCSetup
 			TaxiPoints.Add(OnCenterline);
 		}
 		TaxiPoints.Add(OnCenterline + RunwayDirection * 6000.0);
-		D.Taxi = ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(TaxiPoints, 80.f), 3500.f);
+		// No bend tighter than an airliner taxies (about 21 m): zigzags over gaps in the paint become one smooth line
+		bool bTaxiSmooth = true;
+		D.Taxi = ATCMapSurvey::SmoothBends(ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(TaxiPoints, 80.f), 3500.f), 2100.f, &bTaxiSmooth);
+		if (CutsOtherPlace(Site, D.StandRef, MainGear, D.Push) || CutsOtherPlace(Site, D.StandRef, MainGear, D.Taxi) || FollowsSideLine(Site, TaxiPath))
+		{
+			UE_LOG(LogATC, Warning, TEXT("%s: stand %s skipped, its way out runs through another parking place or along an edge line"), *Site.ICAO, *D.StandRef);
+			return false;
+		}
+		if (!bPushSmooth || !bTaxiSmooth)
+		{
+			UE_LOG(LogATC, Warning, TEXT("%s: stand %s skipped, its %s would turn back on itself"), *Site.ICAO, *D.StandRef, bPushSmooth ? TEXT("taxi route") : TEXT("pushback"));
+			return false;
+		}
 
 		// The apron ends where the route leaves the mapped aprons, or (paint) where it reaches the taxiway system
 		D.ApronEnd = TaxiPoints[0];
@@ -946,15 +1015,22 @@ namespace ATCSetup
 		{
 			Cost[Node] = Node == Tail ? 1.f : 1000.f;
 		}
-		const TArray<int32> Path = Network.FindPath(Exit, Tail, &Cost);
+		// Leaving the runway the aircraft already heads for the exit: no turning back from there
+		const FVector2D ExitHeading = FVector2D(Network.Nodes[Exit] - (Threshold + LandingDirection * (ExitAlong - 1.5 * FMath::Abs(
+			(Network.Nodes[Exit] - Threshold).X * -LandingDirection.Y + (Network.Nodes[Exit] - Threshold).Y * LandingDirection.X)))).GetSafeNormal();
+		TArray<int32> Path = Network.FindPath(Exit, Tail, &Cost, &ExitHeading);
+		if (Path.IsEmpty())
+		{
+			Path = Network.FindPath(Exit, Tail, &Cost);
+		}
 		if (Path.IsEmpty())
 		{
 			UE_LOG(LogATC, Warning, TEXT("%s: no taxi route from the %s exit to stand %s"), *Site.ICAO, *D.ArrivalRunway, *D.StandRef);
 			return false;
 		}
-		if (FollowsSideLine(Site, Path) || CutsOtherPlace(Site, D.StandRef, MainGear, ToPoints(Network, Path)))
+		if (FollowsSideLine(Site, Path))
 		{
-			UE_LOG(LogATC, Warning, TEXT("%s: stand %s skipped for %s, its taxi-in runs through another parking place or along an edge line"), *Site.ICAO, *D.StandRef, *D.ArrivalRunway);
+			UE_LOG(LogATC, Warning, TEXT("%s: stand %s skipped for %s, its taxi-in runs along an edge line"), *Site.ICAO, *D.StandRef, *D.ArrivalRunway);
 			return false;
 		}
 		// Worth knowing: a taxi-in that could not stay on the centrelines
@@ -987,7 +1063,14 @@ namespace ATCSetup
 		Points.Append(ToPoints(Network, Path));
 		Points.Add(Stand.TailEnd + (MainGear - Stand.TailEnd).GetSafeNormal2D() * 1000.0);
 		Points.Add(MainGear);
-		D.Arrival = ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(Points, 80.f), 3500.f);
+		bool bArrivalSmooth = true;
+		D.Arrival = ATCMapSurvey::SmoothBends(ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(Points, 80.f), 3500.f), 2100.f, &bArrivalSmooth);
+		if (CutsOtherPlace(Site, D.StandRef, MainGear, D.Arrival) || !bArrivalSmooth)
+		{
+			UE_LOG(LogATC, Warning, TEXT("%s: stand %s skipped for %s, its taxi-in %s"), *Site.ICAO, *D.StandRef, *D.ArrivalRunway,
+				bArrivalSmooth ? TEXT("runs through another parking place") : TEXT("would turn back on itself"));
+			return false;
+		}
 
 		// The apron starts where the path leaves the main taxiway lines (the taxilane and lead-in)
 		D.ArrivalApronStart = MainGear;
@@ -1137,13 +1220,29 @@ namespace ATCSetup
 		Route->RouteTag = Tag(RouteTag);
 		Route->bShowCenterline = false;   // the map has its own paint
 		Route->Spline->ClearSplinePoints(false);
+		TArray<FVector> Clean;
 		for (const FVector& Point : Points)
+		{
+			if (Clean.IsEmpty() || FVector::Dist(Clean.Last(), Point) > 20.f)
+			{
+				Clean.Add(Point);
+			}
+		}
+		for (const FVector& Point : Clean)
 		{
 			Route->Spline->AddSplinePoint(Point, ESplineCoordinateSpace::World, false);
 		}
-		for (int32 Index = 0; Index < Points.Num(); ++Index)
+		// Tangents along the bisector of the corner, no longer than the shorter of the two segments (and 50 m).
+		// Automatic (CurveClamped) tangents take half the distance between the neighbours: after a 300 m straight that
+		// is a 150 m tangent on a 3 m arc step, and the spline loops there. A tangent as long as an 800 m straight, a
+		// degree off its direction, bows that straight 10 m out to the side
+		for (int32 Index = 0; Index < Clean.Num(); ++Index)
 		{
-			Route->Spline->SetSplinePointType(Index, ESplinePointType::CurveClamped, false);
+			const FVector In = Index > 0 ? Clean[Index] - Clean[Index - 1] : FVector::ZeroVector;
+			const FVector Out = Index < Clean.Num() - 1 ? Clean[Index + 1] - Clean[Index] : FVector::ZeroVector;
+			const FVector Direction = (In.GetSafeNormal() + Out.GetSafeNormal()).GetSafeNormal();
+			const double Length = FMath::Min3(Index > 0 ? In.Size() : Out.Size(), Index < Clean.Num() - 1 ? Out.Size() : In.Size(), 5000.0);
+			Route->Spline->SetTangentsAtSplinePoint(Index, Direction * Length, Direction * Length, ESplineCoordinateSpace::World, false);
 		}
 		Route->Spline->UpdateSpline();
 		Route->SetActorLabel(RouteTag.ToString().Replace(TEXT("."), TEXT("_")));
@@ -2539,8 +2638,9 @@ namespace ATCSetup
 			StandAt.Add(It->StandTag.ToString().RightChop(FString(TEXT("Stand.EHAM.")).Len()), It->GetParkingTransform().GetLocation() * FVector(1, 1, 0));
 		}
 
-		int32 Routes = 0, CutRoutes = 0, SideRoutes = 0;
+		int32 Routes = 0, CutRoutes = 0, SideRoutes = 0, TightRoutes = 0;
 		float CutMetres = 0.f, SideMetres = 0.f;
+		TArray<float> TightestRadius;
 		TSet<int32> CutZones;
 		TArray<FVector> CutPoints, SidePoints;
 		for (TActorIterator<ATaxiRoute> It(World); It; ++It)
@@ -2550,11 +2650,13 @@ namespace ATCSetup
 			++Routes;
 			// Beside the centreline: on a taxiway edge line or a loose mark (within 1.5 m of such a painted line)
 			float Beside = 0.f;
+			FVector FirstSide = FVector::ZeroVector;
 			for (float D = 0.f; D <= It->GetLength(); D += 200.f)
 			{
 				const FVector Point = It->Spline->GetLocationAtDistanceAlongSpline(D, ESplineCoordinateSpace::World);
 				if (Site.IsSideLine(Site.Network->Nearest(Point, 150.f)))
 				{
+					FirstSide = Beside == 0.f ? Point : FirstSide;
 					Beside += 2.f;
 					SidePoints.Add(Point);
 				}
@@ -2563,7 +2665,36 @@ namespace ATCSetup
 			{
 				++SideRoutes;
 				SideMetres += Beside;
-				UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: SIDE %s follows a line beside the centreline for %.0f m"), *It->RouteTag.ToString(), Beside);
+				UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: SIDE %s follows a line beside the centreline for %.0f m, from X=%.0f Y=%.0f m"), *It->RouteTag.ToString(), Beside,
+					FirstSide.X / 100.0, FirstSide.Y / 100.0);
+			}
+			// Bends: the tightest radius (turn over 3 m chords), away from the first and last 10 m. A taxiing airliner
+			// steers no tighter than about 20 m; a tug turns the main gear of a pushback down to about 6 m
+			{
+				const bool bPush = It->RouteTag.ToString().Contains(TEXT(".Pushback"));
+				const float Length = It->GetLength();
+				float Tightest = BIG_NUMBER, TightestAt = 0.f;
+				for (float D = 1300.f; D <= Length - 1300.f; D += 100.f)
+				{
+					const FVector A = It->Spline->GetLocationAtDistanceAlongSpline(D - 300.f, ESplineCoordinateSpace::World);
+					const FVector B = It->Spline->GetLocationAtDistanceAlongSpline(D, ESplineCoordinateSpace::World);
+					const FVector C = It->Spline->GetLocationAtDistanceAlongSpline(D + 300.f, ESplineCoordinateSpace::World);
+					const float Turn = FMath::Acos(FMath::Clamp(FVector::DotProduct((B - A).GetSafeNormal2D(), (C - B).GetSafeNormal2D()), -1.f, 1.f));
+					const float Radius = Turn > 1e-4f ? 300.f / Turn : BIG_NUMBER;
+					if (Radius < Tightest)
+					{
+						Tightest = Radius;
+						TightestAt = D;
+					}
+				}
+				TightestRadius.Add(Tightest);
+				if (Tightest < (bPush ? 550.f : 1800.f))
+				{
+					++TightRoutes;
+					const FVector At = It->Spline->GetLocationAtDistanceAlongSpline(TightestAt, ESplineCoordinateSpace::World);
+					UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: BEND %s turns with a %.0f m radius at %.0f m (X=%.0f Y=%.0f m)"), *It->RouteTag.ToString(),
+						Tightest / 100.f, TightestAt / 100.f, At.X / 100.0, At.Y / 100.0);
+				}
 			}
 			const TMap<int32, float> Cuts = StandCuts(Zones, *It, Ref, StandAt.Find(Ref), &CutPoints);
 			if (Cuts.Num() == 0)
@@ -2680,6 +2811,9 @@ namespace ATCSetup
 			Plot.Save(FString::Printf(TEXT("stand_cuts_%d"), Tile));
 			UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: stand_cuts_%d.png around X=%.0f Y=%.0f m (%d cut points)"), Tile, (Cell.Key.X + 0.5) * 600.0, (Cell.Key.Y + 0.5) * 600.0, Cell.Value);
 		}
+		TightestRadius.Sort();
+		UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: %d routes bend tighter than 18 m (pushback 5.5 m); tightest radius per route: min %.0f m, median %.0f m"),
+			TightRoutes, TightestRadius.Num() ? TightestRadius[0] / 100.f : 0.f, TightestRadius.Num() ? TightestRadius[TightestRadius.Num() / 2] / 100.f : 0.f);
 		UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: %d routes follow a line beside the centreline for 20 m or more, %.0f m in all"), SideRoutes, SideMetres);
 		UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: %d of %d routes run through %d parking places that are not their own, %.0f m in all (%d parking places known)"),
 			CutRoutes, Routes, CutZones.Num(), CutMetres, Zones.Num());
@@ -2862,7 +2996,9 @@ namespace ATCSetup
 			{
 				Cost[Node] = FMath::Max(Cost[Node], StandCost[Node]);
 			}
-			const TArray<int32> Path = Network.FindPath(Start, Goal, &Cost);
+			// Going on the way the route goes there
+			const FVector2D Heading = FVector2D(Original[FMath::Min(FirstOn + 3, Original.Num() - 1)] - Original[FMath::Max(FirstOn - 3, 0)]).GetSafeNormal();
+			const TArray<int32> Path = Network.FindPath(Start, Goal, &Cost, &Heading);
 			if (Path.Num() < 2)
 			{
 				continue;
@@ -2870,7 +3006,13 @@ namespace ATCSetup
 			TArray<FVector> Points(Original.GetData(), FirstOn);
 			Points.Append(ToPoints(Network, Path));
 			Points.Append(Original.GetData() + LastOn + 1, Original.Num() - LastOn - 1);
-			Points = ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(Points, 80.f), 3500.f);
+			bool bSmooth = false;
+			Points = ATCMapSurvey::SmoothBends(ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(Points, 80.f), 3500.f), 2100.f, &bSmooth);
+			if (!bSmooth || CutsOtherPlace(Site, OwnRef, OwnSpot, Points))
+			{
+				UE_LOG(LogATC, Display, TEXT("ATC.AddParallelRoutes: %s: the parallel lane %s"), *Tag, bSmooth ? TEXT("runs through another parking place") : TEXT("would turn back on itself"));
+				continue;
+			}
 
 			// A real parallel lane: beside the route for a while, not far from it, not much longer, no other runways
 			double Beside = 0.0, Farthest = 0.0;
@@ -3323,8 +3465,14 @@ namespace ATCSetup
 					*Plan.Gate.ArrivalRunway, LengthOf(Plan.Gate.Arrival) / 100.0));
 			Plans.Add(Plan);
 		}
-		UE_LOG(LogATC, Display, TEXT("ATC.AddParkedGates: %d parked models join the traffic (%d copies on top of another hidden with it), %d stay parked"),
-			Plans.Num(), Copies, Skipped);
+		// Half the gates of before (user, 16 Nov): of the new gates only every fourth, the other models stay parked as
+		// they are in the map (fewer routes and splines, a calmer apron). The traffic gates keep their models
+		const int32 Every = 4;
+		int32 NewIndex = 0;
+		const int32 Thinned = Plans.RemoveAll([&NewIndex, Every](const FPlan& Plan) { return !Plan.TrafficStand && (NewIndex++ % Every) != 0; });
+		Skipped += Thinned;
+		UE_LOG(LogATC, Display, TEXT("ATC.AddParkedGates: %d parked models join the traffic (%d copies on top of another hidden with it), %d stay parked (%d of them to keep the gates few)"),
+			Plans.Num(), Copies, Skipped, Thinned);
 		TArray<FDeparture> NewGates;
 		for (const FPlan& Plan : Plans)
 		{

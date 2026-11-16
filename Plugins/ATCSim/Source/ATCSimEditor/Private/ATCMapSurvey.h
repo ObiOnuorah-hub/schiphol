@@ -36,7 +36,7 @@ namespace ATCMapSurvey
 		 * Shortest path over the painted lines (A*), as node indices. Empty when not connected. NodeCost: a cost factor
 		 * per node (1 = normal), for example to find another way than a given route.
 		 */
-		TArray<int32> FindPath(int32 Start, int32 Goal, const TArray<float>* NodeCost = nullptr) const;
+		TArray<int32> FindPath(int32 Start, int32 Goal, const TArray<float>* NodeCost = nullptr, const FVector2D* StartHeading = nullptr) const;
 		/**
 		 * Route between two locations. A start or goal on a loose line (a stand lead-in that stops short of the taxilane)
 		 * follows that line to its end nearest the taxiway system and bridges the gap in a straight line.
@@ -65,6 +65,13 @@ namespace ATCMapSurvey
 
 	/** Replaces sharp corners by arcs of RadiusCm (smaller when the legs are short), sampled every StepCm. */
 	TArray<FVector> RoundCorners(const TArray<FVector>& Points, float RadiusCm, float StepCm = 300.f);
+
+	/**
+	 * Resamples the line every metre and smooths it only where it bends tighter than MinRadiusCm (zigzags over gaps in
+	 * the paint, corners), until no bend is tighter; end points stay. Simplified again (5 cm) before returning.
+	 * bOutReached: false when some bend stays tighter (a turn back on itself between fixed ends).
+	 */
+	TArray<FVector> SmoothBends(const TArray<FVector>& Points, float MinRadiusCm, bool* bOutReached = nullptr);
 
 	/** World Partition map: load every actor in the editor (a headless editor loads none). Once per world. */
 	void LoadWholeWorld(UWorld* World);

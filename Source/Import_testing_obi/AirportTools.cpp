@@ -10,6 +10,8 @@
 #include "Engine/TextureCube.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Engine/PostProcessVolume.h"
+#include "Engine/ExponentialHeightFog.h"
+#include "Components/ExponentialHeightFogComponent.h"
 #include "Engine/Engine.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
@@ -60,6 +62,12 @@
 #include "Materials/MaterialExpressionOneMinus.h"
 #include "Materials/MaterialExpressionSaturate.h"
 #include "Materials/MaterialExpressionAdd.h"
+#include "Materials/MaterialExpressionMax.h"
+#include "Materials/MaterialExpressionMin.h"
+#include "Materials/MaterialExpressionDotProduct.h"
+#include "Materials/MaterialExpressionClamp.h"
+#include "Materials/MaterialExpressionVertexNormalWS.h"
+#include "Materials/MaterialExpressionAbs.h"
 #include "Engine/Texture2D.h"
 #include "Aircraft.h"
 #include "FlightPath.h"
@@ -1896,6 +1904,287 @@ namespace
 	}
 
 	/**
+	 * Since Airport.MatteAll the photo material reflects nothing (specular 0, roughness 1), also on the facades: glass
+	 * piers and terminals, dark in the photo, came out black where the sun does not reach. Real glass shows the sky.
+	 * "Airport.FacadeGloss [specular 0.5] [roughness 0.3] [power 4]" gives M_TerrainVT a specular and roughness that
+	 * depend on the surface: vertical faces (facades) get the specular and roughness, flat ones (the ground, roofs)
+	 * stay matte as before, so no sun glare over the land. Facade weight = (1 - |normal z|)^power.
+	 */
+	void FacadeGloss(const TArray<FString>& Args)
+	{
+		const float SpecularValue = Args.Num() > 0 ? FCString::Atof(*Args[0]) : 0.5f;
+		const float RoughnessValue = Args.Num() > 1 ? FCString::Atof(*Args[1]) : 0.3f;
+		const float PowerValue = Args.Num() > 2 ? FCString::Atof(*Args[2]) : 4.f;
+		UMaterial* Terrain = LoadObject<UMaterial>(nullptr, TEXT("/Game/EHAM/Materials/M_TerrainVT.M_TerrainVT"));
+		if (!Terrain)
+		{
+			UE_LOG(LogTemp, Error, TEXT("Airport.FacadeGloss: no /Game/EHAM/Materials/M_TerrainVT"));
+			return;
+		}
+		Terrain->Modify();
+		auto FindScalar = [Terrain](const TCHAR* Name) -> UMaterialExpressionScalarParameter*
+		{
+			for (UMaterialExpression* Expression : Terrain->GetExpressions())
+			{
+				UMaterialExpressionScalarParameter* Scalar = Cast<UMaterialExpressionScalarParameter>(Expression);
+				if (Scalar && Scalar->ParameterName == Name)
+				{
+					return Scalar;
+				}
+			}
+			return nullptr;
+		};
+		if (!FindScalar(TEXT("FacadeSpecular")))
+		{
+			auto Make = [Terrain](UClass* Class, int32 Y) { return UMaterialEditingLibrary::CreateMaterialExpression(Terrain, Class, -150, Y); };
+			auto Param = [Terrain](const TCHAR* Name, int32 Y)
+			{
+				UMaterialExpressionScalarParameter* Scalar = Cast<UMaterialExpressionScalarParameter>(
+					UMaterialEditingLibrary::CreateMaterialExpression(Terrain, UMaterialExpressionScalarParameter::StaticClass(), -350, Y));
+				Scalar->ParameterName = Name;
+				return Scalar;
+			};
+			// Facade weight from the vertex normal: 1 on a wall, 0 on the ground
+			UMaterialExpression* Normal = Make(UMaterialExpressionVertexNormalWS::StaticClass(), 1400);
+			UMaterialExpressionComponentMask* Up = Cast<UMaterialExpressionComponentMask>(Make(UMaterialExpressionComponentMask::StaticClass(), 1450));
+			Up->R = false;
+			Up->G = false;
+			Up->B = true;
+			Up->A = false;
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Normal, TEXT(""), Up, TEXT(""));
+			UMaterialExpression* Level = Make(UMaterialExpressionAbs::StaticClass(), 1500);
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Up, TEXT(""), Level, TEXT(""));
+			UMaterialExpression* Wall = Make(UMaterialExpressionOneMinus::StaticClass(), 1550);
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Level, TEXT(""), Wall, TEXT(""));
+			UMaterialExpression* Weight = Make(UMaterialExpressionPower::StaticClass(), 1600);
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Wall, TEXT(""), Weight, TEXT("Base"));
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Param(TEXT("FacadePower"), 1600), TEXT(""), Weight, TEXT("Exponent"));
+			UMaterialExpression* Specular = Make(UMaterialExpressionMultiply::StaticClass(), 1700);
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Weight, TEXT(""), Specular, TEXT("A"));
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Param(TEXT("FacadeSpecular"), 1700), TEXT(""), Specular, TEXT("B"));
+			UMaterialEditingLibrary::ConnectMaterialProperty(Specular, TEXT(""), MP_Specular);
+			UMaterialExpressionLinearInterpolate* Roughness = Cast<UMaterialExpressionLinearInterpolate>(Make(UMaterialExpressionLinearInterpolate::StaticClass(), 1800));
+			Roughness->ConstA = 1.f;
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Param(TEXT("FacadeRoughness"), 1800), TEXT(""), Roughness, TEXT("B"));
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Weight, TEXT(""), Roughness, TEXT("Alpha"));
+			UMaterialEditingLibrary::ConnectMaterialProperty(Roughness, TEXT(""), MP_Roughness);
+		}
+		FindScalar(TEXT("FacadeSpecular"))->DefaultValue = SpecularValue;
+		FindScalar(TEXT("FacadeRoughness"))->DefaultValue = RoughnessValue;
+		FindScalar(TEXT("FacadePower"))->DefaultValue = PowerValue;
+		UMaterialEditingLibrary::RecompileMaterial(Terrain);
+		UEditorLoadingAndSavingUtils::SavePackages({ Terrain->GetPackage() }, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.FacadeGloss: facades specular %.2f roughness %.2f (power %.1f), ground stays matte; saved"), SpecularValue, RoughnessValue, PowerValue);
+	}
+
+	/** "Airport.MatInfo <material path>": what feeds each input of a material (log), to find a dark AO or odd roughness. */
+	void MatInfo(const TArray<FString>& Args)
+	{
+		UMaterialInterface* Interface = Args.Num() > 0 ? LoadObject<UMaterialInterface>(nullptr, *Args[0]) : nullptr;
+		UMaterial* Material = Interface ? Interface->GetMaterial() : nullptr;
+		if (!Material)
+		{
+			UE_LOG(LogTemp, Error, TEXT("Airport.MatInfo: no material %s"), Args.Num() > 0 ? *Args[0] : TEXT("(none)"));
+			return;
+		}
+		const UEnum* ShadingEnum = StaticEnum<EMaterialShadingModel>();
+		UE_LOG(LogTemp, Display, TEXT("Airport.MatInfo: %s (base %s) shading %s, %d expressions"), *Interface->GetPathName(), *Material->GetName(),
+			*ShadingEnum->GetNameStringByValue(Material->GetShadingModels().GetFirstShadingModel()), Material->GetExpressions().Num());
+		const TPair<EMaterialProperty, const TCHAR*> Properties[] = { { MP_BaseColor, TEXT("BaseColor") }, { MP_Metallic, TEXT("Metallic") },
+			{ MP_Specular, TEXT("Specular") }, { MP_Roughness, TEXT("Roughness") }, { MP_Normal, TEXT("Normal") }, { MP_EmissiveColor, TEXT("Emissive") },
+			{ MP_AmbientOcclusion, TEXT("AO") }, { MP_Opacity, TEXT("Opacity") }, { MP_OpacityMask, TEXT("OpacityMask") } };
+		for (const TPair<EMaterialProperty, const TCHAR*>& Property : Properties)
+		{
+			UMaterialExpression* Node = UMaterialEditingLibrary::GetMaterialPropertyInputNode(Material, Property.Key);
+			FString Text = Node ? Node->GetClass()->GetName() : TEXT("-");
+			if (const UMaterialExpressionConstant* Constant = Cast<UMaterialExpressionConstant>(Node))
+			{
+				Text += FString::Printf(TEXT(" = %.3f"), Constant->R);
+			}
+			else if (const UMaterialExpressionScalarParameter* Scalar = Cast<UMaterialExpressionScalarParameter>(Node))
+			{
+				float Value = Scalar->DefaultValue;
+				Interface->GetScalarParameterValue(Scalar->ParameterName, Value);
+				Text += FString::Printf(TEXT(" %s = %.3f"), *Scalar->ParameterName.ToString(), Value);
+			}
+			else if (Node)
+			{
+				Text += TEXT(" (output ") + UMaterialEditingLibrary::GetMaterialPropertyInputNodeOutputName(Material, Property.Key) + TEXT(")");
+			}
+			UE_LOG(LogTemp, Display, TEXT("Airport.MatInfo:   %s <- %s"), Property.Value, *Text);
+		}
+	}
+
+	/**
+	 * The grass between the taxiways came out almost black-brown: the aerial photo is dark and dull there. Real Schiphol
+	 * is green between the runways. "Airport.GrassColor [amount 1] [sat low] [sat high] [ref lum] [r g b]" puts a step
+	 * after the photo in M_TerrainVT: where the photo is coloured (saturation between sat low and sat high fades in;
+	 * asphalt and concrete are grey and stay as they are) it becomes the grass colour (linear r g b), keeping the
+	 * photo's light and dark (its luminance against ref lum, clamped 0.5-1.6). Parameters GrassAmount, GrassSatLow,
+	 * GrassSatScale, GrassRefLum, GrassTint; the buildings' *_Bldg instances get GrassAmount 0. Run again to tune.
+	 */
+	void GrassColor(const TArray<FString>& Args)
+	{
+		const float Amount = Args.Num() > 0 ? FCString::Atof(*Args[0]) : 1.f;
+		const float SatLow = Args.Num() > 1 ? FCString::Atof(*Args[1]) : 0.2f;
+		const float SatHigh = Args.Num() > 2 ? FCString::Atof(*Args[2]) : 0.4f;
+		const float RefLum = Args.Num() > 3 ? FCString::Atof(*Args[3]) : 0.05f;
+		const FLinearColor Tint = Args.Num() > 6 ? FLinearColor(FCString::Atof(*Args[4]), FCString::Atof(*Args[5]), FCString::Atof(*Args[6])) : FLinearColor(0.07f, 0.11f, 0.03f);
+		UMaterial* Terrain = LoadObject<UMaterial>(nullptr, TEXT("/Game/EHAM/Materials/M_TerrainVT.M_TerrainVT"));
+		if (!Terrain)
+		{
+			UE_LOG(LogTemp, Error, TEXT("Airport.GrassColor: no /Game/EHAM/Materials/M_TerrainVT"));
+			return;
+		}
+		Terrain->Modify();
+		auto FindScalar = [Terrain](const TCHAR* Name) -> UMaterialExpressionScalarParameter*
+		{
+			for (UMaterialExpression* Expression : Terrain->GetExpressions())
+			{
+				UMaterialExpressionScalarParameter* Scalar = Cast<UMaterialExpressionScalarParameter>(Expression);
+				if (Scalar && Scalar->ParameterName == Name)
+				{
+					return Scalar;
+				}
+			}
+			return nullptr;
+		};
+		UMaterialExpressionVectorParameter* TintParam = nullptr;
+		for (UMaterialExpression* Expression : Terrain->GetExpressions())
+		{
+			UMaterialExpressionVectorParameter* Vector = Cast<UMaterialExpressionVectorParameter>(Expression);
+			TintParam = Vector && Vector->ParameterName == TEXT("GrassTint") ? Vector : TintParam;
+		}
+
+		if (!FindScalar(TEXT("GrassAmount")))
+		{
+			UMaterialExpression* Photo = UMaterialEditingLibrary::GetMaterialPropertyInputNode(Terrain, MP_BaseColor);
+			const FString PhotoOutput = UMaterialEditingLibrary::GetMaterialPropertyInputNodeOutputName(Terrain, MP_BaseColor);
+			if (!Photo)
+			{
+				UE_LOG(LogTemp, Error, TEXT("Airport.GrassColor: M_TerrainVT has nothing on its base colour"));
+				return;
+			}
+			auto Make = [Terrain](UClass* Class, int32 Y) { return UMaterialEditingLibrary::CreateMaterialExpression(Terrain, Class, 150, Y); };
+			auto Connect = [](UMaterialExpression* From, const FString& Output, UMaterialExpression* To, const FString& Input)
+			{
+				UMaterialEditingLibrary::ConnectMaterialExpressions(From, Output, To, Input);
+			};
+			auto Param = [Terrain](const TCHAR* Name, int32 PosX, int32 PosY)
+			{
+				UMaterialExpressionScalarParameter* Scalar = Cast<UMaterialExpressionScalarParameter>(
+					UMaterialEditingLibrary::CreateMaterialExpression(Terrain, UMaterialExpressionScalarParameter::StaticClass(), PosX, PosY));
+				Scalar->ParameterName = Name;
+				return Scalar;
+			};
+			auto Channel = [&](bool bR, bool bG, bool bB, int32 Y)
+			{
+				UMaterialExpressionComponentMask* Mask = Cast<UMaterialExpressionComponentMask>(Make(UMaterialExpressionComponentMask::StaticClass(), Y));
+				Mask->R = bR;
+				Mask->G = bG;
+				Mask->B = bB;
+				Mask->A = false;
+				Connect(Photo, PhotoOutput, Mask, TEXT(""));
+				return Mask;
+			};
+			UMaterialExpression* R = Channel(true, false, false, 300);
+			UMaterialExpression* G = Channel(false, true, false, 400);
+			UMaterialExpression* B = Channel(false, false, true, 500);
+			// Saturation (max - min) / max
+			UMaterialExpression* MaxRG = Make(UMaterialExpressionMax::StaticClass(), 350);
+			Connect(R, TEXT(""), MaxRG, TEXT("A"));
+			Connect(G, TEXT(""), MaxRG, TEXT("B"));
+			UMaterialExpression* MaxC = Make(UMaterialExpressionMax::StaticClass(), 400);
+			Connect(MaxRG, TEXT(""), MaxC, TEXT("A"));
+			Connect(B, TEXT(""), MaxC, TEXT("B"));
+			UMaterialExpression* MinRG = Make(UMaterialExpressionMin::StaticClass(), 450);
+			Connect(R, TEXT(""), MinRG, TEXT("A"));
+			Connect(G, TEXT(""), MinRG, TEXT("B"));
+			UMaterialExpression* MinC = Make(UMaterialExpressionMin::StaticClass(), 500);
+			Connect(MinRG, TEXT(""), MinC, TEXT("A"));
+			Connect(B, TEXT(""), MinC, TEXT("B"));
+			UMaterialExpression* Spread = Make(UMaterialExpressionSubtract::StaticClass(), 450);
+			Connect(MaxC, TEXT(""), Spread, TEXT("A"));
+			Connect(MinC, TEXT(""), Spread, TEXT("B"));
+			UMaterialExpressionAdd* MaxSafe = Cast<UMaterialExpressionAdd>(Make(UMaterialExpressionAdd::StaticClass(), 550));
+			Connect(MaxC, TEXT(""), MaxSafe, TEXT("A"));
+			MaxSafe->ConstB = 0.001f;
+			UMaterialExpression* Saturation = Make(UMaterialExpressionDivide::StaticClass(), 500);
+			Connect(Spread, TEXT(""), Saturation, TEXT("A"));
+			Connect(MaxSafe, TEXT(""), Saturation, TEXT("B"));
+			// Mask: (saturation - low) * scale, 0..1
+			UMaterialExpression* Above = Make(UMaterialExpressionSubtract::StaticClass(), 600);
+			Connect(Saturation, TEXT(""), Above, TEXT("A"));
+			Connect(Param(TEXT("GrassSatLow"), 150, 700), TEXT(""), Above, TEXT("B"));
+			UMaterialExpression* Scaled = Make(UMaterialExpressionMultiply::StaticClass(), 650);
+			Connect(Above, TEXT(""), Scaled, TEXT("A"));
+			Connect(Param(TEXT("GrassSatScale"), 150, 800), TEXT(""), Scaled, TEXT("B"));
+			UMaterialExpression* Mask = Make(UMaterialExpressionSaturate::StaticClass(), 700);
+			Connect(Scaled, TEXT(""), Mask, TEXT(""));
+			UMaterialExpression* Weight = Make(UMaterialExpressionMultiply::StaticClass(), 750);
+			Connect(Mask, TEXT(""), Weight, TEXT("A"));
+			Connect(Param(TEXT("GrassAmount"), 150, 900), TEXT(""), Weight, TEXT("B"));
+			// Light and dark of the photo: luminance against the reference, clamped
+			UMaterialExpressionConstant3Vector* Rec709 = Cast<UMaterialExpressionConstant3Vector>(Make(UMaterialExpressionConstant3Vector::StaticClass(), 1000));
+			Rec709->Constant = FLinearColor(0.2126f, 0.7152f, 0.0722f);
+			UMaterialExpression* Lum = Make(UMaterialExpressionDotProduct::StaticClass(), 1000);
+			Connect(Photo, PhotoOutput, Lum, TEXT("A"));
+			Connect(Rec709, TEXT(""), Lum, TEXT("B"));
+			UMaterialExpression* Relative = Make(UMaterialExpressionDivide::StaticClass(), 1050);
+			Connect(Lum, TEXT(""), Relative, TEXT("A"));
+			Connect(Param(TEXT("GrassRefLum"), 150, 1100), TEXT(""), Relative, TEXT("B"));
+			UMaterialExpressionClamp* Detail = Cast<UMaterialExpressionClamp>(Make(UMaterialExpressionClamp::StaticClass(), 1100));
+			Detail->MinDefault = 0.5f;
+			Detail->MaxDefault = 1.6f;
+			Connect(Relative, TEXT(""), Detail, TEXT(""));
+			UMaterialExpressionVectorParameter* NewTint = Cast<UMaterialExpressionVectorParameter>(Make(UMaterialExpressionVectorParameter::StaticClass(), 1200));
+			NewTint->ParameterName = TEXT("GrassTint");
+			TintParam = NewTint;
+			UMaterialExpressionComponentMask* TintRGB = Cast<UMaterialExpressionComponentMask>(Make(UMaterialExpressionComponentMask::StaticClass(), 1250));
+			TintRGB->R = TintRGB->G = TintRGB->B = true;
+			TintRGB->A = false;
+			Connect(NewTint, TEXT(""), TintRGB, TEXT(""));
+			UMaterialExpression* Grass = Make(UMaterialExpressionMultiply::StaticClass(), 1150);
+			Connect(TintRGB, TEXT(""), Grass, TEXT("A"));
+			Connect(Detail, TEXT(""), Grass, TEXT("B"));
+			UMaterialExpression* Result = Make(UMaterialExpressionLinearInterpolate::StaticClass(), 800);
+			Connect(Photo, PhotoOutput, Result, TEXT("A"));
+			Connect(Grass, TEXT(""), Result, TEXT("B"));
+			Connect(Weight, TEXT(""), Result, TEXT("Alpha"));
+			UMaterialEditingLibrary::ConnectMaterialProperty(Result, TEXT(""), MP_BaseColor);
+		}
+		FindScalar(TEXT("GrassAmount"))->DefaultValue = Amount;
+		FindScalar(TEXT("GrassSatLow"))->DefaultValue = SatLow;
+		FindScalar(TEXT("GrassSatScale"))->DefaultValue = 1.f / FMath::Max(SatHigh - SatLow, 0.01f);
+		FindScalar(TEXT("GrassRefLum"))->DefaultValue = FMath::Max(RefLum, 0.001f);
+		TintParam->DefaultValue = Tint;
+		UMaterialEditingLibrary::RecompileMaterial(Terrain);
+		TArray<UPackage*> ToSave = { Terrain->GetPackage() };
+
+		// Not on the buildings (their own *_Bldg instances, see Airport.BrightenShared)
+		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+		TArray<FAssetData> Assets;
+		Registry.GetAssetsByClass(UMaterialInstanceConstant::StaticClass()->GetClassPathName(), Assets);
+		int32 Buildings = 0;
+		for (const FAssetData& Asset : Assets)
+		{
+			if (!Asset.AssetName.ToString().EndsWith(TEXT("_Bldg")))
+			{
+				continue;
+			}
+			if (UMaterialInstanceConstant* Instance = Cast<UMaterialInstanceConstant>(Asset.GetAsset()))
+			{
+				UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(Instance, TEXT("GrassAmount"), 0.f);
+				ToSave.Add(Instance->GetPackage());
+				++Buildings;
+			}
+		}
+		UEditorLoadingAndSavingUtils::SavePackages(ToSave, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.GrassColor: amount %.2f, saturation %.2f-%.2f, ref lum %.3f, tint %s; %d building instances without; saved"),
+			Amount, SatLow, SatHigh, RefLum, *Tint.ToString(), Buildings);
+	}
+
+	/**
 	 * No sun glare anywhere: the ground, buildings, aircraft, the tower and the glass of the airport reflect nothing.
 	 * "Airport.MatteAll [specular] [roughness]" (default 0 and 1) on the materials in /Game/EHAM, /Game/Datasmith
 	 * (aircraft, tower cab) and /Game/Aircraft: a parent gets constants on Specular, Metallic (0: a metal ignores
@@ -2403,6 +2692,21 @@ namespace
 		TEXT("Airport.SoftenGround [brightness 0.85] [contrast 1.15] [specular 0]: a less washed-out aerial photo under the airport"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&SoftenGround));
 
+	FAutoConsoleCommand FacadeGlossCommand(
+		TEXT("Airport.FacadeGloss"),
+		TEXT("Airport.FacadeGloss [specular 0.5] [roughness 0.3] [power 4]: facades of the photo material reflect the sky again, the ground stays matte"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&FacadeGloss));
+
+	FAutoConsoleCommand MatInfoCommand(
+		TEXT("Airport.MatInfo"),
+		TEXT("Airport.MatInfo <material path>: what feeds each input of the material (log)"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&MatInfo));
+
+	FAutoConsoleCommand GrassColorCommand(
+		TEXT("Airport.GrassColor"),
+		TEXT("Airport.GrassColor [amount 1] [sat low 0.2] [sat high 0.4] [ref lum 0.05] [r g b]: the coloured parts of the aerial photo (grass, soil) become grass green; amount 0 = photo as it was"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&GrassColor));
+
 	FAutoConsoleCommand MatteAllCommand(
 		TEXT("Airport.MatteAll"),
 		TEXT("Airport.MatteAll [specular 0] [roughness 1]: no sun glare on ground, buildings, aircraft, tower and glass (metallic 0; decals keep theirs)"),
@@ -2529,6 +2833,26 @@ namespace
 			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: sun %s intensity=%.2f visible=%d atmosphereSun=%d pitch=%.1f"), *It->GetName(), Sun->Intensity,
 				Sun->IsVisible() ? 1 : 0, Sun->IsUsedAsAtmosphereSunLight() ? 1 : 0, It->GetActorRotation().Pitch);
 		}
+		int32 Fogs = 0;
+		for (TActorIterator<AExponentialHeightFog> It(World); It; ++It)
+		{
+			UExponentialHeightFogComponent* Fog = It->GetComponent();
+			// "Airport.SkyInfo fog 0.02 0.2 1500": density, height falloff, start distance (m) to try (not saved)
+			if (Args.Num() > 3 && Args[0] == TEXT("fog"))
+			{
+				Fog->SetFogDensity(FCString::Atof(*Args[1]));
+				Fog->SetFogHeightFalloff(FCString::Atof(*Args[2]));
+				Fog->SetStartDistance(FCString::Atof(*Args[3]) * 100.f);
+			}
+			++Fogs;
+			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: fog %s visible=%d density=%.4f falloff=%.3f start=%.0f m z=%.0f m volumetric=%d inscattering=%s"), *It->GetName(),
+				Fog->IsVisible() ? 1 : 0, Fog->FogDensity, Fog->FogHeightFalloff, Fog->StartDistance / 100.f, It->GetActorLocation().Z / 100.0, Fog->bEnableVolumetricFog ? 1 : 0,
+				*Fog->FogInscatteringLuminance.ToString());
+		}
+		if (Fogs == 0)
+		{
+			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: no height fog in the map"));
+		}
 		for (TActorIterator<APostProcessVolume> It(World); It; ++It)
 		{
 			FPostProcessSettings& Post = It->Settings;
@@ -2540,10 +2864,23 @@ namespace
 				Post.bOverride_ColorGammaShadows = true;
 				Post.ColorGammaShadows = FVector4(1.0, 1.0, 1.0, FCString::Atof(*Args[2]));
 			}
-			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: post %s unbound=%d exposureMethod=%d(%d) bias=%.2f(%d) min=%.2f max=%.2f ao=%.2f(%d) indirect=%.2f(%d)"),
+			// "Airport.SkyInfo gi 0|1|2": dynamic GI none / Lumen / screen space; "ao 0.2": SSAO intensity (not saved)
+			if (Args.Num() > 1 && Args[0] == TEXT("gi") && It->bUnbound)
+			{
+				Post.bOverride_DynamicGlobalIlluminationMethod = true;
+				Post.DynamicGlobalIlluminationMethod = static_cast<EDynamicGlobalIlluminationMethod::Type>(FCString::Atoi(*Args[1]));
+			}
+			if (Args.Num() > 1 && Args[0] == TEXT("ao") && It->bUnbound)
+			{
+				Post.bOverride_AmbientOcclusionIntensity = true;
+				Post.AmbientOcclusionIntensity = FCString::Atof(*Args[1]);
+			}
+			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: post %s unbound=%d exposureMethod=%d(%d) bias=%.2f(%d) min=%.2f max=%.2f ao=%.2f(%d) indirect=%.2f(%d) gi=%d(%d) reflections=%d(%d) skylightLeak=%.2f(%d)"),
 				*It->GetName(), It->bUnbound ? 1 : 0, static_cast<int32>(Post.AutoExposureMethod), Post.bOverride_AutoExposureMethod ? 1 : 0,
 				Post.AutoExposureBias, Post.bOverride_AutoExposureBias ? 1 : 0, Post.AutoExposureMinBrightness, Post.AutoExposureMaxBrightness,
-				Post.AmbientOcclusionIntensity, Post.bOverride_AmbientOcclusionIntensity ? 1 : 0, Post.IndirectLightingIntensity, Post.bOverride_IndirectLightingIntensity ? 1 : 0);
+				Post.AmbientOcclusionIntensity, Post.bOverride_AmbientOcclusionIntensity ? 1 : 0, Post.IndirectLightingIntensity, Post.bOverride_IndirectLightingIntensity ? 1 : 0,
+				static_cast<int32>(Post.DynamicGlobalIlluminationMethod), Post.bOverride_DynamicGlobalIlluminationMethod ? 1 : 0,
+				static_cast<int32>(Post.ReflectionMethod), Post.bOverride_ReflectionMethod ? 1 : 0, Post.LumenSkylightLeaking, Post.bOverride_LumenSkylightLeaking ? 1 : 0);
 		}
 	}
 
@@ -2753,6 +3090,8 @@ namespace
 		TEXT("Lighter shadows. Usage: Airport.SoftenShadows [sky light intensity, default 2]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&SoftenShadows));
 
+	void Pick(const TArray<FString>& Args, UWorld* World);
+
 	/** Play mode only: flies the camera to a few views over the airport, saves a screenshot of each, then quits. */
 	void TakeShots(const TArray<FString>& Args, UWorld* World)
 	{
@@ -2937,7 +3276,8 @@ namespace
 		TSharedRef<int32> Step = MakeShared<int32>(0);
 		FTimerHandle Handle;
 		const bool bPerf = Mode == TEXT("perf");
-		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([World, Views, Folder, Step, bPerf]()
+		const bool bPick = Args.Num() > 3 && Args[3] == TEXT("pick");
+		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([World, Views, Folder, Step, bPerf, bPick]()
 		{
 			APlayerController* Controller = World->GetFirstPlayerController();
 			const int32 ViewIndex = *Step / 2;
@@ -2992,6 +3332,18 @@ namespace
 				const FString File = Folder / FString::Printf(TEXT("Airport_%d.png"), ViewIndex);
 				FScreenshotRequest::RequestScreenshot(File, false, false);
 				UE_LOG(LogTemp, Display, TEXT("Airport.Shots: %s"), *File);
+				// "pick" as the fourth argument: what lies under a grid of points of the picture (Airport.Pick)
+				if (bPick)
+				{
+					for (int32 Row = 0; Row < 5; ++Row)
+					{
+						for (int32 Column = 1; Column < 10; ++Column)
+						{
+							UE_LOG(LogTemp, Display, TEXT("Airport.Shots: view %d pick"), ViewIndex);
+							Pick({ FString::Printf(TEXT("%.2f"), Column * 0.1f), FString::Printf(TEXT("%.2f"), 0.46f + Row * 0.04f) }, World);
+						}
+					}
+				}
 			}
 			++(*Step);
 		}), 8.f, true, FirstDelay);

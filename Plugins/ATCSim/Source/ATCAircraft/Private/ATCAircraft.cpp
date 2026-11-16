@@ -336,6 +336,8 @@ void AATCAircraft::StartTakeoff()
 	TakeoffSpeedCms = Movement->Speed;
 	TakeoffSeconds = 0.f;
 	PitchDeg = 0.f;
+	FlightPathDeg = 0.f;
+	bLiftedOff = false;
 	Movement->ClearPath();   // off the taxi network: from here the aircraft flies itself
 	LeaveTaxiNetwork();
 	SetActorTickEnabled(true);
@@ -386,6 +388,7 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 	LandingToGoCm = ApproachDistanceM * ATCUnits::MetersToCm;
 	LandingSpeedCms = ApproachSpeedCms;
 	PitchDeg = 2.5f;
+	SinceTouchdown = -1.f;
 
 	// In the air nobody taxis behind it: no path until it joins the route. Its runway exit stays reserved (spawn manager)
 	Movement->ClearPath();
@@ -440,7 +443,9 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 		UpdateEngineSound();
 	}
 
-	// 3 degree glide path; from 12 m the flare: the sink rate drops to a third at touchdown (smooth cubic)
+	// 3 degree glide path, nose 2.5 degrees up; from 12 m the flare: the sink rate drops to a third at touchdown
+	// (smooth cubic) while the nose comes up to 6 degrees. On the main gear first: the nose stays up for a second and a
+	// half, then comes down at 1.5 degrees a second (the nose wheel touches about four seconds after the mains)
 	const float Glide = FMath::Tan(FMath::DegreesToRadians(3.f));
 	const float FlareCm = 1200.f / Glide;
 	float Height = 0.f;
@@ -453,12 +458,15 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 	{
 		const float U = LandingToGoCm / FlareCm;
 		Height = 1200.f * (0.3f * U + 1.4f * U * U - 0.7f * U * U * U);
-		PitchDeg = FMath::Lerp(5.5f, 2.5f, U);
+		PitchDeg = FMath::Lerp(6.f, 2.5f, FMath::SmoothStep(0.f, 1.f, U));
 	}
 	else
 	{
-		// Nose wheel down in about three seconds
-		PitchDeg = FMath::FInterpConstantTo(PitchDeg, 0.f, DeltaSeconds, 2.f);
+		SinceTouchdown = SinceTouchdown < 0.f ? 0.f : SinceTouchdown + DeltaSeconds;
+		if (SinceTouchdown > 1.5f)
+		{
+			PitchDeg = FMath::FInterpConstantTo(PitchDeg, 0.f, DeltaSeconds, 1.5f);
+		}
 	}
 
 	const FVector Location = TouchdownPoint - LandingDirection * LandingToGoCm + FVector(0.f, 0.f, Height);
@@ -516,22 +524,32 @@ void AATCAircraft::StartGoAround()
 	bTakingOff = true;
 	TakeoffSpeedCms = LandingSpeedCms;
 	TakeoffSeconds = 0.f;
+	// Still in the air, coming down the glide path: the nose comes up and the descent turns into a climb
+	bLiftedOff = true;
+	FlightPathDeg = -3.f;
 	UpdateEngineSound();
 }
 
 void AATCAircraft::TickTakeoff(float DeltaSeconds)
 {
-	// Takeoff roll at about 2 m/s2, rotation at VR to 8 degrees nose up, then a steady climb
+	// Takeoff roll at about 2 m/s2. At VR the nose comes up at 2.5 degrees a second to 13 degrees, the aircraft still
+	// rolling on its main gear (rotating about it); it lifts off at about 8 degrees, and the climb angle of its path
+	// builds up smoothly to the pitch minus 6 degrees (the wing's angle of attack): 7 degrees at full pitch
 	TakeoffSeconds += DeltaSeconds;
 	const float Rotate = RotateSpeedKt * ATCUnits::KnotsToCms;
 	TakeoffSpeedCms += (TakeoffSpeedCms < Rotate ? 200.f : 80.f) * DeltaSeconds;
 	if (TakeoffSpeedCms >= Rotate)
 	{
-		PitchDeg = FMath::Min(PitchDeg + 3.f * DeltaSeconds, 8.f);
+		PitchDeg = FMath::Min(PitchDeg + 2.5f * DeltaSeconds, 13.f);
+	}
+	bLiftedOff |= PitchDeg >= 8.f;
+	if (bLiftedOff)
+	{
+		FlightPathDeg = FMath::FInterpConstantTo(FlightPathDeg, FMath::Max(PitchDeg - 6.f, 0.f), DeltaSeconds, 2.f);
 	}
 	FRotator Rotation = GetActorRotation();
 	Rotation.Pitch = PitchDeg;
-	const float ClimbDeg = FMath::Max(PitchDeg - 1.5f, 0.f);
+	const float ClimbDeg = FlightPathDeg;
 	const FVector Flat = FRotator(0.f, Rotation.Yaw, 0.f).Vector();
 	const FVector Velocity = (Flat * FMath::Cos(FMath::DegreesToRadians(ClimbDeg)) + FVector::UpVector * FMath::Sin(FMath::DegreesToRadians(ClimbDeg))) * TakeoffSpeedCms;
 	SetActorLocationAndRotation(GetActorLocation() + Velocity * DeltaSeconds, Rotation);

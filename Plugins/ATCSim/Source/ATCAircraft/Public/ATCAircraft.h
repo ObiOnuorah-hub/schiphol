@@ -186,6 +186,11 @@ private:
 	float TakeoffSpeedCms = 0.f;
 	float TakeoffSeconds = 0.f;
 	float PitchDeg = 0.f;
+	/** Climb angle of the flight path (not the nose): 0 until the main gear leaves the runway, then up towards pitch - 6. */
+	float FlightPathDeg = 0.f;
+	bool bLiftedOff = false;
+	/** Seconds since the main gear touched down (-1: in the air): the nose stays up a moment before it comes down. */
+	float SinceTouchdown = -1.f;
 
 	bool bLanding = false;
 	bool bExitReserved = false;

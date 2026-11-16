@@ -2,6 +2,7 @@
 // ATC.MapSurvey logs it and draws a top-down PNG; ATC.MapPlot draws a detail with a coordinate grid.
 
 #include "ATCMapSurvey.h"
+#include "Algo/Reverse.h"
 #include "ATCUnits.h"
 #include "Components/StaticMeshComponent.h"
 #include "Editor.h"
@@ -406,65 +407,147 @@ namespace ATCMapSurvey
 		}
 	}
 
-	TArray<int32> FNetwork::FindPath(int32 Start, int32 Goal, const TArray<float>* NodeCost) const
+	TArray<int32> FNetwork::FindPath(int32 Start, int32 Goal, const TArray<float>* NodeCost, const FVector2D* StartHeading) const
 	{
 		if (!Nodes.IsValidIndex(Start) || !Nodes.IsValidIndex(Goal))
 		{
 			return {};
 		}
 
+		if (Start == Goal)
+		{
+			return { Start };
+		}
+
+		// A* over directed links, so that the way a node was reached counts: an aircraft cannot turn back on itself where
+		// two painted lines meet in a V (a fillet meant for the other direction). Turning more than 130 degrees against
+		// the last 3 m is not allowed, a sharp corner (over 60 degrees) costs 15 m extra
 		struct FOpen
 		{
 			float Estimate;
-			int32 Node;
+			int32 State;
 			bool operator<(const FOpen& Other) const { return Estimate < Other.Estimate; }
 		};
-		TArray<float> Cost;
-		Cost.Init(TNumericLimits<float>::Max(), Nodes.Num());
-		TArray<int32> From;
-		From.Init(INDEX_NONE, Nodes.Num());
-		TArray<FOpen> Open;
-		Cost[Start] = 0.f;
-		Open.HeapPush({ static_cast<float>(FVector::Dist2D(Nodes[Start], Nodes[Goal])), Start });
+		const int32 NumNodes = Nodes.Num();
+		TArray<int32> Offset;
+		Offset.SetNumUninitialized(NumNodes + 1);
+		Offset[0] = 0;
+		for (int32 Node = 0; Node < NumNodes; ++Node)
+		{
+			Offset[Node + 1] = Offset[Node] + Links[Node].Num();
+		}
+		const int32 NumStates = Offset[NumNodes];
+		TArray<int32> Owner;
+		Owner.SetNumUninitialized(NumStates);
+		for (int32 Node = 0; Node < NumNodes; ++Node)
+		{
+			for (int32 Index = Offset[Node]; Index < Offset[Node + 1]; ++Index)
+			{
+				Owner[Index] = Node;
+			}
+		}
+		auto Target = [&](int32 State) { return Links[Owner[State]][State - Offset[Owner[State]]]; };
+		auto StepCost = [&](int32 From, int32 To)
+		{
+			// Painted centerlines first; taxiway edge lines, bridges over unpainted gaps and other stands' lines cost more
+			const float Step = FVector::Dist2D(Nodes[From], Nodes[To]);
+			const int32 Line = LinePart[To];
+			const bool bOffNetwork = Line != MainLinePart && Line != LinePart[Start] && Line != LinePart[Goal];
+			return Step * 0.5f * (LineCost(From) + LineCost(To)) * (Step > CellCm ? 1.5f : 1.f) * (bOffNetwork ? 3.f : 1.f) * (NodeCost ? (*NodeCost)[To] : 1.f);
+		};
+		auto Heuristic = [&](int32 Node) { return static_cast<float>(FVector::Dist2D(Nodes[Node], Nodes[Goal])); };
 
+		TArray<float> Cost;
+		Cost.Init(TNumericLimits<float>::Max(), NumStates);
+		TArray<int32> From;
+		From.Init(INDEX_NONE, NumStates);
+		TArray<FOpen> Open;
+		// Up to 130 degrees: where the paint has a gap at a crossing the line zigzags a few metres (smoothed later);
+		// a V where two lines meet turns 150 degrees and more
+		const float MaxTurnCos = FMath::Cos(FMath::DegreesToRadians(130.f));
+		const float SharpCos = FMath::Cos(FMath::DegreesToRadians(60.f));
+		for (int32 Index = 0; Index < Links[Start].Num(); ++Index)
+		{
+			const int32 Next = Links[Start][Index];
+			float Extra = 0.f;
+			if (StartHeading && !StartHeading->IsZero())
+			{
+				const float Turn = *StartHeading | FVector2D(Nodes[Next] - Nodes[Start]).GetSafeNormal();
+				if (Turn < MaxTurnCos)
+				{
+					continue;
+				}
+				Extra = Turn < SharpCos ? 1500.f : 0.f;
+			}
+			const int32 State = Offset[Start] + Index;
+			Cost[State] = StepCost(Start, Next) + Extra;
+			Open.HeapPush({ Cost[State] + Heuristic(Next), State });
+		}
+		int32 Found = INDEX_NONE;
 		while (Open.Num() > 0)
 		{
 			FOpen Current;
 			Open.HeapPop(Current);
-			if (Current.Node == Goal)
-			{
-				break;
-			}
-			if (Current.Estimate > Cost[Current.Node] + FVector::Dist2D(Nodes[Current.Node], Nodes[Goal]) + 1.0)
+			const int32 Here = Target(Current.State);
+			if (Current.Estimate > Cost[Current.State] + Heuristic(Here) + 1.f)
 			{
 				continue;   // stale heap entry
 			}
-			for (int32 Next : Links[Current.Node])
+			if (Here == Goal)
 			{
-				// Painted centerlines first; taxiway edge lines, bridges over unpainted gaps and other stands' lines cost more
-				const float Step = FVector::Dist2D(Nodes[Current.Node], Nodes[Next]);
-				const int32 Line = LinePart[Next];
-				const bool bOffNetwork = Line != MainLinePart && Line != LinePart[Start] && Line != LinePart[Goal];
-				const float NewCost = Cost[Current.Node] + Step * 0.5f * (LineCost(Current.Node) + LineCost(Next)) * (Step > CellCm ? 1.5f : 1.f) * (bOffNetwork ? 3.f : 1.f)
-					* (NodeCost ? (*NodeCost)[Next] : 1.f);
-				if (NewCost < Cost[Next])
+				Found = Current.State;
+				break;
+			}
+			// The heading: from the node about 3 m back along the way here
+			int32 Back = Owner[Current.State];
+			for (int32 State = Current.State, Count = 0; State != INDEX_NONE && Count < 16; State = From[State], ++Count)
+			{
+				Back = Owner[State];
+				if (FVector::DistSquared2D(Nodes[Back], Nodes[Here]) >= 300.f * 300.f)
 				{
-					Cost[Next] = NewCost;
-					From[Next] = Current.Node;
-					Open.HeapPush({ NewCost + static_cast<float>(FVector::Dist2D(Nodes[Next], Nodes[Goal])), Next });
+					break;
+				}
+			}
+			const FVector2D Heading = FVector2D(Nodes[Here] - Nodes[Back]).GetSafeNormal();
+			for (int32 Index = 0; Index < Links[Here].Num(); ++Index)
+			{
+				const int32 Next = Links[Here][Index];
+				if (Next == Owner[Current.State])
+				{
+					continue;
+				}
+				float Extra = 0.f;
+				if (!Heading.IsZero())
+				{
+					const float Turn = Heading | FVector2D(Nodes[Next] - Nodes[Here]).GetSafeNormal();
+					if (Turn < MaxTurnCos)
+					{
+						continue;
+					}
+					Extra = Turn < SharpCos ? 1500.f : 0.f;
+				}
+				const int32 State = Offset[Here] + Index;
+				const float NewCost = Cost[Current.State] + StepCost(Here, Next) + Extra;
+				if (NewCost < Cost[State])
+				{
+					Cost[State] = NewCost;
+					From[State] = Current.State;
+					Open.HeapPush({ NewCost + Heuristic(Next), State });
 				}
 			}
 		}
 
 		TArray<int32> Path;
-		if (From[Goal] == INDEX_NONE && Goal != Start)
+		if (Found == INDEX_NONE)
 		{
 			return Path;
 		}
-		for (int32 Node = Goal; Node != INDEX_NONE; Node = From[Node])
+		Path.Add(Goal);
+		for (int32 State = Found; State != INDEX_NONE; State = From[State])
 		{
-			Path.Insert(Node, 0);
+			Path.Add(Owner[State]);
 		}
+		Algo::Reverse(Path);
 		return Path;
 	}
 
@@ -577,6 +660,121 @@ namespace ATCMapSurvey
 		}
 		Result.Add(Points.Last());
 		return Result;
+	}
+
+	TArray<FVector> SmoothBends(const TArray<FVector>& Points, float MinRadiusCm, bool* bOutReached)
+	{
+		// Every metre along the line
+		const float StepCm = 100.f;
+		TArray<FVector> P;
+		if (bOutReached)
+		{
+			*bOutReached = true;
+		}
+		if (Points.Num() < 3)
+		{
+			return Points;
+		}
+		P.Add(Points[0]);
+		float Next = StepCm;   // distance along the current leg of the next sample
+		for (int32 Index = 1; Index < Points.Num(); ++Index)
+		{
+			const FVector A = Points[Index - 1];
+			const FVector B = Points[Index];
+			const float Length = FVector::Dist(A, B);
+			while (Next <= Length)
+			{
+				P.Add(FMath::Lerp(A, B, Next / Length));
+				Next += StepCm;
+			}
+			Next -= Length;
+		}
+		if (FVector::Dist(P.Last(), Points.Last()) < StepCm * 0.3f)
+		{
+			P.Last() = Points.Last();
+		}
+		else
+		{
+			P.Add(Points.Last());
+		}
+
+		// Where the line bends tighter than MinRadiusCm (over 3 m chords), pull the points there towards their
+		// neighbours until it does not: a zigzag over a gap in the paint becomes one smooth line, a corner a curve.
+		// Bends that are wide enough are left alone, so the line stays on the paint everywhere else
+		const int32 K = 3;
+		const int32 Num = P.Num();
+		if (Num < 2 * K + 3)
+		{
+			return Points;
+		}
+		auto Radius = [&P, K](int32 I)
+		{
+			const FVector2D A(P[I - K]), B(P[I]), C(P[I + K]);
+			const double Cross = FMath::Abs((B - A) ^ (C - A));
+			return Cross < 1e-3 ? TNumericLimits<double>::Max() : (B - A).Size() * (C - B).Size() * (C - A).Size() / (2.0 * Cross);
+		};
+		// One bend at a time (a corner needs a few thousand passes to spread over 40 m; the rest of the line not)
+		for (int32 Round = 0; Round < 20; ++Round)
+		{
+			TArray<TPair<int32, int32>> Regions;
+			for (int32 I = K; I < Num - K; ++I)
+			{
+				if (Radius(I) < MinRadiusCm)
+				{
+					if (Regions.Num() > 0 && I - Regions.Last().Value <= 4 * K)
+					{
+						Regions.Last().Value = I;
+					}
+					else
+					{
+						Regions.Add({ I, I });
+					}
+				}
+			}
+			if (Regions.IsEmpty())
+			{
+				break;
+			}
+			for (const TPair<int32, int32>& Region : Regions)
+			{
+				int32 Low = FMath::Max(K, Region.Key - 2 * K);
+				int32 High = FMath::Min(Num - K - 1, Region.Value + 2 * K);
+				for (int32 Pass = 0; Pass < 20000 && Low <= High; ++Pass)
+				{
+					int32 NewLow = Num, NewHigh = -1;
+					for (int32 I = Low; I <= High; ++I)
+					{
+						if (Radius(I) >= MinRadiusCm)
+						{
+							continue;
+						}
+						// The two end points stay where they are
+						for (int32 J = FMath::Max(2, I - K); J <= FMath::Min(Num - 3, I + K); ++J)
+						{
+							P[J] = FMath::Lerp(P[J], (P[J - 1] + P[J + 1]) * 0.5, 0.5);
+						}
+						NewLow = FMath::Min(NewLow, I);
+						NewHigh = FMath::Max(NewHigh, I);
+					}
+					Low = FMath::Max(K, NewLow - 2 * K);
+					High = FMath::Min(Num - K - 1, NewHigh + 2 * K);
+				}
+			}
+		}
+		if (bOutReached)
+		{
+			// 5 % slack: the last passes only creep towards the limit
+			for (int32 I = K; I < Num - K; ++I)
+			{
+				if (Radius(I) < MinRadiusCm * 0.95f)
+				{
+					*bOutReached = false;
+					break;
+				}
+			}
+		}
+		// 15 cm: on a 21 m bend a point every 8 m, half as many as at 5 cm (lighter splines, same line)
+		return Simplify(P, 15.f);
 	}
 
 	TArray<FVector> Simplify(const TArray<FVector>& Points, float ToleranceCm)

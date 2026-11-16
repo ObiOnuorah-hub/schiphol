@@ -180,9 +180,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Taxi|Lights")
 	bool bLightsOnFirstUse = true;
 
-	/** ICAO: 15 m on straight taxiways; turns get half of it. */
+	/** ICAO allows up to 30 m on straight taxiways (15 m in low visibility); turns get half of it. 30 m: half the lights. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Taxi|Lights")
-	float LightSpacingCm = 1500.f;
+	float LightSpacingCm = 3000.f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Taxi|Lights")
 	float StopBarWidthCm = 2300.f;
