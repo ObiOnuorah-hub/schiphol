@@ -4046,6 +4046,14 @@ namespace
 			}
 #endif
 		}
+		// "Airport.Shots 20 at <prefix> <x m> <y m> <height m>": straight down on a spot of the map, and from the side
+		else if (Mode == TEXT("at") && Args.Num() > 5)
+		{
+			const FVector Spot(FCString::Atod(*Args[3]) * 100.0, FCString::Atod(*Args[4]) * 100.0, 0.0);
+			const double Height = FCString::Atod(*Args[5]) * 100.0;
+			Views.Add({ Spot + FVector(1.0, 0.0, Height), Spot });
+			Views.Add({ Spot + FVector(-0.6 * Height, 0.6 * Height, 0.5 * Height), Spot });
+		}
 		// "Airport.Shots 30 model <prefix> <mesh path part>": the map's aircraft whose meshes have that path part (hidden ones
 		// too: a traffic stand-in then shows in their place), one aircraft = all parts within 40 m, 4 views around each
 		else if (Mode == TEXT("model") && Args.Num() > 3)

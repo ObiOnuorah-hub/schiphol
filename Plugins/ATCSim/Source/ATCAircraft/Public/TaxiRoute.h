@@ -154,6 +154,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Taxi|Landing")
 	float RunwayBeforeStartCm = 0.f;
 
+	/**
+	 * Where landings touch down, from the runway end: on the aiming point markings, the two big white blocks (found in
+	 * the paint by ATC.CheckRoutes: about 300 m on a 2 km runway, 400 m on a long one). 0 = unknown: 450 m.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Taxi|Landing")
+	float TouchdownFromEndCm = 0.f;
+
 	/** Yellow centerline along the spline. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Taxi|Visual")
 	bool bShowCenterline = true;

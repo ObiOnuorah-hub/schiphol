@@ -300,11 +300,29 @@ bool UAircraftSpawnSubsystem::HoldLanding(const FAircraftSpawnRequest& Request, 
 	const FVector Start = Approach ? Approach->GetLocationAt(0.f) : Route->GetLocationAt(StartCm);
 	const FVector Direction = Approach ? RunwayDirection(Approach, 0.f) : RunwayDirection(Route, StartCm);
 
-	// Landings on the same runway (the same direction, joining it on one centre line) come at least the spacing apart
-	RecentLandings.RemoveAll([Now, Settings](const FRecentLanding& Recent) { return Now - Recent.Time >= Settings->LandingSpacingSeconds; });
+	// Landings on the same runway (the same direction, joining it on one centre line) come at least the spacing apart, and
+	// more behind a heavy or super: ICAO wake turbulence separation on final, seconds at about 140 kt (3 NM = 77 s).
+	// 17-11-2026: an A380 came 92 s behind a 787 to the same exit and had to go around
+	auto WakeSeconds = [Settings](const AATCAircraft* Leader, const UAircraftTypeData* Follower)
+	{
+		const EWakeCategory Lead = Leader && Leader->AircraftType ? Leader->AircraftType->WakeCategory : EWakeCategory::Medium;
+		const EWakeCategory Follow = Follower ? Follower->WakeCategory : EWakeCategory::Medium;
+		float Miles = 3.f;
+		if (Lead == EWakeCategory::Super)
+		{
+			Miles = Follow == EWakeCategory::Super ? 3.f : Follow == EWakeCategory::Heavy ? 6.f : 7.f;
+		}
+		else if (Lead == EWakeCategory::Heavy)
+		{
+			Miles = Follow >= EWakeCategory::Heavy ? 4.f : 5.f;
+		}
+		return FMath::Max(Settings->LandingSpacingSeconds, Miles * 25.7f);
+	};
+	RecentLandings.RemoveAll([Now](const FRecentLanding& Recent) { return Now - Recent.Time >= 200.f || !Recent.Aircraft.IsValid(); });
 	for (const FRecentLanding& Recent : RecentLandings)
 	{
-		if ((Direction | Recent.Direction) > 0.98f && FMath::Abs(FVector::CrossProduct(Direction, Recent.Start - Start).Z) < 10000.f)
+		if ((Direction | Recent.Direction) > 0.98f && FMath::Abs(FVector::CrossProduct(Direction, Recent.Start - Start).Z) < 10000.f
+			&& Now - Recent.Time < WakeSeconds(Cast<AATCAircraft>(Recent.Aircraft.Get()), Request.Type))
 		{
 			OutBlocker = Recent.Aircraft.Get();
 			return true;

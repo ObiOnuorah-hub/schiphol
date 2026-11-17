@@ -443,8 +443,10 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 		LandingDirection = GetActorForwardVector().GetSafeNormal2D();
 	}
 
-	// Touchdown about 450 m past the runway end; with a short runway behind the start the braking is harder
-	RolloutCm = Route->RunwayBeforeStartCm > 0.f ? FMath::Clamp(Route->RunwayBeforeStartCm - 45000.f, 50000.f, 160000.f) : 90000.f;
+	// Touchdown on the aiming point markings (the white blocks; else 450 m past the runway end); with a short runway behind
+	// the start the braking is harder
+	const float TouchdownFromEnd = Route->TouchdownFromEndCm > 0.f ? Route->TouchdownFromEndCm : 45000.f;
+	RolloutCm = Route->RunwayBeforeStartCm > 0.f ? FMath::Clamp(Route->RunwayBeforeStartCm - TouchdownFromEnd, 40000.f, 250000.f) : 90000.f;
 	TouchdownPoint = Start - LandingDirection * RolloutCm;
 	const bool bHeavy = AircraftType && AircraftType->WakeCategory >= EWakeCategory::Heavy;
 	ApproachSpeedCms = (bHeavy ? 145.f : 135.f) * ATCUnits::KnotsToCms;
@@ -494,8 +496,12 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 		bExitReserved = ReserveRunwayExit();
 		const AATCAircraft* Ahead = Cast<AATCAircraft>(ExitBlocker.Get());
 		// (on the rollout the landing moves itself, not through Movement; in the turn off the runway it is down to ~6 kt)
-		const bool bBeingVacated = Ahead && (Ahead->IsLanding() || (Ahead->TaxiController->bPriority && Ahead->Movement->Speed > 50.f));
-		if (!bExitReserved && LandingToGoCm < (bBeingVacated ? 15000.f : 150000.f))
+		// One that is moving off the runway (taxiing in, or a departure passing behind the exit) only holds the taxiway behind
+		// the exit, half a minute of rollout away, like traffic a controller clears a landing behind: decide 50 m before
+		// touchdown (17-11-2026: two wide-bodies went around behind one taxiing in at 12 kt and one passing at 7 kt)
+		const bool bMovingOff = Ahead && !Ahead->IsLanding() && Ahead->Movement->Speed > 50.f;
+		const float DecideCm = Ahead && Ahead->IsLanding() ? 15000.f : bMovingOff ? 5000.f : 150000.f;
+		if (!bExitReserved && LandingToGoCm < DecideCm)
 		{
 			StartGoAround();
 			return;

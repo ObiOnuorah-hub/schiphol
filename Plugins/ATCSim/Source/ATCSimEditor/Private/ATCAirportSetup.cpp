@@ -1029,6 +1029,10 @@ namespace ATCSetup
 		return true;
 	}
 
+	/** atc.LogExits 1: BuildArrival logs the paint nodes it could have left the runway on (and why not). */
+	static int32 GLogArrivalExits = 0;
+	static FAutoConsoleVariableRef LogExitsVar(TEXT("atc.LogExits"), GLogArrivalExits, TEXT("1: arrival building logs the candidate runway exit nodes"));
+
 	bool BuildArrival(const FSite& Site, FDeparture& D)
 	{
 		const ATCMapSurvey::FNetwork& Network = *Site.Network;
@@ -1057,7 +1061,11 @@ namespace ATCSetup
 		const double RunwayLength = FVector::Dist2D(Runway.A, Runway.B);
 		// Narrow-bodies brake to taxi speed sooner and leave earlier than wide-bodies: two exit streams on one landing
 		// runway (with all on one exit the next landing went around while the last still taxied off, 17-11-2026)
-		const double ExitFrom = 0.42 * RunwayLength, ExitBest = (D.Type->AerodromeCode >= EAerodromeCode::E ? 0.60 : 0.45) * RunwayLength;
+		// (small ones from a third of the runway: the 27 connector at 1.35 km lay outside a 42 % window, so they took a node
+		// on the parallel taxiway 82 m from the runway and cut across the grass to it)
+		const bool bWide = D.Type->AerodromeCode >= EAerodromeCode::E;
+		const double ExitFrom = (bWide ? 0.42 : 0.33) * RunwayLength, ExitBest = (bWide ? 0.60 : 0.40) * RunwayLength;
+		const double AlongWeight = bWide ? 0.5 : 0.15;   // small ones: near the runway edge counts more than the exact place
 		// A short runway (the Oostbaan, 2 km) may be left at its end
 		const double ExitTo = RunwayLength < 250000.0 ? RunwayLength + 10000.0 : FMath::Min(0.78 * RunwayLength, RunwayLength - 30000.0);
 		TArray<int32> Nearby;
@@ -1068,11 +1076,15 @@ namespace ATCSetup
 		// Among the nodes that centrelines lead to from the stand (a shoulder stripe on the taxiway edge lies nearer the
 		// runway, but from it the way in runs along the edge line); only when there are none, any centreline node
 		const TBitArray<> Reach = CentrelineReach(Network, BaseCost, Tail);
-		for (const bool bReachedOnly : { true, false })
+		// First pass also only on the main taxiway lines: a stop bar is loose paint, and as the exit it put an S-bend into the
+		// turn off the end of the Oostbaan (17-11-2026)
+		for (const int32 Pass : { 0, 1, 2 })
 		{
+			const bool bReachedOnly = Pass < 2;
 			for (int32 Node : Nearby)
 			{
-				if (Network.Part[Node] != Network.Part[Tail] || IsBesideCentreline(Site, Node) || (bReachedOnly && !Reach[Node]))
+				if (Network.Part[Node] != Network.Part[Tail] || IsBesideCentreline(Site, Node) || (bReachedOnly && !Reach[Node])
+					|| (Pass == 0 && Network.LinePart[Node] != Network.MainLinePart))
 				{
 					continue;
 				}
@@ -1084,7 +1096,7 @@ namespace ATCSetup
 				{
 					continue;
 				}
-				const double Score = Side + 0.5 * FMath::Abs(Along - ExitBest);
+				const double Score = Side + AlongWeight * FMath::Abs(Along - ExitBest);
 				if (Score < BestScore)
 				{
 					BestScore = Score;
@@ -1162,6 +1174,28 @@ namespace ATCSetup
 				Network.Nodes[Exit].Y / 100.0, Network.Part[Exit], Network.MainPart, Network.LinePart[Exit], Network.MainLinePart);
 		}
 
+		// Why this exit: the paint nodes near the runway edge in the stretch, per 100 m, and what keeps them out
+		if (GLogArrivalExits)
+		{
+			TMap<int32, FString> PerStretch;
+			for (int32 Node : Nearby)
+			{
+				const FVector Delta = Network.Nodes[Node] - Threshold;
+				const double Along = Delta.X * LandingDirection.X + Delta.Y * LandingDirection.Y;
+				const double Side = FMath::Abs(Delta.X * -LandingDirection.Y + Delta.Y * LandingDirection.X);
+				if (Side > Runway.HalfWidthCm + 800.0 && Side < Runway.HalfWidthCm + 4000.0)
+				{
+					FString& Text = PerStretch.FindOrAdd(FMath::FloorToInt(Along / 10000.0));
+					Text += FString::Printf(TEXT("%s%s%s "), Network.Part[Node] != Network.Part[Tail] ? TEXT("P") : TEXT(""),
+						IsBesideCentreline(Site, Node) ? TEXT("B") : TEXT(""), Reach[Node] ? TEXT("r") : TEXT("-"));
+				}
+			}
+			PerStretch.KeySort(TLess<int32>());
+			for (const TPair<int32, FString>& Pair : PerStretch)
+			{
+				UE_LOG(LogATC, Display, TEXT("%s %s exit nodes at %d00 m: %s"), *Site.ICAO, *D.ArrivalRunway, Pair.Key, *Pair.Value.Left(120));
+			}
+		}
 		// Rollout on the centreline, turn off towards the exit, taxi in, last metres straight onto the stand
 		const FVector ExitPoint = Network.Nodes[Exit];
 		const double ExitSide = FMath::Abs((ExitPoint - Threshold).X * -LandingDirection.Y + (ExitPoint - Threshold).Y * LandingDirection.X);
@@ -1171,12 +1205,172 @@ namespace ATCSetup
 			Point.Z = ExitPoint.Z;
 			return Point;
 		};
-		TArray<FVector> Points = { OnCenterline(ExitAlong - ExitSide * 1.5 - 40000.0), OnCenterline(ExitAlong - ExitSide * 1.5) };
-		Points.Append(ToPoints(Network, Path));
+		// Straight on down the centre line to where the exit's own line meets it, then the turn: a right-angled exit (the one
+		// at the end of the Oostbaan) was cut across the grass from 140 m before it (user 17-11-2026: "first a bit straight,
+		// then right", "not over the grass at the end of the runway"). An exit line nearly along the runway: 1.5 times its
+		// offset before it, as before
+		double TurnAlong = ExitAlong - ExitSide * 1.5;
+		{
+			// The way the taxi-in leaves the exit (its first 60 m): a loose paint mark at the exit can run along the runway
+			FVector2D Line = Network.LineDirection(Exit);
+			for (const int32 Node : Path)
+			{
+				if (FVector::Dist2D(Network.Nodes[Node], ExitPoint) >= 6000.0)
+				{
+					Line = FVector2D(Network.Nodes[Node] - ExitPoint).GetSafeNormal();
+					break;
+				}
+			}
+			const FVector2D Way(LandingDirection);
+			const double Cross = Way.X * Line.Y - Way.Y * Line.X;
+			// Only an exit that goes on forwards or at a right angle; one whose way leads back against the landing direction
+			// (a line along a parallel taxiway) keeps the turn before it, or the route makes an S on the runway
+			if (FMath::Abs(Cross) > FMath::Sin(FMath::DegreesToRadians(20.0)) && (Line | Way) > -0.15)
+			{
+				const FVector2D Delta(ExitPoint - Threshold);
+				const double SignedSide = Way.X * Delta.Y - Way.Y * Delta.X;
+				const double Meet = -SignedSide / Cross;   // along the exit line from the exit node to the centre line
+				TurnAlong = FMath::Clamp(ExitAlong + Meet * (Line | Way), ExitAlong - ExitSide * 3.0, ExitAlong + 5000.0);
+			}
+		}
+		// The painted lead-off line itself, back from the exit to where it leaves the runway centre line: the yellow exit line
+		// starts on the centre line and curves off; turning onto the exit node in a straight line cut the corner across the
+		// grass (27: 50 m, 22: 30-100 m, 17-11-2026). Each step goes to a linked paint node nearer the centre line and not
+		// further down the runway, at most 3 m (no bridges)
+		TArray<FVector> LeadOff;
+		const double MeetAlong = TurnAlong;
+		{
+			auto SideOf = [&](int32 Node)
+			{
+				const FVector Delta = Network.Nodes[Node] - Threshold;
+				return FMath::Abs(Delta.X * -LandingDirection.Y + Delta.Y * LandingDirection.X);
+			};
+			auto AlongOf = [&](int32 Node)
+			{
+				const FVector Delta = Network.Nodes[Node] - Threshold;
+				return Delta.X * LandingDirection.X + Delta.Y * LandingDirection.Y;
+			};
+			// Back towards the runway: nearer the centre line, or (where the curve runs almost along the runway) back up it
+			int32 Here = Exit;
+			TArray<int32> Back;
+			TSet<int32> Seen = { Exit };
+			double Walked = 0.0;
+			for (int32 Step = 0; Step < 600 && SideOf(Here) > 150.0 && Walked < 40000.0; ++Step)
+			{
+				int32 Best = INDEX_NONE;
+				double BestSide = TNumericLimits<double>::Max();
+				for (const int32 Next : Network.Links[Here])
+				{
+					const double Side = SideOf(Next);
+					// Never forwards along the runway: a lead-off line meets the runway before its exit (for the 27 wide-body exit
+					// a line further on was followed, and the route ran past the exit and hooked back)
+					if (!Seen.Contains(Next) && FVector::Dist2D(Network.Nodes[Next], Network.Nodes[Here]) <= 300.0 && Side <= SideOf(Here) + 20.0
+						&& AlongOf(Next) <= AlongOf(Here) + 50.0 && (Side < SideOf(Here) - 5.0 || AlongOf(Next) < AlongOf(Here) - 20.0) && Side < BestSide)
+					{
+						BestSide = Side;
+						Best = Next;
+					}
+				}
+				if (Best == INDEX_NONE)
+				{
+					break;
+				}
+				Walked += FVector::Dist2D(Network.Nodes[Best], Network.Nodes[Here]);
+				Seen.Add(Best);
+				Back.Add(Best);
+				Here = Best;
+			}
+			const double EndSide = SideOf(Here);
+			if (Back.Num() > 0 && EndSide <= 300.0)
+			{
+				// The paint reaches the centre line: along it all the way
+				TurnAlong = AlongOf(Here);
+				for (int32 Index = Back.Num() - 1; Index >= 0; --Index)
+				{
+					LeadOff.Add(Network.Nodes[Back[Index]]);
+				}
+				LeadOff[0] = OnCenterline(TurnAlong);
+			}
+			else if (Back.Num() >= 8 && EndSide < Runway.HalfWidthCm + 2500.0)
+			{
+				// The paint stops at the runway edge: its own line goes on straight to the centre line
+				const FVector2D Towards = FVector2D(Network.Nodes[Here] - Network.Nodes[Back[Back.Num() - 8]]).GetSafeNormal();
+				const FVector2D Normal(-LandingDirection.Y, LandingDirection.X);
+				const FVector2D Delta(Network.Nodes[Here] - Threshold);
+				const double Signed = Delta | Normal;
+				const double Rate = Towards | Normal;   // change of the signed side per cm along Towards
+				if (Signed * Rate < 0.0 && FMath::Abs(Rate) > 0.2)
+				{
+					const double ToCentre = -Signed / Rate;
+					if (ToCentre < 8000.0)
+					{
+						TurnAlong = AlongOf(Here) + ToCentre * (Towards | FVector2D(LandingDirection));
+						LeadOff.Add(OnCenterline(TurnAlong));
+						for (int32 Index = Back.Num() - 1; Index >= 0; --Index)
+						{
+							LeadOff.Add(Network.Nodes[Back[Index]]);
+						}
+					}
+				}
+			}
+			// The turn off the runway never lies past the exit itself
+			if (LeadOff.Num() > 0 && TurnAlong > ExitAlong + 2000.0)
+			{
+				UE_LOG(LogATC, Display, TEXT("%s %s -> %s: lead-off paint met the runway %.0f m past the exit, not used"), *Site.ICAO,
+					*D.ArrivalRunway, *D.StandRef, (TurnAlong - ExitAlong) / 100.0);
+				LeadOff.Reset();
+				TurnAlong = MeetAlong;
+			}
+			if (LeadOff.Num() == 0)
+			{
+				UE_LOG(LogATC, Display, TEXT("%s %s -> %s: lead-off walk from the exit ended %.0f m from the centre line after %d steps"), *Site.ICAO,
+					*D.ArrivalRunway, *D.StandRef, EndSide / 100.0, Back.Num());
+			}
+		}
+		TArray<FVector> Points = { OnCenterline(TurnAlong - 40000.0), OnCenterline(TurnAlong) };
+		Points.Append(LeadOff);
+		TArray<FVector> Taxi = ToPoints(Network, Path);
+		// Without lead-off paint the exit can be a loose mark (the stop bar across the taxiway off the Oostbaan end, which has
+		// no centre line): those first points go, the route runs straight on to the taxiway paint beyond
+		if (LeadOff.Num() == 0)
+		{
+			int32 Loose = 0;
+			while (Loose + 1 < Path.Num() && Network.LinePart[Path[Loose]] != Network.MainLinePart
+				&& FVector::Dist2D(Network.Nodes[Path[Loose]], ExitPoint) < 6000.0)
+			{
+				++Loose;
+			}
+			Taxi.RemoveAt(0, Loose);
+		}
+		// Without lead-off paint: straight from the turn on the runway to the taxiway 40 m past the exit node, when the paint
+		// in between lies within 3 m of that line (at the end of the Oostbaan the paint around the stop bar made a 5 m jog)
+		if (LeadOff.Num() == 0 && Taxi.Num() > 2)
+		{
+			const FVector From = OnCenterline(TurnAlong);
+			int32 Skip = 0;
+			while (Skip + 1 < Taxi.Num() && FVector::Dist2D(Taxi[Skip + 1], Taxi[0]) < 4000.0)
+			{
+				++Skip;
+			}
+			bool bStraight = Skip > 0;
+			for (int32 Index = 0; Index < Skip && bStraight; ++Index)
+			{
+				bStraight = FMath::PointDistToSegment(FVector(Taxi[Index].X, Taxi[Index].Y, 0.0), FVector(From.X, From.Y, 0.0),
+					FVector(Taxi[Skip].X, Taxi[Skip].Y, 0.0)) < 300.0;
+			}
+			if (bStraight)
+			{
+				Taxi.RemoveAt(0, Skip);
+			}
+		}
+		Points.Append(Taxi);
 		Points.Add(Stand.TailEnd + (MainGear - Stand.TailEnd).GetSafeNormal2D() * 1000.0);
 		Points.Add(MainGear);
 		bool bArrivalSmooth = true;
 		D.Arrival = ATCMapSurvey::SmoothBends(ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(Points, 80.f), 3500.f), 2100.f, &bArrivalSmooth);
+		UE_LOG(LogATC, Display, TEXT("%s %s -> %s: %s"), *Site.ICAO, *D.ArrivalRunway, *D.StandRef, LeadOff.Num() > 0
+			? *FString::Printf(TEXT("leaves the runway along its painted lead-off line (%d points, from %.0f m past the threshold)"), LeadOff.Num(), TurnAlong / 100.0)
+			: TEXT("no lead-off paint on the runway, turns onto the exit"));
 		if (CutsOtherPlace(Site, D.StandRef, MainGear, D.Arrival) || !bArrivalSmooth)
 		{
 			UE_LOG(LogATC, Warning, TEXT("%s: stand %s skipped for %s, its taxi-in %s"), *Site.ICAO, *D.StandRef, *D.ArrivalRunway,
@@ -2348,8 +2542,47 @@ namespace ATCSetup
 	 * ATC.CheckRoutes: which taxi routes of the open EHAM map leave the pavement. A point counts as paved on the painted
 	 * lines, an OSM apron, a runway, or within half the width (plus a 7.5 m shoulder) of an OSM taxiway or taxilane.
 	 * Logs every stretch of 20 m or more off the pavement and plots the routes (Saved/ATC/route_check.png, off = red).
-	 * Also stores on every arrival route how much runway lies behind its start (where landings touch down); saves the map.
+	 * Also stores on every arrival route how much runway lies behind its start and where landings touch down (AimingPoint);
+	 * saves the map.
 	 */
+	void CheckRoutes(const TArray<FString>& Args);
+
+	/**
+	 * Where the aiming point markings of a runway end lie (cm from that end, landing towards the other end): the two big
+	 * white blocks either side of the centre line, 45-60 m long, the most white paint of any 50 m stretch 100 m to 1.2 km
+	 * in, 5 to 21 m beside the centre line (threshold bars, numbers, centre line and edge lines fall outside that; touchdown
+	 * zone bars are much thinner). 0 = none found. User 17-11-2026: "all aircraft land around the white blocks".
+	 */
+	double AimingPoint(const TArray<FVector>& White, const FMapRunway& Runway, bool bFromA)
+	{
+		const FVector End = bFromA ? Runway.A : Runway.B;
+		const FVector2D Along = FVector2D(bFromA ? Runway.B - Runway.A : Runway.A - Runway.B).GetSafeNormal();
+		const FVector2D Side(-Along.Y, Along.X);
+		TArray<int32> Bins;   // 10 m each
+		Bins.SetNumZeroed(120);
+		for (const FVector& Point : White)
+		{
+			const FVector2D Delta(Point - End);
+			const double Down = Delta | Along;
+			const double Beside = FMath::Abs(Delta | Side);
+			if (Down >= 10000.0 && Down < 120000.0 && Beside > 500.0 && Beside < 2100.0)
+			{
+				++Bins[FMath::FloorToInt(Down / 1000.0)];
+			}
+		}
+		int32 Best = INDEX_NONE, BestCount = 0;
+		for (int32 First = 0; First + 5 <= Bins.Num(); ++First)
+		{
+			const int32 Count = Bins[First] + Bins[First + 1] + Bins[First + 2] + Bins[First + 3] + Bins[First + 4];
+			if (Count > BestCount)
+			{
+				BestCount = Count;
+				Best = First;
+			}
+		}
+		return Best == INDEX_NONE ? 0.0 : Best * 1000.0 + 2500.0;
+	}
+
 	void CheckRoutes(const TArray<FString>& Args)
 	{
 		UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
@@ -2503,13 +2736,15 @@ namespace ATCSetup
 						&& FMath::Abs(FVector::DotProduct(Direction, Runway.Along())) > 0.95)
 					{
 						Route->Modify();
-						Route->RunwayBeforeStartCm = FVector::DotProduct(Direction, Runway.Along()) > 0.0 ? Along : Runway.Length() - Along;
+						const bool bFromA = FVector::DotProduct(Direction, Runway.Along()) > 0.0;
+						Route->RunwayBeforeStartCm = bFromA ? Along : Runway.Length() - Along;
+						Route->TouchdownFromEndCm = AimingPoint(ATCMapSurvey::RunwayMarkingPoints(World), Runway, bFromA);
 						if (UPackage* External = Route->GetExternalPackage())
 						{
 							Packages.AddUnique(External);
 						}
-						UE_LOG(LogATC, Display, TEXT("ATC.CheckRoutes: %s starts %.0f m down runway %s"), *Route->RouteTag.ToString(),
-							Route->RunwayBeforeStartCm / 100.f, *Runway.Ref);
+						UE_LOG(LogATC, Display, TEXT("ATC.CheckRoutes: %s starts %.0f m down runway %s, touchdown on the aiming point %.0f m from the end"),
+							*Route->RouteTag.ToString(), Route->RunwayBeforeStartCm / 100.f, *Runway.Ref, Route->TouchdownFromEndCm / 100.f);
 						++Arrivals;
 						break;
 					}
@@ -3241,10 +3476,18 @@ namespace ATCSetup
 					++FirstAllowed;
 				}
 			}
+			const bool bArrivalLane = Tag.Contains(TEXT(".Arr"));
 			for (int32 Index = FirstAllowed; Index <= LastAllowed; ++Index)
 			{
-				if (Network.Nearest(Original[Index], 150.f) != INDEX_NONE)
+				const int32 Near = Network.Nearest(Original[Index], 150.f);
+				if (Near != INDEX_NONE)
 				{
+					// An arrival's lane starts on the taxiway lines, not on loose paint like the stop bar off the Oostbaan end
+					// (the lane got the S-bend there that its route had lost, 17-11-2026)
+					if (FirstOn == INDEX_NONE && bArrivalLane && Network.LinePart[Near] != Network.MainLinePart)
+					{
+						continue;
+					}
 					FirstOn = FirstOn == INDEX_NONE ? Index : FirstOn;
 					LastOn = Index;
 				}
@@ -3399,6 +3642,7 @@ namespace ATCSetup
 			ATaxiRoute* Parallel = SpawnRoute(World, AltTag, Points);
 			Parallel->Tags.Add(ParallelTag);
 			Parallel->RunwayBeforeStartCm = Route->RunwayBeforeStartCm;
+			Parallel->TouchdownFromEndCm = Route->TouchdownFromEndCm;
 			for (const FSpeedZone& Zone : Route->SpeedZones)
 			{
 				FSpeedZone& Copy = Parallel->SpeedZones.Add_GetRef(Zone);
