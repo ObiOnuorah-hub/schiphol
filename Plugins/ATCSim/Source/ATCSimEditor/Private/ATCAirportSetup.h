@@ -113,6 +113,9 @@ namespace ATCSetup
 	 */
 	void AddSideLines(FSite& Site);
 
+	/** Straight on over junctions where the painted centreline stops and goes on beyond, along an OSM taxiway. */
+	void AddStraightGaps(FSite& Site);
+
 	/**
 	 * The parking places of the airport: every OSM parking position from its nose end (the end away from the taxiways)
 	 * back over 65 % of its lead-in line, and every stand in the world (20 m ahead of the main gear to 15 m behind).
@@ -162,6 +165,8 @@ namespace ATCSetup
 		FVector ArrivalApronStart = FVector::ZeroVector;
 		int32 ArrivalRunwayIndex = INDEX_NONE;
 		ATaxiRoute* ArrivalRoute = nullptr;
+		/** Narrow-body gates: the arrival from the Oostbaan (22) for a late sidestep from the 27 final (AddSidestep). */
+		ATaxiRoute* SidestepRoute = nullptr;
 	};
 
 	bool BuildDeparture(const FSite& Site, FDeparture& Departure);

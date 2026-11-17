@@ -357,7 +357,73 @@ void AATCAircraft::Tick(float DeltaSeconds)
 	}
 }
 
-void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, float RolloutEndSpeedKt)
+bool AATCAircraft::PlanSidestep(const ATaxiRoute* ApproachRoute)
+{
+	// The two finals: the one it flies first (the approach route's runway) and the landing one, through the touchdown point
+	const FVector2D FirstStart(ApproachRoute->Spline->GetLocationAtDistanceAlongSpline(0.f, ESplineCoordinateSpace::World));
+	FirstFinal = (FVector2D(ApproachRoute->Spline->GetLocationAtDistanceAlongSpline(FMath::Min(2000.f, ApproachRoute->GetLength()), ESplineCoordinateSpace::World))
+		- FirstStart).GetSafeNormal();
+	const FVector2D Touchdown(TouchdownPoint);
+	const FVector2D Landing = FVector2D(LandingDirection).GetSafeNormal();
+	const float Cross = FirstFinal.X * Landing.Y - FirstFinal.Y * Landing.X;
+	SidestepTurnRad = FMath::Acos(FMath::Clamp(FirstFinal | Landing, -1.f, 1.f));
+	if (FirstFinal.IsZero() || SidestepTurnRad < FMath::DegreesToRadians(10.f) || SidestepTurnRad > FMath::DegreesToRadians(90.f))
+	{
+		return false;
+	}
+	SidestepTurnSign = Cross > 0.f ? 1.f : -1.f;   // towards +Y (right, seen from above with X forward)
+
+	// Where the finals cross: Touchdown - Landing * Back = FirstStart - FirstFinal * Along
+	const FVector2D Delta = Touchdown - FirstStart;
+	const float Det = -Landing.X * FirstFinal.Y + Landing.Y * FirstFinal.X;
+	if (FMath::Abs(Det) < KINDA_SMALL_NUMBER)
+	{
+		return false;
+	}
+	const float Back = (FirstFinal.X * Delta.Y - FirstFinal.Y * Delta.X) / Det;   // touchdown back to the crossing
+	// A visual sidestep: about a 1.2 km turn (some 22 degrees of bank), at least 300 m straight before touchdown
+	const float Tangent = FMath::Tan(0.5f * SidestepTurnRad);
+	SidestepRadius = FMath::Min(120000.f, (Back - 30000.f) / Tangent);
+	if (SidestepRadius < 40000.f)
+	{
+		UE_LOG(LogATC, Display, TEXT("%s: no sidestep, the finals cross %.0f m before touchdown (too close for a turn)"), *Identity->Callsign.ToString(), Back / 100.f);
+		return false;
+	}
+	const FVector2D Crossing = Touchdown - Landing * Back;
+	SidestepArcStart = Crossing - FirstFinal * (SidestepRadius * Tangent);
+	SidestepCenter = SidestepArcStart + SidestepTurnSign * FVector2D(-FirstFinal.Y, FirstFinal.X) * SidestepRadius;
+	BackStraight = Back - SidestepRadius * Tangent;
+	BackArc = SidestepRadius * SidestepTurnRad;
+	return true;
+}
+
+void AATCAircraft::SidestepAt(float ToGoCm, FVector2D& OutPoint, FVector2D& OutHeading, float& OutCurvature) const
+{
+	const FVector2D Landing = FVector2D(LandingDirection).GetSafeNormal();
+	OutCurvature = 0.f;
+	if (ToGoCm <= BackStraight)
+	{
+		OutHeading = Landing;
+		OutPoint = FVector2D(TouchdownPoint) - Landing * ToGoCm;
+	}
+	else if (ToGoCm <= BackStraight + BackArc)
+	{
+		// Fraction of the turn done; heading and radius turn together
+		const float Angle = SidestepTurnSign * SidestepTurnRad * (1.f - (ToGoCm - BackStraight) / BackArc);
+		const FVector2D Radial = SidestepArcStart - SidestepCenter;
+		const float C = FMath::Cos(Angle), S = FMath::Sin(Angle);
+		OutPoint = SidestepCenter + FVector2D(Radial.X * C - Radial.Y * S, Radial.X * S + Radial.Y * C);
+		OutHeading = FVector2D(FirstFinal.X * C - FirstFinal.Y * S, FirstFinal.X * S + FirstFinal.Y * C);
+		OutCurvature = SidestepTurnSign / SidestepRadius;
+	}
+	else
+	{
+		OutHeading = FirstFinal;
+		OutPoint = SidestepArcStart - FirstFinal * (ToGoCm - BackStraight - BackArc);
+	}
+}
+
+void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, float RolloutEndSpeedKt, const ATaxiRoute* ApproachRoute)
 {
 	if (!Route)
 	{
@@ -388,7 +454,17 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 	LandingToGoCm = ApproachDistanceM * ATCUnits::MetersToCm;
 	LandingSpeedCms = ApproachSpeedCms;
 	PitchDeg = 2.5f;
+	RollDeg = 0.f;
 	SinceTouchdown = -1.f;
+	bSidestep = ApproachRoute && PlanSidestep(ApproachRoute);
+	if (bSidestep)
+	{
+		// At least 1.5 km on the first final before the turn, so it is seen lined up for that runway
+		LandingToGoCm = FMath::Max(LandingToGoCm, BackStraight + BackArc + 150000.f);
+		UE_LOG(LogATC, Display, TEXT("%s on final for %s, sidesteps to %s: %.0f degree turn of %.0f m radius, %.0f m before touchdown"),
+			*Identity->Callsign.ToString(), *ApproachRoute->RouteTag.ToString(), *Route->RouteTag.ToString(), FMath::RadiansToDegrees(SidestepTurnRad),
+			SidestepRadius / 100.f, (BackStraight + BackArc) / 100.f);
+	}
 
 	// In the air nobody taxis behind it: no path until it joins the route. Its runway exit stays reserved (spawn manager)
 	Movement->ClearPath();
@@ -469,8 +545,18 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 		}
 	}
 
-	const FVector Location = TouchdownPoint - LandingDirection * LandingToGoCm + FVector(0.f, 0.f, Height);
-	SetActorLocationAndRotation(Location, FRotator(PitchDeg, LandingDirection.Rotation().Yaw, 0.f));
+	// On the final (or the sidestep turn); banked in a turn as an aircraft is: tan(bank) = v^2 * curvature / g
+	FVector2D Ground = FVector2D(TouchdownPoint - LandingDirection * LandingToGoCm);
+	FVector2D Heading = FVector2D(LandingDirection);
+	float Curvature = 0.f;
+	if (bSidestep && LandingToGoCm > 0.f)
+	{
+		SidestepAt(LandingToGoCm, Ground, Heading, Curvature);
+	}
+	const float TargetRoll = FMath::Clamp(FMath::RadiansToDegrees(FMath::Atan(FMath::Square(LandingSpeedCms) * Curvature / 981.f)), -30.f, 30.f);
+	RollDeg = FMath::FInterpConstantTo(RollDeg, TargetRoll, DeltaSeconds, 8.f);
+	const FVector Location(Ground.X, Ground.Y, TouchdownPoint.Z + Height);
+	SetActorLocationAndRotation(Location, FRotator(PitchDeg, FVector(Heading, 0.f).Rotation().Yaw, RollDeg));
 
 	// At the start of the arrival route: from here the taxi controller drives (exit, taxi in, stand)
 	if (-LandingToGoCm >= RolloutCm)
@@ -549,6 +635,9 @@ void AATCAircraft::TickTakeoff(float DeltaSeconds)
 	}
 	FRotator Rotation = GetActorRotation();
 	Rotation.Pitch = PitchDeg;
+	// Wings level again (a go-around out of the sidestep turn climbs straight ahead)
+	RollDeg = FMath::FInterpConstantTo(RollDeg, 0.f, DeltaSeconds, 8.f);
+	Rotation.Roll = RollDeg;
 	const float ClimbDeg = FlightPathDeg;
 	const FVector Flat = FRotator(0.f, Rotation.Yaw, 0.f).Vector();
 	const FVector Velocity = (Flat * FMath::Cos(FMath::DegreesToRadians(ClimbDeg)) + FVector::UpVector * FMath::Sin(FMath::DegreesToRadians(ClimbDeg))) * TakeoffSpeedCms;

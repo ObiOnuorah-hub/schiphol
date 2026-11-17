@@ -56,9 +56,12 @@
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialParameterCollection.h"
+#include "Editor.h"
 #include "MeshDescription.h"
 #include "Misc/PackageName.h"
 #include "StaticMeshAttributes.h"
+#include "StaticMeshOperations.h"
+#include "UObject/UObjectIterator.h"
 
 namespace ATCExample
 {
@@ -314,7 +317,7 @@ namespace ATCExample
 	FRotator NoseForward(const UStaticMesh* Mesh)
 	{
 		const FBox Box = Mesh->GetBoundingBox();
-		const bool bAlongX = Box.GetSize().X >= Box.GetSize().Y;
+		bool bAlongX = Box.GetSize().X >= Box.GetSize().Y;
 		FVector Top(0.0, 0.0, -UE_BIG_NUMBER);
 		if (const FMeshDescription* Description = Mesh->GetMeshDescription(0))
 		{
@@ -323,6 +326,13 @@ namespace ATCExample
 			{
 				Top = Positions[Vertex].Z > Top.Z ? FVector(Positions[Vertex]) : Top;
 			}
+		}
+		// Wider than long (787, A380): the fin top lies far back along the fuselage and in the middle of the span
+		const double OffX = FMath::Abs(Top.X - Box.GetCenter().X) / FMath::Max(Box.GetSize().X, 1.0);
+		const double OffY = FMath::Abs(Top.Y - Box.GetCenter().Y) / FMath::Max(Box.GetSize().Y, 1.0);
+		if (FMath::Max(OffX, OffY) > 0.25 && FMath::Min(OffX, OffY) < 0.1)
+		{
+			bAlongX = OffX > OffY;
 		}
 		const double TailSide = bAlongX ? Top.X - Box.GetCenter().X : Top.Y - Box.GetCenter().Y;
 		const FVector Nose = bAlongX ? FVector(TailSide > 0.0 ? -1.0 : 1.0, 0.0, 0.0) : FVector(0.0, TailSide > 0.0 ? -1.0 : 1.0, 0.0);
@@ -419,12 +429,23 @@ namespace ATCExample
 		FitMesh(B789, *Model(TEXT("787-9_KLM/787-9_KLM/Geometries/Group_2.Group_2")), FRotator(0.f, -90.f, 0.f));
 		UAircraftTypeData* B78X = MakeAircraftType(TEXT("B78X"), TEXT("Boeing 787-10"), EAerodromeCode::E, EWakeCategory::Heavy, 60.1f, 68.3f, 30.0f, 25.f, 2.5f);
 		FitMesh(B78X, *Model(TEXT("787-10_KLM/787-10_KLM_100_jaar/Geometries/Group_3.Group_3")));
+		// The single-mesh KLM 787s above have a broken livery (loose white shapes, no windows): the HQ model merged into one
+		// mesh (ATC.MergeFleetModel KLM_Boeing_787_9_Dreamliner /Game/Aircraft/Fleet/KLM_B789_HQ) replaces both
+		if (FPackageName::DoesPackageExist(TEXT("/Game/Aircraft/Fleet/SM_KLM_B789_HQ")))
+		{
+			FitMesh(B789, TEXT("/Game/Aircraft/Fleet/SM_KLM_B789_HQ.SM_KLM_B789_HQ"));
+			FitMesh(B78X, TEXT("/Game/Aircraft/Fleet/SM_KLM_B789_HQ.SM_KLM_B789_HQ"));
+		}
 		UAircraftTypeData* B788 = MakeAircraftType(TEXT("B788"), TEXT("Boeing 787-8"), EAerodromeCode::E, EWakeCategory::Heavy, 60.1f, 56.7f, 22.8f, 25.f, 2.5f);
 		// The 787-8 and the A380 are wider than they are long: the long-side rule would take the wings for the fuselage
 		FitMesh(B788, *Plane(TEXT("787norwegian")), FRotator(0.f, -90.f, 0.f));
 		UAircraftTypeData* B77W = MakeAircraftType(TEXT("B77W"), TEXT("Boeing 777-300ER"), EAerodromeCode::E, EWakeCategory::Heavy, 64.8f, 73.9f, 31.2f, 25.f, 2.5f);
 		FitMesh(B77W, *Plane(TEXT("777koreanair")));
 		AddLivery(B77W, TEXT("KLM"), *Model(TEXT("777-306_KLM_orange_pride/777-306_KLM_orange_pride/Geometries/Group_101.Group_101")));
+		if (FPackageName::DoesPackageExist(TEXT("/Game/Aircraft/Fleet/SM_KLM_B77W_HQ")))
+		{
+			AddLivery(B77W, TEXT("KLM"), TEXT("/Game/Aircraft/Fleet/SM_KLM_B77W_HQ.SM_KLM_B77W_HQ"));   // merged HQ model, same reason as the 787
+		}
 		AddLivery(B77W, TEXT("ANZ"), *Plane(TEXT("777airnewzealand")));
 		AddLivery(B77W, TEXT("AAL"), *Plane(TEXT("777americanairline")));
 		UAircraftTypeData* B77L = MakeAircraftType(TEXT("B77L"), TEXT("Boeing 777F"), EAerodromeCode::E, EWakeCategory::Heavy, 64.8f, 63.7f, 25.9f, 25.f, 2.5f);
@@ -441,6 +462,10 @@ namespace ATCExample
 		AddLivery(B744, TEXT("NCA"), *Plane(TEXT("747nca")));
 		UAircraftTypeData* A388 = MakeAircraftType(TEXT("A388"), TEXT("Airbus A380-800"), EAerodromeCode::F, EWakeCategory::Super, 79.8f, 72.7f, 32.0f, 25.f, 2.5f);
 		FitMesh(A388, *Model(TEXT("A380_Emirates/A380_Emirates/Geometries/Group_17.Group_17")), FRotator(0.f, -90.f, 0.f));
+		if (FPackageName::DoesPackageExist(TEXT("/Game/Aircraft/Fleet/SM_UAE_A388_HQ")))
+		{
+			FitMesh(A388, TEXT("/Game/Aircraft/Fleet/SM_UAE_A388_HQ.SM_UAE_A388_HQ"));   // merged HQ model, as the KLM 787
+		}
 	}
 
 	void FillEHAMTrafficMix(UTrafficMixData* Mix)
@@ -485,6 +510,202 @@ namespace ATCExample
 	FAutoConsoleCommand SetupFleetCommand(TEXT("ATC.SetupFleet"),
 		TEXT("Make every aircraft type with the models and liveries in the project, and the Schiphol traffic mix"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&SetupFleet));
+
+	/**
+	 * ATC.MergeFleetModel <mesh path part> <asset base> [n]: merges the parts of the n-th aircraft in the open map whose
+	 * meshes have that path part (Datasmith "HQ" models: one actor per part) into one static mesh, in the model's own axes.
+	 * Traffic needs one mesh per livery, and the HQ models only exist as parts. The asset is <folder>/SM_<name>.
+	 * 17-11-2026: the single-mesh KLM 787s had a broken livery (loose white shapes, no windows), the HQ one is fine.
+	 */
+	void MergeFleetModel(const TArray<FString>& Args)
+	{
+		UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+		if (!World || Args.Num() < 2)
+		{
+			UE_LOG(LogATC, Warning, TEXT("ATC.MergeFleetModel <mesh path part> </Game/.../Name> [n]"));
+			return;
+		}
+		const int32 Wanted = Args.Num() > 2 ? FCString::Atoi(*Args[2]) : 0;
+
+		// The parts, per aircraft: the same top parent actor and within 40 m of each other (two copies can stand on one spot)
+		struct FGroup { FBox Box; const AActor* Top = nullptr; TArray<UPrimitiveComponent*> Parts; };
+		TArray<FGroup> Groups;
+		for (TObjectIterator<UStaticMeshComponent> It; It; ++It)
+		{
+			if (It->IsTemplate() || It->GetWorld() != World || !It->GetOwner() || !It->GetStaticMesh() || !It->GetStaticMesh()->GetPathName().Contains(Args[0]))
+			{
+				continue;
+			}
+			const AActor* Top = It->GetOwner();
+			while (Top->GetAttachParentActor())
+			{
+				Top = Top->GetAttachParentActor();
+			}
+			const FBox Box = It->Bounds.GetBox();
+			FGroup* Group = Groups.FindByPredicate([&Box, Top](const FGroup& Other) { return Other.Top == Top && FVector::Dist2D(Other.Box.GetCenter(), Box.GetCenter()) < 4000.0; });
+			if (!Group)
+			{
+				Group = &Groups.AddDefaulted_GetRef();
+				Group->Box = Box;
+				Group->Top = Top;
+			}
+			else
+			{
+				Group->Box += Box;
+			}
+			Group->Parts.Add(*It);
+		}
+		for (const FGroup& Each : Groups)
+		{
+			UE_LOG(LogATC, Display, TEXT("ATC.MergeFleetModel: aircraft %d: %d parts under %s at %s, %.0f m"), int32(&Each - Groups.GetData()), Each.Parts.Num(),
+				*Each.Top->GetActorNameOrLabel(), *Each.Box.GetCenter().ToString(), Each.Box.GetSize().Size2D() / 100.0);
+		}
+		if (!Groups.IsValidIndex(Wanted))
+		{
+			UE_LOG(LogATC, Warning, TEXT("ATC.MergeFleetModel: %d aircraft with %s in the map, no number %d"), Groups.Num(), *Args[0], Wanted);
+			return;
+		}
+		const FGroup& Group = Groups[Wanted];
+
+		// The actor all parts hang under: put it at the origin without rotation, so the mesh comes out in the model's axes
+		auto Ancestors = [](AActor* Actor)
+		{
+			TArray<AActor*> Chain;
+			for (; Actor; Actor = Actor->GetAttachParentActor())
+			{
+				Chain.Add(Actor);
+			}
+			return Chain;
+		};
+		TArray<AActor*> Common = Ancestors(Group.Parts[0]->GetOwner());
+		for (const UPrimitiveComponent* Part : Group.Parts)
+		{
+			const TArray<AActor*> Chain = Ancestors(Part->GetOwner());
+			Common.RemoveAll([&Chain](const AActor* Actor) { return !Chain.Contains(Actor); });
+		}
+		AActor* Root = Common.Num() > 0 ? Common[0] : nullptr;
+		if (!Root)
+		{
+			UE_LOG(LogATC, Warning, TEXT("ATC.MergeFleetModel: the %d parts have no common parent actor"), Group.Parts.Num());
+			return;
+		}
+		const FTransform Placed = Root->GetActorTransform();
+		Root->SetActorTransform(FTransform(FQuat::Identity, FVector::ZeroVector, Placed.GetScale3D()));
+		UE_LOG(LogATC, Display, TEXT("ATC.MergeFleetModel: %d parts under %s (placed at %s, yaw %.1f), %d aircraft found"),
+			Group.Parts.Num(), *Root->GetActorNameOrLabel(), *Placed.GetLocation().ToString(), Placed.Rotator().Yaw, Groups.Num());
+
+		// All parts in one mesh description, one polygon group per material the part really shows (overrides included).
+		// The engine's MergeComponentsToStaticMesh lost every material here (1 empty slot, grey aircraft).
+		FMeshDescription Merged;
+		FStaticMeshAttributes(Merged).Register();
+		TArray<UMaterialInterface*> Materials;   // index = polygon group = material slot
+		TArray<FName> SlotNames;
+		for (UPrimitiveComponent* Primitive : Group.Parts)
+		{
+			UStaticMeshComponent* Part = Cast<UStaticMeshComponent>(Primitive);
+			UStaticMesh* Source = Part->GetStaticMesh();
+			const FMeshDescription* Description = Source->GetMeshDescription(0);
+			if (!Description)
+			{
+				continue;
+			}
+			FStaticMeshOperations::FAppendSettings Append;
+			Append.MeshTransform = Part->GetComponentTransform();
+			Append.PolygonGroupsDelegate = FAppendPolygonGroupsDelegate::CreateLambda(
+				[&Materials, &SlotNames, Part, Source](const FMeshDescription& From, FMeshDescription& To, PolygonGroupMap& Remap)
+			{
+				const TPolygonGroupAttributesConstRef<FName> FromNames = FStaticMeshConstAttributes(From).GetPolygonGroupMaterialSlotNames();
+				TPolygonGroupAttributesRef<FName> ToNames = FStaticMeshAttributes(To).GetPolygonGroupMaterialSlotNames();
+				for (const FPolygonGroupID FromGroup : From.PolygonGroups().GetElementIDs())
+				{
+					int32 Slot = Source->GetStaticMaterials().IndexOfByPredicate([&FromNames, FromGroup](const FStaticMaterial& Material)
+						{ return Material.ImportedMaterialSlotName == FromNames[FromGroup]; });
+					Slot = Slot == INDEX_NONE ? FromGroup.GetValue() : Slot;
+					UMaterialInterface* Material = Part->GetMaterial(Slot);
+					int32 Index = Materials.Find(Material);
+					if (Index == INDEX_NONE)
+					{
+						Index = Materials.Add(Material);
+						SlotNames.Add(FName(*FString::Printf(TEXT("Slot%d_%s"), Index, Material ? *Material->GetName() : TEXT("None"))));
+						const FPolygonGroupID ToGroup = To.CreatePolygonGroup();
+						ToNames[ToGroup] = SlotNames[Index];
+						check(ToGroup.GetValue() == Index);
+					}
+					Remap.Add(FromGroup, FPolygonGroupID(Index));
+				}
+			});
+			FStaticMeshOperations::AppendMeshDescription(*Description, Merged, Append);
+		}
+		Root->SetActorTransform(Placed);
+
+		const FString Folder = FPackageName::GetLongPackagePath(Args[1]);
+		const FString Name = TEXT("SM_") + FPackageName::GetShortName(Args[1]);
+		UStaticMesh* Mesh = FPackageName::DoesPackageExist(Folder / Name) ? LoadObject<UStaticMesh>(nullptr, *(Folder / Name + TEXT(".") + Name)) : nullptr;
+		if (!Mesh)
+		{
+			Mesh = NewObject<UStaticMesh>(CreatePackage(*(Folder / Name)), *Name, RF_Public | RF_Standalone);
+			FAssetRegistryModule::AssetCreated(Mesh);
+		}
+		Mesh->Modify();
+		TArray<FStaticMaterial> Slots;
+		for (int32 Index = 0; Index < Materials.Num(); ++Index)
+		{
+			Slots.Add(FStaticMaterial(Materials[Index], SlotNames[Index], SlotNames[Index]));
+		}
+		Mesh->SetStaticMaterials(Slots);
+		Mesh->GetSectionInfoMap().Clear();
+		Mesh->SetNumSourceModels(1);
+		// The parts' own build settings (Datasmith lets the build recompute their normals: with the stored ones a mirrored
+		// wing came out dark)
+		FMeshBuildSettings& Build = Mesh->GetSourceModel(0).BuildSettings;
+		Build = CastChecked<UStaticMeshComponent>(Group.Parts[0])->GetStaticMesh()->GetSourceModel(0).BuildSettings;
+		Build.bGenerateLightmapUVs = false;
+		UE_LOG(LogATC, Display, TEXT("ATC.MergeFleetModel: build settings of the parts: recompute normals %d, tangents %d, mikkt %d"),
+			Build.bRecomputeNormals ? 1 : 0, Build.bRecomputeTangents ? 1 : 0, Build.bUseMikkTSpace ? 1 : 0);
+		Mesh->CreateMeshDescription(0, MoveTemp(Merged));
+		Mesh->CommitMeshDescription(0);
+		Mesh->NaniteSettings = CastChecked<UStaticMeshComponent>(Group.Parts[0])->GetStaticMesh()->NaniteSettings;
+		Mesh->NaniteSettings.FallbackTarget = ENaniteFallbackTarget::PercentTriangles;
+		Mesh->NaniteSettings.FallbackPercentTriangles = 1.f;   // translucent windows draw the fallback mesh: keep it whole
+		Mesh->Build(false);
+		Mesh->PostEditChange();
+		Mesh->MarkPackageDirty();
+		UE_LOG(LogATC, Display, TEXT("ATC.MergeFleetModel: %s, %d materials, %d sections, %d triangles, %.1f x %.1f x %.1f m, nanite %d"), *Mesh->GetPathName(),
+			Materials.Num(), Mesh->GetNumSections(0), Mesh->GetNumTriangles(0), Mesh->GetBoundingBox().GetSize().X / 100.f, Mesh->GetBoundingBox().GetSize().Y / 100.f,
+			Mesh->GetBoundingBox().GetSize().Z / 100.f, Mesh->IsNaniteEnabled() ? 1 : 0);
+		UEditorLoadingAndSavingUtils::SavePackages({ Mesh->GetPackage() }, false);
+	}
+
+	/** ATC.MeshInfo <static mesh path>: material slots and the sections of LOD 0 with their slot. */
+	void MeshInfo(const TArray<FString>& Args)
+	{
+		const UStaticMesh* Mesh = Args.Num() > 0 ? LoadObject<UStaticMesh>(nullptr, *Args[0]) : nullptr;
+		if (!Mesh)
+		{
+			UE_LOG(LogATC, Warning, TEXT("ATC.MeshInfo: no mesh %s"), Args.Num() > 0 ? *Args[0] : TEXT(""));
+			return;
+		}
+		for (int32 Slot = 0; Slot < Mesh->GetStaticMaterials().Num(); ++Slot)
+		{
+			const FStaticMaterial& Material = Mesh->GetStaticMaterials()[Slot];
+			UE_LOG(LogATC, Display, TEXT("ATC.MeshInfo: slot %d %s = %s"), Slot, *Material.MaterialSlotName.ToString(),
+				Material.MaterialInterface ? *Material.MaterialInterface->GetPathName() : TEXT("none"));
+		}
+		for (int32 Section = 0; Section < Mesh->GetNumSections(0); ++Section)
+		{
+			const FMeshSectionInfo Info = Mesh->GetSectionInfoMap().Get(0, Section);
+			UE_LOG(LogATC, Display, TEXT("ATC.MeshInfo: section %d -> slot %d"), Section, Info.MaterialIndex);
+		}
+		UE_LOG(LogATC, Display, TEXT("ATC.MeshInfo: %s, %d slots, %d sections, nanite %d"), *Mesh->GetName(), Mesh->GetStaticMaterials().Num(), Mesh->GetNumSections(0),
+			Mesh->IsNaniteEnabled() ? 1 : 0);
+	}
+
+	FAutoConsoleCommand MeshInfoCommand(TEXT("ATC.MeshInfo"), TEXT("ATC.MeshInfo <static mesh path>: material slots and sections"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&MeshInfo));
+
+	FAutoConsoleCommand MergeFleetModelCommand(TEXT("ATC.MergeFleetModel"),
+		TEXT("ATC.MergeFleetModel <mesh path part> </Game/.../Name> [n]: one static mesh from a multi-part aircraft in the open map"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&MergeFleetModel));
 
 	UWeatherPresetData* MakeWeather(const TCHAR* Name, const TCHAR* Display, const TCHAR* Metar, float Coverage, float BaseFt, float VisibilityM,
 		EPrecipitationType Precipitation, float Rate, float Wetness, float Snow, float Sun, float SourceAngle, float WindDir, float WindKt)

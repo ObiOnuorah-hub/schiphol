@@ -230,7 +230,9 @@ AATCAircraft* UAircraftSpawnSubsystem::TrySpawn(const FAircraftSpawnRequest& InR
 	{
 		return nullptr;
 	}
-	if (Request.bLand && HoldLanding(Request, Route, Start, OutBlocker))
+	// A sidestep flies another runway's final first: it is spaced with the landings on that final
+	ATaxiRoute* Approach = Request.bLand && Request.ApproachRouteTag.IsValid() ? Traffic->FindRoute(Request.ApproachRouteTag) : nullptr;
+	if (Request.bLand && HoldLanding(Request, Route, Start, OutBlocker, Approach))
 	{
 		return nullptr;
 	}
@@ -276,8 +278,10 @@ AATCAircraft* UAircraftSpawnSubsystem::TrySpawn(const FAircraftSpawnRequest& InR
 	}
 	if (Request.bLand)
 	{
-		Aircraft->StartLanding(Route, Start, End, Request.InitialSpeedKt);
-		RecentLandings.Add({ Route->GetLocationAt(Start), RunwayDirection(Route, Start), static_cast<float>(GetWorld()->GetTimeSeconds()), Aircraft });
+		Aircraft->StartLanding(Route, Start, End, Request.InitialSpeedKt, Approach);
+		const ATaxiRoute* Final = Approach ? Approach : Route;
+		const float FinalStart = Approach ? 0.f : Start;
+		RecentLandings.Add({ Final->GetLocationAt(FinalStart), RunwayDirection(Final, FinalStart), static_cast<float>(GetWorld()->GetTimeSeconds()), Aircraft });
 	}
 	else if (Request.bStartTaxi)
 	{
@@ -289,12 +293,12 @@ AATCAircraft* UAircraftSpawnSubsystem::TrySpawn(const FAircraftSpawnRequest& InR
 	return Aircraft;
 }
 
-bool UAircraftSpawnSubsystem::HoldLanding(const FAircraftSpawnRequest& Request, ATaxiRoute* Route, float StartCm, AActor*& OutBlocker)
+bool UAircraftSpawnSubsystem::HoldLanding(const FAircraftSpawnRequest& Request, ATaxiRoute* Route, float StartCm, AActor*& OutBlocker, const ATaxiRoute* Approach)
 {
 	const UATCSimSettings* Settings = GetDefault<UATCSimSettings>();
 	const float Now = GetWorld()->GetTimeSeconds();
-	const FVector Start = Route->GetLocationAt(StartCm);
-	const FVector Direction = RunwayDirection(Route, StartCm);
+	const FVector Start = Approach ? Approach->GetLocationAt(0.f) : Route->GetLocationAt(StartCm);
+	const FVector Direction = Approach ? RunwayDirection(Approach, 0.f) : RunwayDirection(Route, StartCm);
 
 	// Landings on the same runway (the same direction, joining it on one centre line) come at least the spacing apart
 	RecentLandings.RemoveAll([Now, Settings](const FRecentLanding& Recent) { return Now - Recent.Time >= Settings->LandingSpacingSeconds; });

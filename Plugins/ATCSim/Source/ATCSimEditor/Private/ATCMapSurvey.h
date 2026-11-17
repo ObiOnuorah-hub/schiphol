@@ -43,6 +43,17 @@ namespace ATCMapSurvey
 		 */
 		TArray<FVector> Route(const FVector& From, const FVector& To, float MaxBridgeCm = 8000.f) const;
 
+		/**
+		 * Straight on over a junction: where a painted centreline stops and goes on beyond a gap in the same direction (some
+		 * Schiphol junctions have no centreline through them; ICAO: the centreline continues straight through an
+		 * intersection, turns only along a painted curve), the line end is linked to the line ahead within MaxGapCm,
+		 * when no short painted way exists and OnTaxiway accepts the gap. Once per network. Returns the number of links.
+		 */
+		int32 AddStraightGaps(float MaxGapCm, TFunctionRef<bool(const FVector&, const FVector&)> OnTaxiway);
+		/** Straight-on links over a gap (both directions, key Min * 2^32 + Max): they cost like paint, not like a bridge. */
+		TSet<uint64> StraightLinks;
+		bool bStraightGapsAdded = false;
+
 		/** Direction of the painted line at a node (unit, sign arbitrary). */
 		FVector2D LineDirection(int32 Node) const;
 		/** 1 on a centerline or single line, higher on a taxiway edge line (paint on one side only, about a half width away). */
@@ -73,8 +84,9 @@ namespace ATCMapSurvey
 	 * Resamples the line every metre and smooths it only where it bends tighter than MinRadiusCm (zigzags over gaps in
 	 * the paint, corners), until no bend is tighter; end points stay. Simplified again (5 cm) before returning.
 	 * bOutReached: false when some bend stays tighter (a turn back on itself between fixed ends).
+	 * KeepEndCm: the last stretch of that length is not moved at all (a lineup straight on the runway centreline).
 	 */
-	TArray<FVector> SmoothBends(const TArray<FVector>& Points, float MinRadiusCm, bool* bOutReached = nullptr);
+	TArray<FVector> SmoothBends(const TArray<FVector>& Points, float MinRadiusCm, bool* bOutReached = nullptr, float KeepEndCm = 0.f);
 
 	/** World Partition map: load every actor in the editor (a headless editor loads none). Once per world. */
 	void LoadWholeWorld(UWorld* World);

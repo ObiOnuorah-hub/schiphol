@@ -3,6 +3,7 @@
 // taxi routes, and the scenario that uses them.
 
 #include "ATCAirportSetup.h"
+#include "Algo/Reverse.h"
 #include "ATCExampleContent.h"
 #include "ATCMapSurvey.h"
 #include "ATCTowerScreens.h"
@@ -276,6 +277,81 @@ namespace ATCSetup
 					const FVector Shift(Fit.Normal * Fit.OffsetCm, 0.0);
 					Mapped.A += Shift;
 					Mapped.B += Shift;
+				}
+			}
+			// Then onto the painted centreline itself: one shift for the whole runway left it 1-4 m beside the dashes, and
+			// skewed (06/24: 4 m at one end, 1 m at the other; 16-11-2026). The dashes' median offset every 100 m, a
+			// straight line through those (stations more than 50 cm off the line dropped), twice with a narrower window
+			for (const double Window : { 600.0, 250.0 })
+			{
+				if (Evidence.IsEmpty())
+				{
+					break;
+				}
+				const FVector2D Dir(Mapped.Along());
+				const FVector2D Normal(-Dir.Y, Dir.X);
+				const double Length = Mapped.Length();
+				TArray<FVector2D> Band;   // (along, side) of the paint near the line
+				for (const FVector& Point : Evidence)
+				{
+					const FVector2D Delta = FVector2D(Point - Mapped.A);
+					const double Side = Delta | Normal;
+					const double Along = Delta | Dir;
+					if (FMath::Abs(Side) < Window && Along > 10000.0 && Along < Length - 10000.0)
+					{
+						Band.Add({ Along, Side });
+					}
+				}
+				TArray<FVector2D> Stations;   // (along, median side)
+				for (double Station = 15000.0; Station <= Length - 15000.0; Station += 10000.0)
+				{
+					TArray<double> Sides;
+					for (const FVector2D& Sample : Band)
+					{
+						if (FMath::Abs(Sample.X - Station) < 5000.0)
+						{
+							Sides.Add(Sample.Y);
+						}
+					}
+					if (Sides.Num() >= 5)
+					{
+						Sides.Sort();
+						Stations.Add({ Station, Sides[Sides.Num() / 2] });
+					}
+				}
+				double Offset = 0.0, Slope = 0.0;
+				for (int32 Round = 0; Round < 2; ++Round)
+				{
+					double N = 0.0, SumX = 0.0, SumY = 0.0, SumXX = 0.0, SumXY = 0.0;
+					for (const FVector2D& Station : Stations)
+					{
+						if (Round == 0 || FMath::Abs(Station.Y - (Offset + Slope * Station.X)) < 50.0)
+						{
+							N += 1.0;
+							SumX += Station.X;
+							SumY += Station.Y;
+							SumXX += Station.X * Station.X;
+							SumXY += Station.X * Station.Y;
+						}
+					}
+					const double Denominator = N * SumXX - SumX * SumX;
+					if (N < 4.0 || FMath::Abs(Denominator) < 1.0)
+					{
+						Offset = Slope = 0.0;
+						break;
+					}
+					Slope = (N * SumXY - SumX * SumY) / Denominator;
+					Offset = (SumY - Slope * SumX) / N;
+				}
+				const FVector2D ShiftA = Normal * Offset;
+				const FVector2D ShiftB = Normal * (Offset + Slope * Length);
+				Mapped.A += FVector(ShiftA, 0.0);
+				Mapped.B += FVector(ShiftB, 0.0);
+				if (Window < 600.0)
+				{
+					UE_LOG(LogATC, Display, TEXT("Runway %s fitted onto its painted centreline (%d stations), last step %+.2f m / %+.2f m at its ends; ends at %.0f %.0f and %.0f %.0f m"),
+						*Mapped.Ref, Stations.Num(), ShiftA.Size() * FMath::Sign(Offset) / 100.0, ShiftB.Size() * FMath::Sign(Offset + Slope * Length) / 100.0,
+						Mapped.A.X / 100.0, Mapped.A.Y / 100.0, Mapped.B.X / 100.0, Mapped.B.Y / 100.0);
 				}
 			}
 			Result.Add(Mapped);
@@ -887,10 +963,21 @@ namespace ATCSetup
 		{
 			TaxiPoints.Add(OnCenterline);
 		}
-		TaxiPoints.Add(OnCenterline + RunwayDirection * 6000.0);
-		// No bend tighter than an airliner taxies (about 21 m): zigzags over gaps in the paint become one smooth line
-		bool bTaxiSmooth = true;
-		D.Taxi = ATCMapSurvey::SmoothBends(ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(TaxiPoints, 80.f), 3500.f), 2100.f, &bTaxiSmooth);
+		// No bend tighter than an airliner taxies (about 21 m): zigzags over gaps in the paint become one smooth line. The
+		// lineup ends with a straight that is kept exactly on the runway centreline (the smoothing pulled the old 60 m end
+		// up to 34 m sideways, 16-11-2026): 60 m kept after 40 m to finish the turn in, else more room for the turn
+		bool bTaxiSmooth = false;
+		for (const TPair<double, double>& Lineup : { TPair<double, double>(10000.0, 6000.0), TPair<double, double>(16000.0, 8000.0), TPair<double, double>(25000.0, 10000.0) })
+		{
+			TArray<FVector> Points = TaxiPoints;
+			Points.Add(OnCenterline + RunwayDirection * Lineup.Key);
+			bTaxiSmooth = true;
+			D.Taxi = ATCMapSurvey::SmoothBends(ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(Points, 80.f), 3500.f), 2100.f, &bTaxiSmooth, Lineup.Value);
+			if (bTaxiSmooth)
+			{
+				break;
+			}
+		}
 		if (CutsOtherPlace(Site, D.StandRef, MainGear, D.Push) || CutsOtherPlace(Site, D.StandRef, MainGear, D.Taxi) || FollowsSideLine(Site, TaxiPath))
 		{
 			UE_LOG(LogATC, Warning, TEXT("%s: stand %s skipped, its way out runs through another parking place or along an edge line"), *Site.ICAO, *D.StandRef);
@@ -964,10 +1051,17 @@ namespace ATCSetup
 		}
 		const FMapRunway& Runway = Site.Runways[D.ArrivalRunwayIndex];
 
-		// Exit: a taxiway centreline beside the runway 1.4 to 2.6 km past the threshold, connected to the stand.
-		// Paint stops at the runway edge, so the exit is the line node closest to the runway in that stretch
+		// Exit: a taxiway centreline beside the runway 42 to 78 % of its length past the threshold (1.4 to 2.6 km on a
+		// 3.3 km runway, 0.85 to 1.5 km on the 2 km Oostbaan), connected to the stand. Paint stops at the runway edge, so
+		// the exit is the line node closest to the runway in that stretch
+		const double RunwayLength = FVector::Dist2D(Runway.A, Runway.B);
+		// Narrow-bodies brake to taxi speed sooner and leave earlier than wide-bodies: two exit streams on one landing
+		// runway (with all on one exit the next landing went around while the last still taxied off, 17-11-2026)
+		const double ExitFrom = 0.42 * RunwayLength, ExitBest = (D.Type->AerodromeCode >= EAerodromeCode::E ? 0.60 : 0.45) * RunwayLength;
+		// A short runway (the Oostbaan, 2 km) may be left at its end
+		const double ExitTo = RunwayLength < 250000.0 ? RunwayLength + 10000.0 : FMath::Min(0.78 * RunwayLength, RunwayLength - 30000.0);
 		TArray<int32> Nearby;
-		Network.Query(Threshold + LandingDirection * 200000.0, 160000.f, Nearby);
+		Network.Query(Threshold + LandingDirection * (0.5 * (ExitFrom + ExitTo)), float(0.5 * (ExitTo - ExitFrom) + 40000.0), Nearby);
 		int32 Exit = INDEX_NONE;
 		double ExitAlong = 0.0;
 		double BestScore = TNumericLimits<double>::Max();
@@ -985,11 +1079,12 @@ namespace ATCSetup
 				const FVector Delta = Network.Nodes[Node] - Threshold;
 				const double Along = Delta.X * LandingDirection.X + Delta.Y * LandingDirection.Y;
 				const double Side = FMath::Abs(Delta.X * -LandingDirection.Y + Delta.Y * LandingDirection.X);
-				if (Along < 140000.0 || Along > 260000.0 || Side < Runway.HalfWidthCm + 800.0 || Side > Runway.HalfWidthCm + 15000.0)
+				const bool bPastEnd = Along > RunwayLength;   // a taxiway straight on beyond the runway end
+				if (Along < ExitFrom || Along > ExitTo || (!bPastEnd && Side < Runway.HalfWidthCm + 800.0) || Side > Runway.HalfWidthCm + 15000.0)
 				{
 					continue;
 				}
-				const double Score = Side + 0.1 * FMath::Abs(Along - 190000.0);
+				const double Score = Side + 0.5 * FMath::Abs(Along - ExitBest);
 				if (Score < BestScore)
 				{
 					BestScore = Score;
@@ -1004,7 +1099,24 @@ namespace ATCSetup
 		}
 		if (Exit == INDEX_NONE)
 		{
-			UE_LOG(LogATC, Warning, TEXT("%s: no exit off runway %s towards stand %s"), *Site.ICAO, *D.ArrivalRunway, *D.StandRef);
+			// Why not: the painted nodes in the stretch beside the runway, by their distance to it
+			int32 InStretch = 0, Connected = 0, Centre = 0;
+			double NearestSide = TNumericLimits<double>::Max();
+			for (int32 Node : Nearby)
+			{
+				const FVector Delta = Network.Nodes[Node] - Threshold;
+				const double Along = Delta.X * LandingDirection.X + Delta.Y * LandingDirection.Y;
+				const double Side = FMath::Abs(Delta.X * -LandingDirection.Y + Delta.Y * LandingDirection.X);
+				if (Along >= ExitFrom && Along <= ExitTo && Side > Runway.HalfWidthCm + 800.0 && Side < Runway.HalfWidthCm + 30000.0)
+				{
+					++InStretch;
+					Connected += Network.Part[Node] == Network.Part[Tail] ? 1 : 0;
+					Centre += IsBesideCentreline(Site, Node) ? 0 : 1;
+					NearestSide = FMath::Min(NearestSide, Side - Runway.HalfWidthCm);
+				}
+			}
+			UE_LOG(LogATC, Warning, TEXT("%s: no exit off runway %s towards stand %s (%d painted nodes beside it within 300 m, %d connected to the stand, %d on a centreline, nearest %.0f m from the edge)"),
+				*Site.ICAO, *D.ArrivalRunway, *D.StandRef, InStretch, Connected, Centre, NearestSide < 1e9 ? NearestSide / 100.0 : -1.0);
 			return false;
 		}
 		// To the far end of the stand's lead-in line and along it onto the stand: nose-in, also where another painted
@@ -1251,6 +1363,44 @@ namespace ATCSetup
 		return Route;
 	}
 
+	/** The arrival route actor of D (rollout, exit, taxi in), 10 kt on the apron, stops before runway crossings. */
+	ATaxiRoute* SpawnArrivalRoute(UWorld* World, const FSite& Site, FDeparture& D)
+	{
+		if (D.Arrival.Num() < 2 || D.ArrivalRouteTag.IsNone())
+		{
+			return nullptr;
+		}
+		ATaxiRoute* Route = SpawnRoute(World, D.ArrivalRouteTag, D.Arrival);
+		FSpeedZone ArrivalApron;
+		ArrivalApron.StartDistance = UAircraftMovementComponent::GetDistanceClosestTo(Route->Spline, D.ArrivalApronStart);
+		ArrivalApron.EndDistance = Route->GetLength();
+		ArrivalApron.MaxSpeedKt = 10.f;
+		Route->SpeedZones = { ArrivalApron };
+		AddRunwayStops(Site, D, Route, true);
+		Route->RerunConstructionScripts();
+		return Route;
+	}
+
+	/** The runway a narrow-body arrival sometimes sidesteps to from the 27 final: the Oostbaan. */
+	const TCHAR* const Sidestep22 = TEXT("22");
+
+	/**
+	 * A narrow-body gate's second arrival: from the Oostbaan (22). Now and then a small aircraft flies the 27 final and
+	 * sidesteps to 22 late, as at Schiphol (ATrafficDirector::SidestepShare). Spawned when the route can be built.
+	 */
+	void AddSidestep(UWorld* World, const FSite& Site, FDeparture& D)
+	{
+		FDeparture S = D;
+		const FString Taxi = D.TaxiRouteTag.ToString();
+		S.ArrivalRunway = Sidestep22;
+		S.ArrivalRouteTag = FName(*(Taxi.Left(Taxi.Find(TEXT(".Rwy"), ESearchCase::CaseSensitive, ESearchDir::FromEnd)) + TEXT(".Arr") + Sidestep22));
+		S.Arrival.Reset();
+		if (BuildArrival(Site, S))
+		{
+			D.SidestepRoute = SpawnArrivalRoute(World, Site, S);
+		}
+	}
+
 	bool SpawnDeparture(UWorld* World, const FSite& Site, FDeparture& D)
 	{
 		UBlueprint* StandBlueprint = LoadObject<UBlueprint>(nullptr, TEXT("/ATCSim/Blueprints/BP_Stand.BP_Stand"));
@@ -1269,17 +1419,7 @@ namespace ATCSetup
 		D.PushRoute->RerunConstructionScripts();
 		D.TaxiRoute->RerunConstructionScripts();
 
-		if (D.Arrival.Num() > 1 && !D.ArrivalRouteTag.IsNone())
-		{
-			D.ArrivalRoute = SpawnRoute(World, D.ArrivalRouteTag, D.Arrival);
-			FSpeedZone ArrivalApron;
-			ArrivalApron.StartDistance = UAircraftMovementComponent::GetDistanceClosestTo(D.ArrivalRoute->Spline, D.ArrivalApronStart);
-			ArrivalApron.EndDistance = D.ArrivalRoute->GetLength();
-			ArrivalApron.MaxSpeedKt = 10.f;
-			D.ArrivalRoute->SpeedZones = { ArrivalApron };
-			AddRunwayStops(Site, D, D.ArrivalRoute, true);
-			D.ArrivalRoute->RerunConstructionScripts();
-		}
+		D.ArrivalRoute = SpawnArrivalRoute(World, Site, D);
 
 		D.Stand = World->SpawnActor<AStand>(StandClass, D.Parking);
 		D.Stand->StandTag = Tag(D.StandTag);
@@ -1522,8 +1662,11 @@ namespace ATCSetup
 	const FName TrafficTag(TEXT("ATCTraffic"));
 
 	/**
-	 * The Schiphol gates in the simulation (north flow: departures 36L and 24, arrivals 36C and 36R). The pier decides
-	 * the aircraft size the routes are built for: E, F and G are the wide-body piers. Checked with ATC.ProbeEHAMGates.
+	 * The Schiphol gates in the simulation: landings on the Buitenveldertbaan (27), departures from the Kaagbaan (24) and
+	 * the Polderbaan (36L) (user 17-11-2026; a real Schiphol combination, e.g. "27 18R 24 18L" in Stcrt. 2024-4851); before
+	 * that arrivals 36C/36R. Narrow-body gates also get an arrival from the Oostbaan (22), for a late sidestep (Sidestep22).
+	 * The pier decides the aircraft size the routes are built for: E, F and G are the wide-body piers. Checked with
+	 * ATC.ProbeEHAMGates.
 	 */
 	struct FGatePlan
 	{
@@ -1535,20 +1678,20 @@ namespace ATCSetup
 
 	const FGatePlan EHAMGates[] = {
 		// G7 and G4 carry the morning scenario
-		{ TEXT("G7"), TEXT("36L"), TEXT("36C"), true },
-		{ TEXT("G4"), TEXT("24"), TEXT("36C"), false },
+		{ TEXT("G7"), TEXT("36L"), TEXT("27"), true },
+		{ TEXT("G4"), TEXT("24"), TEXT("27"), false },
 		// B and C: Schengen narrow-body piers, Kaagbaan departures
-		{ TEXT("B15"), TEXT("24"), TEXT("36R"), false }, { TEXT("B23"), TEXT("24"), TEXT("36R"), false }, { TEXT("B31"), TEXT("24"), TEXT("36R"), false },
-		{ TEXT("C5"), TEXT("24"), TEXT("36C"), false }, { TEXT("C9"), TEXT("24"), TEXT("36C"), false }, { TEXT("C14"), TEXT("24"), TEXT("36C"), false },
+		{ TEXT("B15"), TEXT("24"), TEXT("27"), false }, { TEXT("B23"), TEXT("24"), TEXT("27"), false }, { TEXT("B31"), TEXT("24"), TEXT("27"), false },
+		{ TEXT("C5"), TEXT("24"), TEXT("27"), false }, { TEXT("C9"), TEXT("24"), TEXT("27"), false }, { TEXT("C14"), TEXT("24"), TEXT("27"), false },
 		// D: narrow-body low numbers, wide-body high numbers, Polderbaan departures
-		{ TEXT("D2"), TEXT("36L"), TEXT("36R"), false }, { TEXT("D12"), TEXT("36L"), TEXT("36R"), false }, { TEXT("D16"), TEXT("36L"), TEXT("36R"), false },
-		{ TEXT("D7"), TEXT("36L"), TEXT("36C"), true }, { TEXT("D43"), TEXT("36L"), TEXT("36C"), true }, { TEXT("D53"), TEXT("36L"), TEXT("36C"), true },
+		{ TEXT("D2"), TEXT("36L"), TEXT("27"), false }, { TEXT("D12"), TEXT("36L"), TEXT("27"), false }, { TEXT("D16"), TEXT("36L"), TEXT("27"), false },
+		{ TEXT("D7"), TEXT("36L"), TEXT("27"), true }, { TEXT("D43"), TEXT("36L"), TEXT("27"), true }, { TEXT("D53"), TEXT("36L"), TEXT("27"), true },
 		// E, F, G: intercontinental wide-body piers
-		{ TEXT("E2"), TEXT("36L"), TEXT("36C"), true }, { TEXT("E6"), TEXT("36L"), TEXT("36C"), true }, { TEXT("E18"), TEXT("36L"), TEXT("36C"), true },
-		{ TEXT("E22"), TEXT("36L"), TEXT("36C"), true }, { TEXT("F3"), TEXT("36L"), TEXT("36C"), true }, { TEXT("F7"), TEXT("36L"), TEXT("36C"), true },
-		{ TEXT("G2"), TEXT("36L"), TEXT("36C"), true }, { TEXT("G6"), TEXT("36L"), TEXT("36C"), true }, { TEXT("G9"), TEXT("36L"), TEXT("36C"), true },
+		{ TEXT("E2"), TEXT("36L"), TEXT("27"), true }, { TEXT("E6"), TEXT("36L"), TEXT("27"), true }, { TEXT("E18"), TEXT("36L"), TEXT("27"), true },
+		{ TEXT("E22"), TEXT("36L"), TEXT("27"), true }, { TEXT("F3"), TEXT("36L"), TEXT("27"), true }, { TEXT("F7"), TEXT("36L"), TEXT("27"), true },
+		{ TEXT("G2"), TEXT("36L"), TEXT("27"), true }, { TEXT("G6"), TEXT("36L"), TEXT("27"), true }, { TEXT("G9"), TEXT("36L"), TEXT("27"), true },
 		// H: low-cost narrow-body pier, Kaagbaan departures
-		{ TEXT("H1"), TEXT("24"), TEXT("36R"), false }, { TEXT("H3"), TEXT("24"), TEXT("36R"), false }, { TEXT("H6"), TEXT("24"), TEXT("36R"), false },
+		{ TEXT("H1"), TEXT("24"), TEXT("27"), false }, { TEXT("H3"), TEXT("24"), TEXT("27"), false }, { TEXT("H6"), TEXT("24"), TEXT("27"), false },
 	};
 
 	ATaxiRoute* FindRouteInWorld(UWorld* World, const TCHAR* RouteTag)
@@ -1946,6 +2089,10 @@ namespace ATCSetup
 				{
 					Gate.DepartureRoute = RouteIt->RouteTag;
 				}
+				else if (RouteTag == FString::Printf(TEXT("Route.EHAM.%s.Arr%s"), *Ref, Sidestep22))
+				{
+					Gate.SidestepArrivalRoute = RouteIt->RouteTag;
+				}
 				else if (RouteTag.StartsWith(FString::Printf(TEXT("Route.EHAM.%s.Arr"), *Ref)))
 				{
 					Gate.ArrivalRoute = RouteIt->RouteTag;
@@ -2097,6 +2244,7 @@ namespace ATCSetup
 		Site.Runways = MapRunways(Site.Geo, ATCOsm::Runways(Site.Osm), ATCMapSurvey::RunwayMarkingPoints(World));
 		Site.HoldMarkings = ATCMapSurvey::HoldMarkingPoints(World);
 		AddStandZones(Site, World);
+		AddStraightGaps(Site);
 		AddSideLines(Site);
 		return true;
 	}
@@ -2471,17 +2619,20 @@ namespace ATCSetup
 		}
 	}
 
-	void AddSideLines(FSite& Site)
+	/** The OSM taxiway, taxilane and stand centrelines as points every metre, in cells of 5 m. */
+	FIntPoint OsmCell(const FVector2D& Point)
 	{
-		const ATCMapSurvey::FNetwork& Network = *Site.Network;
-		// The OSM centrelines as points every metre, in cells of 5 m
+		return FIntPoint(FMath::FloorToInt(Point.X / 500.0), FMath::FloorToInt(Point.Y / 500.0));
+	}
+
+	TMap<FIntPoint, TArray<FVector2D>> OsmCentrelinePoints(const FSite& Site, bool bWithStands = true)
+	{
 		TMap<FIntPoint, TArray<FVector2D>> Grid;
-		auto CellOf = [](const FVector2D& Point) { return FIntPoint(FMath::FloorToInt(Point.X / 500.0), FMath::FloorToInt(Point.Y / 500.0)); };
 		for (const ATCOsm::FElement& Element : Site.Osm.Elements)
 		{
 			const FString Kind = Element.Tag(TEXT("aeroway"));
 			if (!Element.bWay || Element.Tag(TEXT("area")) == TEXT("yes")
-				|| (Kind != TEXT("taxiway") && Kind != TEXT("taxilane") && Kind != TEXT("parking_position")))
+				|| (Kind != TEXT("taxiway") && Kind != TEXT("taxilane") && (!bWithStands || Kind != TEXT("parking_position"))))
 			{
 				continue;
 			}
@@ -2493,10 +2644,60 @@ namespace ATCSetup
 				for (int32 Step = 0; Step <= Steps; ++Step)
 				{
 					const FVector2D Point = FMath::Lerp(A, B, double(Step) / Steps);
-					Grid.FindOrAdd(CellOf(Point)).Add(Point);
+					Grid.FindOrAdd(OsmCell(Point)).Add(Point);
 				}
 			}
 		}
+		return Grid;
+	}
+
+	/**
+	 * Straight on over junctions where the paint stops (user's screenshot 17-11-2026: "where there is no yellow line you
+	 * still go straight, only in these places"): a gap is bridged only when the straight line over it follows a real
+	 * taxiway, every 5 m within 6 m of an OSM taxiway or taxilane centreline, so never over grass or diagonally.
+	 */
+	void AddStraightGaps(FSite& Site)
+	{
+		const TMap<FIntPoint, TArray<FVector2D>> Grid = OsmCentrelinePoints(Site, false);
+		auto NearOsm = [&Grid](const FVector2D& Point)
+		{
+			const FIntPoint Cell = OsmCell(Point);
+			for (int32 DX = -2; DX <= 2; ++DX)
+			{
+				for (int32 DY = -2; DY <= 2; ++DY)
+				{
+					const TArray<FVector2D>* Points = Grid.Find(Cell + FIntPoint(DX, DY));
+					for (int32 Index = 0; Points && Index < Points->Num(); ++Index)
+					{
+						if (FVector2D::DistSquared((*Points)[Index], Point) < 600.0 * 600.0)
+						{
+							return true;
+						}
+					}
+				}
+			}
+			return false;
+		};
+		ATCMapSurvey::FNetwork& Network = const_cast<ATCMapSurvey::FNetwork&>(*Site.Network);
+		Network.AddStraightGaps(9000.f, [&NearOsm](const FVector& A, const FVector& B)
+		{
+			const int32 Steps = FMath::Max(1, FMath::CeilToInt(FVector::Dist2D(A, B) / 500.0));
+			for (int32 Step = 0; Step <= Steps; ++Step)
+			{
+				if (!NearOsm(FVector2D(FMath::Lerp(A, B, double(Step) / Steps))))
+				{
+					return false;
+				}
+			}
+			return true;
+		});
+	}
+
+	void AddSideLines(FSite& Site)
+	{
+		const ATCMapSurvey::FNetwork& Network = *Site.Network;
+		const TMap<FIntPoint, TArray<FVector2D>> Grid = OsmCentrelinePoints(Site);
+		auto CellOf = [](const FVector2D& Point) { return OsmCell(Point); };
 
 		// How far every painted node lies from the nearest OSM centreline (25 m and more: away from every taxiway)
 		const float Far = 2500.f;
@@ -2638,9 +2839,55 @@ namespace ATCSetup
 			StandAt.Add(It->StandTag.ToString().RightChop(FString(TEXT("Stand.EHAM.")).Len()), It->GetParkingTransform().GetLocation() * FVector(1, 1, 0));
 		}
 
-		int32 Routes = 0, CutRoutes = 0, SideRoutes = 0, TightRoutes = 0;
+		int32 Routes = 0, CutRoutes = 0, SideRoutes = 0, TightRoutes = 0, OffRunway = 0;
 		float CutMetres = 0.f, SideMetres = 0.f;
 		TArray<float> TightestRadius;
+
+		// The painted runway centreline against the runway line the routes use: the signed sideways offset of the white
+		// centreline dashes (within 6 m of the line, away from the ends), every 250 m
+		const TArray<FVector>& WhitePaint = ATCMapSurvey::RunwayMarkingPoints(World);
+		for (const FMapRunway& Runway : Site.Runways)
+		{
+			FString Offsets;
+			const FVector2D Along2D(Runway.Along());
+			const FVector2D Across(-Along2D.Y, Along2D.X);
+			for (double Station = 25000.0; Station < Runway.Length() - 25000.0; Station += 25000.0)
+			{
+				TArray<double> Sides;
+				for (const FVector& Point : WhitePaint)
+				{
+					const FVector2D Delta = FVector2D(Point - Runway.A);
+					const double Along = Delta | Along2D;
+					const double Side = Delta | Across;
+					if (FMath::Abs(Along - Station) < 5000.0 && FMath::Abs(Side) < 600.0)
+					{
+						Sides.Add(Side);
+					}
+				}
+				if (Sides.Num() >= 5)
+				{
+					Sides.Sort();
+					Offsets += FString::Printf(TEXT(" %.0f:%+.1f"), Station / 100.0, Sides[Sides.Num() / 2] / 100.0);
+				}
+			}
+			UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: RUNWAY %s %.0f m, painted centreline beside the runway line (station m: offset m):%s"), *Runway.Ref,
+				Runway.Length() / 100.0, *Offsets);
+		}
+		// How far a route's part on a runway lies beside the runway line: a departure's last 60 m, an arrival's first 300 m
+		auto RunwayOffset = [&Site](const FVector& Point)
+		{
+			double Best = TNumericLimits<double>::Max();
+			for (const FMapRunway& Runway : Site.Runways)
+			{
+				double Along = 0.0, Side = 0.0;
+				Runway.Locate(Point, Along, Side);
+				if (Along > -10000.0 && Along < Runway.Length() + 10000.0)
+				{
+					Best = FMath::Min(Best, Side);
+				}
+			}
+			return Best;
+		};
 		TSet<int32> CutZones;
 		TArray<FVector> CutPoints, SidePoints;
 		for (TActorIterator<ATaxiRoute> It(World); It; ++It)
@@ -2654,7 +2901,8 @@ namespace ATCSetup
 			for (float D = 0.f; D <= It->GetLength(); D += 200.f)
 			{
 				const FVector Point = It->Spline->GetLocationAtDistanceAlongSpline(D, ESplineCoordinateSpace::World);
-				if (Site.IsSideLine(Site.Network->Nearest(Point, 150.f)))
+				// Not on the runway itself: on its centreline the lead-off lines start within a metre of it
+				if (RunwayOffset(Point) > 2250.0 && Site.IsSideLine(Site.Network->Nearest(Point, 150.f)))
 				{
 					FirstSide = Beside == 0.f ? Point : FirstSide;
 					Beside += 2.f;
@@ -2667,6 +2915,26 @@ namespace ATCSetup
 				SideMetres += Beside;
 				UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: SIDE %s follows a line beside the centreline for %.0f m, from X=%.0f Y=%.0f m"), *It->RouteTag.ToString(), Beside,
 					FirstSide.X / 100.0, FirstSide.Y / 100.0);
+			}
+			// On the runway: lined up exactly on the centre line?
+			{
+				const FString Tag = It->RouteTag.ToString();
+				const bool bDeparture = Tag.Contains(TEXT(".Rwy"));
+				const bool bArrival = Tag.Contains(TEXT(".Arr"));
+				if (bDeparture || bArrival)
+				{
+					const float Length = It->GetLength();
+					double Worst = 0.0;
+					for (float D = bDeparture ? FMath::Max(Length - 6000.f, 0.f) : 0.f; D <= (bDeparture ? Length : FMath::Min(30000.f, Length)); D += 200.f)
+					{
+						Worst = FMath::Max(Worst, RunwayOffset(It->Spline->GetLocationAtDistanceAlongSpline(D, ESplineCoordinateSpace::World)));
+					}
+					if (Worst > 50.0)
+					{
+						++OffRunway;
+						UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: LINEUP %s lies up to %.2f m beside the runway centre line on its runway part"), *Tag, Worst / 100.0);
+					}
+				}
 			}
 			// Bends: the tightest radius (turn over 3 m chords), away from the first and last 10 m. A taxiing airliner
 			// steers no tighter than about 20 m; a tug turns the main gear of a pushback down to about 6 m
@@ -2811,6 +3079,7 @@ namespace ATCSetup
 			Plot.Save(FString::Printf(TEXT("stand_cuts_%d"), Tile));
 			UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: stand_cuts_%d.png around X=%.0f Y=%.0f m (%d cut points)"), Tile, (Cell.Key.X + 0.5) * 600.0, (Cell.Key.Y + 0.5) * 600.0, Cell.Value);
 		}
+		UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: %d routes lie more than 0.5 m beside the runway centre line on their runway part"), OffRunway);
 		TightestRadius.Sort();
 		UE_LOG(LogATC, Display, TEXT("ATC.CheckStands: %d routes bend tighter than 18 m (pushback 5.5 m); tightest radius per route: min %.0f m, median %.0f m"),
 			TightRoutes, TightestRadius.Num() ? TightestRadius[0] / 100.f : 0.f, TightestRadius.Num() ? TightestRadius[TightestRadius.Num() / 2] / 100.f : 0.f);
@@ -2948,7 +3217,31 @@ namespace ATCSetup
 			// The part over the painted lines: from the first to the last point on them. Before it lies the runway of an
 			// arrival, after it the line-up of a departure or the last metres onto a stand; those stay as they are
 			int32 FirstOn = INDEX_NONE, LastOn = INDEX_NONE;
-			for (int32 Index = 0; Index < Original.Num(); ++Index)
+			// A departure joins its own route again before the last 150 m: its turn onto the runway and the lineup straight
+			// stay as they are (a lead-on line ends beside the centreline, 2.5 m off, 16-11-2026)
+			const int32 LastAllowed = Tag.Contains(TEXT(".Rwy")) ? Original.Num() - 151 : Original.Num() - 1;
+			// An arrival leaves its own route only once it is off the runway: lead-off lines start on the runway centreline,
+			// so the 27 lanes took another way from the very start, 17 m beside the centreline (17-11-2026)
+			int32 FirstAllowed = 0;
+			if (Tag.Contains(TEXT(".Arr")))
+			{
+				auto OnRunway = [&Site](const FVector& Point)
+				{
+					for (const FMapRunway& Runway : Site.Runways)
+					{
+						if (FMath::PointDistToSegment(FVector(Point.X, Point.Y, 0.0), FVector(Runway.A.X, Runway.A.Y, 0.0), FVector(Runway.B.X, Runway.B.Y, 0.0)) < Runway.HalfWidthCm + 500.0)
+						{
+							return true;
+						}
+					}
+					return false;
+				};
+				while (FirstAllowed < Original.Num() - 1 && OnRunway(Original[FirstAllowed]))
+				{
+					++FirstAllowed;
+				}
+			}
+			for (int32 Index = FirstAllowed; Index <= LastAllowed; ++Index)
 			{
 				if (Network.Nearest(Original[Index], 150.f) != INDEX_NONE)
 				{
@@ -3017,7 +3310,58 @@ namespace ATCSetup
 			Points.Append(ToPoints(Network, Path));
 			Points.Append(Original.GetData() + LastOn + 1, Original.Num() - LastOn - 1);
 			bool bSmooth = false;
-			Points = ATCMapSurvey::SmoothBends(ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(Points, 80.f), 3500.f), 2100.f, &bSmooth);
+			// A departure keeps its lineup straight on the runway centreline as it is (the smoothing pulled it 2.5 m aside)
+			const float KeepEnd = Tag.Contains(TEXT(".Rwy")) ? 6000.f : 0.f;
+			// An arrival keeps its rollout on the runway centreline as it is, up to 60 m before the paint of its exit (the
+			// smoothing pulled the 27 lanes 17 m aside while still on the runway, 17-11-2026): smoothed back to front
+			const float KeepStart = Tag.Contains(TEXT(".Arr")) ? FMath::Max(FirstOn - 60, 0) * 100.f : 0.f;
+			if (KeepStart > 0.f)
+			{
+				Algo::Reverse(Points);
+				Points = ATCMapSurvey::SmoothBends(ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(Points, 80.f), 3500.f), 2100.f, &bSmooth, KeepStart);
+				Algo::Reverse(Points);
+			}
+			else
+			{
+				Points = ATCMapSurvey::SmoothBends(ATCMapSurvey::RoundCorners(ATCMapSurvey::Simplify(Points, 80.f), 3500.f), 2100.f, &bSmooth, KeepEnd);
+			}
+			// The simplification before left the lineup up to 0.9 m beside the centreline: its last 100 m resampled every
+			// 5 m and pulled onto the line, fully from 60 m before the end
+			FVector LineStart, LineDirection;
+			int32 LineRunway = INDEX_NONE;
+			if (KeepEnd > 0.f && bSmooth && FindTakeoff(Site, Tag.RightChop(Tag.Find(TEXT(".Rwy")) + 4), LineStart, LineDirection, LineRunway))
+			{
+				TArray<double> FromEnd;
+				FromEnd.SetNumZeroed(Points.Num());
+				for (int32 Index = Points.Num() - 2; Index >= 0; --Index)
+				{
+					FromEnd[Index] = FromEnd[Index + 1] + FVector::Dist(Points[Index], Points[Index + 1]);
+				}
+				TArray<FVector> Pinned = { Points[0] };
+				for (int32 Index = 1; Index < Points.Num(); ++Index)
+				{
+					// A point every 5 m (counted from the end) inside this segment, within the last 100 m
+					for (double Mark = FMath::FloorToDouble(FMath::Min(FromEnd[Index - 1], 10000.0) / 500.0) * 500.0; Mark > FromEnd[Index] + 1.0; Mark -= 500.0)
+					{
+						if (Mark < FromEnd[Index - 1] - 1.0)
+						{
+							Pinned.Add(FMath::Lerp(Points[Index - 1], Points[Index], (FromEnd[Index - 1] - Mark) / (FromEnd[Index - 1] - FromEnd[Index])));
+						}
+					}
+					Pinned.Add(Points[Index]);
+				}
+				// Pull onto the centreline by how far into the last 100 m a point lies
+				double Walked = 0.0;
+				for (int32 Index = Pinned.Num() - 1; Index >= 0; --Index)
+				{
+					Walked += Index < Pinned.Num() - 1 ? FVector::Dist(Pinned[Index], Pinned[Index + 1]) : 0.0;
+					const double Weight = FMath::Clamp((10000.0 - Walked) / 4000.0, 0.0, 1.0);
+					FVector OnLine = LineStart + LineDirection * ((Pinned[Index] - LineStart) | LineDirection);
+					OnLine.Z = Pinned[Index].Z;
+					Pinned[Index] = FMath::Lerp(Pinned[Index], OnLine, Weight);
+				}
+				Points = Pinned;
+			}
 			if (!bSmooth || CutsOtherPlace(Site, OwnRef, OwnSpot, Points))
 			{
 				UE_LOG(LogATC, Display, TEXT("ATC.AddParallelRoutes: %s: the parallel lane %s"), *Tag, bSmooth ? TEXT("runs through another parking place") : TEXT("would turn back on itself"));
@@ -3437,7 +3781,7 @@ namespace ATCSetup
 				}
 				double BestArrival = 0.0;
 				FDeparture WithArrival = Plan.Gate;
-				for (const TCHAR* Runway : { TEXT("36C"), TEXT("36R") })
+				for (const TCHAR* Runway : { TEXT("27") })   // the Buitenveldertbaan, like the traffic gates
 				{
 					FDeparture D = Plan.Gate;
 					D.ArrivalRunway = Runway;
@@ -3459,7 +3803,8 @@ namespace ATCSetup
 					FName(*FString::Printf(TEXT("Route.EHAM.%s.Alt.Rwy%s"), *Plan.Name, *Plan.Gate.Runway)) };
 				if (!Plan.Gate.ArrivalRouteTag.IsNone())
 				{
-					Names.Append({ Plan.Gate.ArrivalRouteTag, FName(*FString::Printf(TEXT("Route.EHAM.%s.Alt.Arr%s"), *Plan.Name, *Plan.Gate.ArrivalRunway)) });
+					Names.Append({ Plan.Gate.ArrivalRouteTag, FName(*FString::Printf(TEXT("Route.EHAM.%s.Alt.Arr%s"), *Plan.Name, *Plan.Gate.ArrivalRunway)),
+						FName(*FString::Printf(TEXT("Route.EHAM.%s.Arr%s"), *Plan.Name, Sidestep22)), FName(*FString::Printf(TEXT("Route.EHAM.%s.Alt.Arr%s"), *Plan.Name, Sidestep22)) });
 				}
 				for (const FName& Name : Names)
 				{
@@ -3555,7 +3900,11 @@ namespace ATCSetup
 			}
 			else if (SpawnDeparture(World, Site, Plan.Gate))
 			{
-				for (AActor* Actor : TArray<AActor*>({ Plan.Gate.Stand, Plan.Gate.PushRoute, Plan.Gate.TaxiRoute, Plan.Gate.ArrivalRoute }))
+				if (Plan.Type->AerodromeCode < EAerodromeCode::E && Plan.Gate.ArrivalRoute)
+				{
+					AddSidestep(World, Site, Plan.Gate);
+				}
+				for (AActor* Actor : TArray<AActor*>({ Plan.Gate.Stand, Plan.Gate.PushRoute, Plan.Gate.TaxiRoute, Plan.Gate.ArrivalRoute, Plan.Gate.SidestepRoute }))
 				{
 					if (Actor)
 					{
@@ -3568,6 +3917,7 @@ namespace ATCSetup
 				Gate->PushbackOption = Plan.Gate.Stand->PushbackOptions[0].OptionTag;
 				Gate->DepartureRoute = Plan.Gate.TaxiRoute->RouteTag;
 				Gate->ArrivalRoute = Plan.Gate.ArrivalRoute ? Plan.Gate.ArrivalRoute->RouteTag : FGameplayTag();
+				Gate->SidestepArrivalRoute = Plan.Gate.SidestepRoute ? Plan.Gate.SidestepRoute->RouteTag : FGameplayTag();
 				Gate->bWideBody = Plan.Type->AerodromeCode >= EAerodromeCode::E;
 				++Added;
 			}
@@ -3625,10 +3975,14 @@ namespace ATCSetup
 			}
 			if (SpawnDeparture(World, Site, D))
 			{
+				if (!Plan.bWideBody)
+				{
+					AddSidestep(World, Site, D);
+				}
 				Departures.Add(D);
 			}
 		}
-		const FDeparture* Klm = Departures.FindByPredicate([](const FDeparture& D) { return D.StandRef == TEXT("G7"); });
+		const FDeparture* Klm =Departures.FindByPredicate([](const FDeparture& D) { return D.StandRef == TEXT("G7"); });
 		const FDeparture* Ezy = Departures.FindByPredicate([](const FDeparture& D) { return D.StandRef == TEXT("G4"); });
 		if (!Klm || !Ezy)
 		{

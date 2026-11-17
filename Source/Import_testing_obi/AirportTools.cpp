@@ -12,6 +12,7 @@
 #include "Engine/PostProcessVolume.h"
 #include "Engine/ExponentialHeightFog.h"
 #include "Components/ExponentialHeightFogComponent.h"
+#include "Components/SkyAtmosphereComponent.h"
 #include "Engine/Engine.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
@@ -23,6 +24,10 @@
 #include "TimerManager.h"
 #include "UnrealClient.h"
 #include "Misc/Paths.h"
+#include "AircraftTypeData.h"
+#include "AircraftCommands.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Engine/StaticMeshActor.h"
 
 #if WITH_EDITOR
 #include "AssetToolsModule.h"
@@ -1658,6 +1663,258 @@ namespace
 		TEXT("Move untextured aircraft materials to the clean M_AircraftPaint"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&AircraftPaint));
 
+	/**
+	 * "Airport.AircraftLook [check]": the SketchUp aircraft have one-sided faces and some translucent parts. Nanite draws no
+	 * translucent sections and one-sided faces vanish from behind, so engines and wings looked see-through or dark
+	 * (17-11-2026). M_AircraftPaint becomes two-sided; every translucent aircraft material moves to it (glass as dark
+	 * window paint); materials on other parents get a two-sided override. "check" only logs.
+	 */
+	void AircraftLook(const TArray<FString>& Args)
+	{
+		const bool bCheck = Args.Num() > 0 && Args[0] == TEXT("check");
+		UMaterial* Paint = LoadObject<UMaterial>(nullptr, TEXT("/Game/EHAM/Materials/M_AircraftPaint.M_AircraftPaint"));
+		if (!Paint)
+		{
+			UE_LOG(LogTemp, Error, TEXT("Airport.AircraftLook: M_AircraftPaint not found"));
+			return;
+		}
+
+		// Every material on an aircraft mesh: the Datasmith models, the merged ones and the fleet folders
+		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+		FARFilter Filter;
+		for (const TCHAR* Path : { TEXT("/Game/Datasmith/Vliegtuigen"), TEXT("/Game/staticmeshplane"), TEXT("/Game/Aircraft"), TEXT("/Game/Aircraft_HQ") })
+		{
+			Filter.PackagePaths.Add(Path);
+		}
+		Filter.bRecursivePaths = true;
+		Filter.ClassPaths.Add(UStaticMesh::StaticClass()->GetClassPathName());
+		TArray<FAssetData> Assets;
+		Registry.GetAssets(Filter, Assets);
+		TSet<UMaterialInterface*> Materials;
+		for (const FAssetData& Asset : Assets)
+		{
+			if (const UStaticMesh* Mesh = Cast<UStaticMesh>(Asset.GetAsset()))
+			{
+				for (const FStaticMaterial& Slot : Mesh->GetStaticMaterials())
+				{
+					if (Slot.MaterialInterface)
+					{
+						Materials.Add(Slot.MaterialInterface);
+					}
+				}
+			}
+		}
+
+		TArray<UPackage*> ToSave;
+		int32 Glass = 0, Opaque = 0, Overridden = 0, Fine = 0, Bases = 0;
+
+		// Base materials in the project (M_AircraftPaint, Datasmith's per-model "References"): two-sided there, once
+		TSet<UMaterial*> BaseMaterials;
+		for (UMaterialInterface* Material : Materials)
+		{
+			UMaterial* Base = Material->GetMaterial();
+			if (Base && Base->GetPathName().StartsWith(TEXT("/Game/")) && !Base->TwoSided && !IsTranslucentBlendMode(Base->BlendMode))
+			{
+				BaseMaterials.Add(Base);
+			}
+		}
+		BaseMaterials.Add(Paint);
+		for (UMaterial* Base : BaseMaterials)
+		{
+			UE_LOG(LogTemp, Display, TEXT("Airport.AircraftLook: base %s two-sided=%d"), *Base->GetPathName(), Base->TwoSided ? 1 : 0);
+			if (!bCheck && !Base->TwoSided)
+			{
+				Base->Modify();
+				Base->TwoSided = true;
+				UMaterialEditingLibrary::RecompileMaterial(Base);
+				ToSave.Add(Base->GetPackage());
+				++Bases;
+			}
+		}
+
+		for (UMaterialInterface* Material : Materials)
+		{
+			UMaterialInstanceConstant* Instance = Cast<UMaterialInstanceConstant>(Material);
+			const FString Name = Material->GetName();
+			const bool bTranslucent = IsTranslucentBlendMode(Material->GetBlendMode());
+			const FString Lower = Name.ToLower();
+			const bool bGlass = Lower.Contains(TEXT("glass")) || Lower.Contains(TEXT("window")) || Lower.Contains(TEXT("translucent")) || Lower.Contains(TEXT("stekl"))
+				|| Lower.Contains(TEXT("stеkl")) || Lower.Contains(TEXT("стекл")) || Lower.Contains(TEXT("tonir"));
+			const bool bOnPaint = BaseMaterials.Contains(Material->GetMaterial());   // two-sided through its base
+			UE_LOG(LogTemp, Display, TEXT("Airport.AircraftLook: %s < %s translucent=%d twosided=%d glass=%d base=%s"), *Material->GetPathName(),
+				Instance && Instance->Parent ? *Instance->Parent->GetName() : TEXT("-"), bTranslucent ? 1 : 0, Material->IsTwoSided() ? 1 : 0, bGlass ? 1 : 0,
+				Material->GetMaterial() ? *Material->GetMaterial()->GetPathName() : TEXT("none"));
+			if (!Instance)
+			{
+				continue;
+			}
+			if (bTranslucent)
+			{
+				bGlass ? ++Glass : ++Opaque;
+			}
+			else if (!bOnPaint && !Material->IsTwoSided())
+			{
+				++Overridden;
+			}
+			else
+			{
+				++Fine;
+				continue;
+			}
+			if (bCheck)
+			{
+				continue;
+			}
+
+			Instance->Modify();
+			if (bTranslucent)
+			{
+				// The paint material keeps the part's colour (same DiffuseColor parameter); glass becomes dark window paint
+				Instance->SetParentEditorOnly(Paint);
+				Instance->BasePropertyOverrides.bOverride_BlendMode = false;
+				Instance->BasePropertyOverrides.bOverride_OpacityMaskClipValue = false;
+				Instance->BasePropertyOverrides.bOverride_TwoSided = false;
+				if (bGlass)
+				{
+					Instance->SetVectorParameterValueEditorOnly(FMaterialParameterInfo(TEXT("DiffuseColor")), FLinearColor(0.16f, 0.19f, 0.23f));
+				}
+			}
+			else
+			{
+				Instance->BasePropertyOverrides.bOverride_TwoSided = true;
+				Instance->BasePropertyOverrides.TwoSided = true;
+			}
+			Instance->PostEditChange();
+			ToSave.Add(Instance->GetPackage());
+		}
+		UE_LOG(LogTemp, Display, TEXT("Airport.AircraftLook: %d materials on %d meshes: %d base materials two-sided, %d glass -> window paint, %d translucent -> paint, %d two-sided override, %d fine%s"),
+			Materials.Num(), Assets.Num(), bCheck ? BaseMaterials.Num() : Bases, Glass, Opaque, Overridden, Fine, bCheck ? TEXT(" (check only)") : TEXT(""));
+		if (bCheck)
+		{
+			return;
+		}
+		UEditorLoadingAndSavingUtils::SavePackages(ToSave, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.AircraftLook: %d packages saved"), ToSave.Num());
+	}
+
+	/**
+	 * "Airport.AircraftTyres [check]": materials that sit only low against the ground on every fleet model that uses them
+	 * (wheels on the ground at Z 0 after the model's offset) are tyres; a light one (white or greenish tyres on the A350s
+	 * and the Vueling A320, 17-11-2026) becomes dark rubber.
+	 */
+	void AircraftTyres(const TArray<FString>& Args)
+	{
+		const bool bCheck = Args.Num() > 0 && Args[0] == TEXT("check");
+		UMaterial* Paint = LoadObject<UMaterial>(nullptr, TEXT("/Game/EHAM/Materials/M_AircraftPaint.M_AircraftPaint"));
+		struct FUse { double MaxZ = -UE_BIG_NUMBER; double MinZ = UE_BIG_NUMBER; bool bLow = true; FString Where; };
+		TMap<UMaterialInterface*, FUse> Uses;
+		TArray<FAssetData> Assets;
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get().GetAssetsByClass(UAircraftTypeData::StaticClass()->GetClassPathName(), Assets);
+		for (const FAssetData& Asset : Assets)
+		{
+			const UAircraftTypeData* Type = Cast<UAircraftTypeData>(Asset.GetAsset());
+			if (!Type)
+			{
+				continue;
+			}
+			TArray<TPair<TSoftObjectPtr<UStaticMesh>, FTransform>> Models = { { Type->Mesh, Type->MeshOffset } };
+			for (const FAircraftLivery& Livery : Type->Liveries)
+			{
+				Models.Add({ Livery.Mesh, Livery.MeshOffset });
+			}
+			const double LowCm = 2.6 * Type->LengthM + 30.0;   // A320 1.3 m, 777 2.2 m: just over a main wheel
+			for (const TPair<TSoftObjectPtr<UStaticMesh>, FTransform>& Model : Models)
+			{
+				UStaticMesh* Mesh = Model.Key.LoadSynchronous();
+				const FMeshDescription* Description = Mesh ? Mesh->GetMeshDescription(0) : nullptr;
+				if (!Description)
+				{
+					continue;
+				}
+				FStaticMeshConstAttributes Attributes(*Description);
+				const TVertexAttributesConstRef<FVector3f> Positions = Attributes.GetVertexPositions();
+				const TPolygonGroupAttributesConstRef<FName> SlotNames = Attributes.GetPolygonGroupMaterialSlotNames();
+				// The ground is the model's lowest vertex (the offset uses the render bounds: the Vueling stands 16 cm above it)
+				double Ground = UE_BIG_NUMBER;
+				for (const FVertexID Vertex : Description->Vertices().GetElementIDs())
+				{
+					Ground = FMath::Min(Ground, Model.Value.TransformPosition(FVector(Positions[Vertex])).Z);
+				}
+				for (const FPolygonGroupID Group : Description->PolygonGroups().GetElementIDs())
+				{
+					int32 Slot = Mesh->GetStaticMaterials().IndexOfByPredicate([&](const FStaticMaterial& Material) { return Material.ImportedMaterialSlotName == SlotNames[Group]; });
+					Slot = Slot == INDEX_NONE ? Group.GetValue() : Slot;
+					UMaterialInterface* Material = Mesh->GetStaticMaterials().IsValidIndex(Slot) ? Mesh->GetStaticMaterials()[Slot].MaterialInterface : nullptr;
+					if (!Material)
+					{
+						continue;
+					}
+					double MinZ = UE_BIG_NUMBER, MaxZ = -UE_BIG_NUMBER;
+					for (const FTriangleID Triangle : Description->GetPolygonGroupTriangles(Group))
+					{
+						for (const FVertexID Vertex : Description->GetTriangleVertices(Triangle))
+						{
+							const double Z = Model.Value.TransformPosition(FVector(Positions[Vertex])).Z - Ground;
+							MinZ = FMath::Min(MinZ, Z);
+							MaxZ = FMath::Max(MaxZ, Z);
+						}
+					}
+					FUse& Use = Uses.FindOrAdd(Material);
+					Use.MinZ = FMath::Min(Use.MinZ, MinZ);
+					Use.MaxZ = FMath::Max(Use.MaxZ, MaxZ);
+					Use.bLow &= MaxZ < LowCm && MinZ < 8.0;   // a tyre touches the ground, a wheel hub does not
+					Use.Where += Type->ICAOType.ToString() + TEXT(" ");
+				}
+			}
+		}
+
+		TArray<UPackage*> ToSave;
+		for (const TPair<UMaterialInterface*, FUse>& Pair : Uses)
+		{
+			UMaterialInstanceConstant* Instance = Cast<UMaterialInstanceConstant>(Pair.Key);
+			FLinearColor Color = FLinearColor::Black;
+			if (Args.Contains(TEXT("all")))   // every material with its height range
+			{
+				UE_LOG(LogTemp, Display, TEXT("Airport.AircraftTyres: ground %s z %.0f..%.0f (%s)"), *Pair.Key->GetPathName(), Pair.Value.MinZ, Pair.Value.MaxZ, *Pair.Value.Where);
+			}
+			const FString Lower = Pair.Key->GetName().ToLower();
+			const bool bNamedTyre = Lower.Contains(TEXT("tyre")) || Lower.Contains(TEXT("tire"));   // the Vueling's, also on its hubs
+			if (!(Pair.Value.bLow || bNamedTyre) || !Instance)
+			{
+				continue;
+			}
+			// A tyre on a textured material (the Vueling's use a Spanish flag picture: greenish tyres) moves to the paint
+			const bool bOnPaint = Instance->GetMaterial() == Paint;
+			Instance->GetVectorParameterValue(FMaterialParameterInfo(TEXT("DiffuseColor")), Color);
+			const bool bLight = !bOnPaint || Color.GetLuminance() > 0.12f;
+			UE_LOG(LogTemp, Display, TEXT("Airport.AircraftTyres: %s z %.0f..%.0f cm colour %s%s (%s)"), *Instance->GetPathName(), Pair.Value.MinZ, Pair.Value.MaxZ,
+				*Color.ToString(), bLight ? TEXT(" -> rubber") : TEXT(""), *Pair.Value.Where);
+			if (bLight && !bCheck)
+			{
+				Instance->Modify();
+				if (!bOnPaint)
+				{
+					Instance->SetParentEditorOnly(Paint);
+				}
+				Instance->SetVectorParameterValueEditorOnly(FMaterialParameterInfo(TEXT("DiffuseColor")), FLinearColor(0.2f, 0.2f, 0.21f));   // sRGB, about 3 % linear
+				Instance->PostEditChange();
+				ToSave.Add(Instance->GetPackage());
+			}
+		}
+		UEditorLoadingAndSavingUtils::SavePackages(ToSave, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.AircraftTyres: %d materials looked at, %d tyres made dark%s"), Uses.Num(), ToSave.Num(), bCheck ? TEXT(" (check only)") : TEXT(""));
+	}
+
+	FAutoConsoleCommand AircraftTyresCommand(
+		TEXT("Airport.AircraftTyres"),
+		TEXT("Light tyre materials on the fleet models become dark rubber. Usage: Airport.AircraftTyres [check]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&AircraftTyres));
+
+	FAutoConsoleCommand AircraftLookCommand(
+		TEXT("Airport.AircraftLook"),
+		TEXT("Aircraft without see-through parts: two-sided paint, translucent parts opaque. Usage: Airport.AircraftLook [check]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&AircraftLook));
+
 	FAutoConsoleCommand GlossyPaintCommand(
 		TEXT("Airport.GlossyPaint"),
 		TEXT("Glossy paint on all aircraft. Usage: Airport.GlossyPaint [shininess, default 40]"),
@@ -2189,6 +2446,68 @@ namespace
 				Text += TEXT(" (output ") + UMaterialEditingLibrary::GetMaterialPropertyInputNodeOutputName(Material, Property.Key) + TEXT(")");
 			}
 			UE_LOG(LogTemp, Display, TEXT("Airport.MatInfo:   %s <- %s"), Property.Value, *Text);
+		}
+		// The textures this material (instance) really samples, with what they hold
+		TArray<FMaterialParameterInfo> Infos;
+		TArray<FGuid> Ids;
+		Interface->GetAllTextureParameterInfo(Infos, Ids);
+		const UEnum* CompressionEnum = StaticEnum<TextureCompressionSettings>();
+		for (const FMaterialParameterInfo& Info : Infos)
+		{
+			UTexture* Texture = nullptr;
+			Interface->GetTextureParameterValue(Info, Texture);
+			const UTexture2D* Texture2D = Cast<UTexture2D>(Texture);
+			UE_LOG(LogTemp, Display, TEXT("Airport.MatInfo:   texture %s = %s compression=%s srgb=%d alpha=%d size=%dx%d"), *Info.Name.ToString(),
+				Texture ? *Texture->GetPathName() : TEXT("none"), Texture ? *CompressionEnum->GetNameStringByValue(Texture->CompressionSettings) : TEXT("-"),
+				Texture && Texture->SRGB ? 1 : 0, Texture2D && Texture2D->HasAlphaChannel() ? 1 : 0, Texture2D ? Texture2D->GetSizeX() : 0, Texture2D ? Texture2D->GetSizeY() : 0);
+		}
+		UE_LOG(LogTemp, Display, TEXT("Airport.MatInfo:   blend %s, two sided %d"), *StaticEnum<EBlendMode>()->GetNameStringByValue(Interface->GetBlendMode()), Interface->IsTwoSided() ? 1 : 0);
+		// "Airport.MatInfo <material> <other material>": every setting in which the two base materials differ, and the
+		// first one's nodes (the map's M_TerrainVT got no sky light, M_AircraftPaint, a copy of it, did; 16-11-2026)
+		UMaterialInterface* OtherInterface = Args.Num() > 1 ? LoadObject<UMaterialInterface>(nullptr, *Args[1]) : nullptr;
+		const UMaterial* Other = OtherInterface ? OtherInterface->GetMaterial() : nullptr;
+		// Two instances: their own settings side by side (overrides, static switches, parameters)
+		if (OtherInterface && Cast<UMaterialInstance>(Interface) && OtherInterface->GetClass() == Interface->GetClass())
+		{
+			for (TFieldIterator<FProperty> It(Interface->GetClass()); It; ++It)
+			{
+				if (It->HasAnyPropertyFlags(CPF_Transient) || It->Identical_InContainer(Interface, OtherInterface))
+				{
+					continue;
+				}
+				FString Mine, Theirs;
+				It->ExportTextItem_InContainer(Mine, Interface, nullptr, nullptr, PPF_None);
+				It->ExportTextItem_InContainer(Theirs, OtherInterface, nullptr, nullptr, PPF_None);
+				UE_LOG(LogTemp, Display, TEXT("Airport.MatInfo:   instance differs %s: %s vs %s"), *It->GetName(), *Mine.Left(400), *Theirs.Left(400));
+			}
+			Other = nullptr;
+		}
+		if (Other)
+		{
+			for (TFieldIterator<FProperty> It(UMaterial::StaticClass()); It; ++It)
+			{
+				if (It->HasAnyPropertyFlags(CPF_Transient) || It->GetFName() == TEXT("ExpressionCollection") || It->Identical_InContainer(Material, Other))
+				{
+					continue;
+				}
+				FString Mine, Theirs;
+				It->ExportTextItem_InContainer(Mine, Material, nullptr, nullptr, PPF_None);
+				It->ExportTextItem_InContainer(Theirs, Other, nullptr, nullptr, PPF_None);
+				UE_LOG(LogTemp, Display, TEXT("Airport.MatInfo:   differs %s: %s vs %s"), *It->GetName(), *Mine.Left(200), *Theirs.Left(200));
+			}
+			// The material's inputs (every pin of the result node, also the hidden ones), side by side
+			const UObject* MineData = Material->GetEditorOnlyData();
+			const UObject* TheirData = Other->GetEditorOnlyData();
+			for (TFieldIterator<FProperty> It(MineData ? MineData->GetClass() : UObject::StaticClass()); MineData && TheirData && It; ++It)
+			{
+				FString Mine, Theirs;
+				It->ExportTextItem_InContainer(Mine, MineData, nullptr, nullptr, PPF_None);
+				It->ExportTextItem_InContainer(Theirs, TheirData, nullptr, nullptr, PPF_None);
+				if (!Mine.IsEmpty() || !Theirs.IsEmpty())
+				{
+					UE_LOG(LogTemp, Display, TEXT("Airport.MatInfo:   input %s: %s | %s"), *It->GetName(), *Mine.Left(220), *Theirs.Left(220));
+				}
+			}
 		}
 	}
 
@@ -3051,9 +3370,10 @@ namespace
 				// "... fog 0.004 0.2 1000 save" in the editor: kept in the map (the light haze of a Dutch summer day)
 				if (Args.Num() > 4 && Args[4] == TEXT("save") && !World->IsGameWorld())
 				{
+					// The actor lives in its own package (one file per actor): save that one too, not only the level
 					It->Modify();
-					UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost() }, false);
-					UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: fog saved in the map"));
+					UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost(), It->GetPackage() }, false);
+					UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: fog saved in the map (%s)"), *It->GetPackage()->GetName());
 				}
 #endif
 			}
@@ -3065,6 +3385,33 @@ namespace
 		if (Fogs == 0)
 		{
 			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: no height fog in the map"));
+		}
+		// The sky's own haze: "Airport.SkyInfo atmo <mie scale> <aerial perspective scale> [save]". The white band at the
+		// horizon after the height fog went (16-11-2026) is the atmosphere's Mie haze over the far distance
+		for (TObjectIterator<USkyAtmosphereComponent> It; It; ++It)
+		{
+			USkyAtmosphereComponent* Atmosphere = *It;
+			if (Atmosphere->GetWorld() != World)
+			{
+				continue;
+			}
+			if (Args.Num() > 2 && Args[0] == TEXT("atmo"))
+			{
+				Atmosphere->Modify();
+				Atmosphere->SetMieScatteringScale(FCString::Atof(*Args[1]));
+				Atmosphere->SetAerialPespectiveViewDistanceScale(FCString::Atof(*Args[2]));
+#if WITH_EDITOR
+				if (Args.Num() > 3 && Args[3] == TEXT("save") && !World->IsGameWorld())
+				{
+					Atmosphere->GetOwner()->Modify();
+					UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost(), Atmosphere->GetOwner()->GetPackage() }, false);
+					UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: atmosphere saved in the map (%s)"), *Atmosphere->GetOwner()->GetPackage()->GetName());
+				}
+#endif
+			}
+			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: atmosphere %s mieScale=%.5f mieAbsorption=%.5f mieAnisotropy=%.2f rayleighScale=%.4f aerialScale=%.2f heightFogContribution=%.2f"),
+				*Atmosphere->GetOwner()->GetName(), Atmosphere->MieScatteringScale, Atmosphere->MieAbsorptionScale, Atmosphere->MieAnisotropy,
+				Atmosphere->RayleighScatteringScale, Atmosphere->AerialPespectiveViewDistanceScale, Atmosphere->HeightFogContribution);
 		}
 		for (TActorIterator<APostProcessVolume> It(World); It; ++It)
 		{
@@ -3099,8 +3446,8 @@ namespace
 				if (Args.Num() > 5 && Args[5] == TEXT("save") && !World->IsGameWorld())
 				{
 					It->Modify();
-					UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost() }, false);
-					UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: shadow tint saved in the map"));
+					UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost(), It->GetPackage() }, false);
+					UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: shadow tint saved in the map (%s)"), *It->GetPackage()->GetName());
 				}
 #endif
 			}
@@ -3110,8 +3457,212 @@ namespace
 				Post.AmbientOcclusionIntensity, Post.bOverride_AmbientOcclusionIntensity ? 1 : 0, Post.IndirectLightingIntensity, Post.bOverride_IndirectLightingIntensity ? 1 : 0,
 				static_cast<int32>(Post.DynamicGlobalIlluminationMethod), Post.bOverride_DynamicGlobalIlluminationMethod ? 1 : 0,
 				static_cast<int32>(Post.ReflectionMethod), Post.bOverride_ReflectionMethod ? 1 : 0, Post.LumenSkylightLeaking, Post.bOverride_LumenSkylightLeaking ? 1 : 0);
+			UE_LOG(LogTemp, Display, TEXT("Airport.SkyInfo: post %s shadow gain %s(%d) shadow saturation %.2f(%d) film toe %.2f(%d)"), *It->GetName(),
+				*Post.ColorGainShadows.ToString(), Post.bOverride_ColorGainShadows ? 1 : 0, Post.ColorSaturationShadows.W, Post.bOverride_ColorSaturationShadows ? 1 : 0,
+				Post.FilmToe, Post.bOverride_FilmToe ? 1 : 0);
 		}
 	}
+
+	/**
+	 * Play: "Airport.LightProbe [swap]": the meshes within 150 m of the point the camera looks at, with what decides how
+	 * they are lit (mobility, lighting channels, shading model); "swap" gives them the plain engine material, to see
+	 * whether the sky light reaches them then (it reached the aircraft but not the map, 16-11-2026)
+	 */
+#if WITH_EDITOR
+	/**
+	 * M_TerrainVT was once a copy of the importer's LambertSurfaceMaterial, whose result pins carry "use constant" with
+	 * fixed values that win over whatever is connected: ambient occlusion 0 (no sky light and no bounce light at all:
+	 * pitch black shadows, 16-11-2026), normal (0,0,0), opacity mask 1 (masked copies never clip: the white tree
+	 * boards) and a white subsurface colour (the boards glowed). "Airport.FixConstantInputs [check]": every material
+	 * under /Game (and the engine's importer parents, report only) with such a pin; without "check" the /Game ones get
+	 * all their "use constant" pins switched off (the connected nodes or the engine defaults count again), recompiled
+	 * and saved. M_AircraftPaint (constant specular/roughness 0.5, no stuck AO) does not match and stays as it is.
+	 */
+	void FixConstantInputs(const TArray<FString>& Args)
+	{
+		const bool bCheckOnly = Args.Num() > 0 && Args[0] == TEXT("check");
+		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+		FARFilter Filter;
+		Filter.ClassPaths.Add(UMaterial::StaticClass()->GetClassPathName());
+		TArray<FAssetData> Assets;
+		Registry.GetAssets(Filter, Assets);
+		TArray<UPackage*> ToSave;
+		int32 Found = 0;
+		for (const FAssetData& Asset : Assets)
+		{
+			const FString Path = Asset.PackageName.ToString();
+			const bool bProject = Path.StartsWith(TEXT("/Game/"));
+			const FString Name = Asset.AssetName.ToString();
+			// The project's own materials, and the importer parents the map still uses
+			if (!bProject && !Name.Contains(TEXT("SurfaceMaterial")))
+			{
+				continue;
+			}
+			UMaterial* Material = Cast<UMaterial>(Asset.GetAsset());
+			UMaterialEditorOnlyData* Data = Material ? Material->GetEditorOnlyData() : nullptr;
+			if (!Data)
+			{
+				continue;
+			}
+			// Which pins have "use constant" on, and is one of them a harmful one
+			FString Stuck;
+			bool bHarmful = false;
+			TArray<TPair<FBoolProperty*, void*>> Pins;
+			for (TFieldIterator<FStructProperty> It(Data->GetClass()); It; ++It)
+			{
+				FBoolProperty* Use = CastField<FBoolProperty>(It->Struct->FindPropertyByName(TEXT("UseConstant")));
+				void* Pin = It->ContainerPtrToValuePtr<void>(Data);
+				if (!Use || !Use->GetPropertyValue_InContainer(Pin))
+				{
+					continue;
+				}
+				const FExpressionInput* Input = static_cast<const FExpressionInput*>(Pin);
+				const FString PinName = It->GetName();
+				FString Value;
+				It->ExportTextItem_Direct(Value, Pin, nullptr, nullptr, PPF_None);
+				const bool bConnected = Input->Expression != nullptr;
+				const bool bZeroAO = PinName == TEXT("AmbientOcclusion") && !Value.Contains(TEXT("Constant=1"));
+				const bool bZeroNormal = PinName == TEXT("Normal") && Value.Contains(TEXT("Z=0.000000"));
+				const bool bMaskOverride = (PinName == TEXT("OpacityMask") || PinName == TEXT("SubsurfaceColor") || PinName == TEXT("Opacity")) && bConnected;
+				bHarmful |= bZeroAO || bZeroNormal || bMaskOverride;
+				Stuck += FString::Printf(TEXT(" %s%s%s"), *PinName, bConnected ? TEXT("(connected)") : TEXT(""), bZeroAO || bZeroNormal || bMaskOverride ? TEXT("!") : TEXT(""));
+				Pins.Add({ Use, Pin });
+			}
+			if (!bHarmful)
+			{
+				continue;
+			}
+			++Found;
+			const bool bFix = !bCheckOnly && bProject;
+			UE_LOG(LogTemp, Display, TEXT("Airport.FixConstantInputs: %s pins with a fixed value:%s%s"), *Material->GetPathName(), *Stuck, bFix ? TEXT(" -> switched off") : TEXT(""));
+			if (bFix)
+			{
+				Material->Modify();
+				for (const TPair<FBoolProperty*, void*>& Pin : Pins)
+				{
+					Pin.Key->SetPropertyValue_InContainer(Pin.Value, false);
+				}
+				Material->PostEditChange();
+				UMaterialEditingLibrary::RecompileMaterial(Material);
+				ToSave.Add(Material->GetPackage());
+			}
+		}
+		UEditorLoadingAndSavingUtils::SavePackages(ToSave, false);
+		UE_LOG(LogTemp, Display, TEXT("Airport.FixConstantInputs: %d materials with stuck pins, %d fixed and saved"), Found, ToSave.Num());
+	}
+
+	FAutoConsoleCommand FixConstantInputsCommand(
+		TEXT("Airport.FixConstantInputs"),
+		TEXT("Airport.FixConstantInputs [check]: switch off the importer's stuck constant pins (AO 0, normal 0, mask 1) on the project materials"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&FixConstantInputs));
+
+	/**
+	 * A throwaway material for LightProbe "swapnew <mode>": "const" grey base colour only, "vt" the terminal's aerial
+	 * photo through a virtual texture sampler only, "normal" grey with the facade gloss trick (vertex normal -> specular)
+	 */
+	UMaterialInterface* MakeTestMaterial(const FString& Mode)
+	{
+		UMaterial* Material = NewObject<UMaterial>(GetTransientPackage(), NAME_None, RF_Transient);
+		UMaterialExpression* Color = nullptr;
+		FString ColorOutput;
+		if (Mode == TEXT("vt"))
+		{
+			UMaterialExpressionTextureSample* Sample = Cast<UMaterialExpressionTextureSample>(
+				UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionTextureSample::StaticClass(), -400, 0));
+			Sample->Texture = LoadObject<UTexture>(nullptr, TEXT("/Game/EHAM/EHAM_V34_1/Terminal3_pierF_V34_0/Textures/BLDG004_Terminal3_ConcourseE_col.BLDG004_Terminal3_ConcourseE_col"));
+			Sample->SamplerType = Sample->Texture && Sample->Texture->VirtualTextureStreaming ? SAMPLERTYPE_VirtualColor : SAMPLERTYPE_Color;
+			Color = Sample;
+			ColorOutput = TEXT("RGB");
+		}
+		else
+		{
+			UMaterialExpressionConstant3Vector* Grey = Cast<UMaterialExpressionConstant3Vector>(
+				UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionConstant3Vector::StaticClass(), -400, 0));
+			Grey->Constant = FLinearColor(0.3f, 0.3f, 0.3f);
+			Color = Grey;
+		}
+		UMaterialEditingLibrary::ConnectMaterialProperty(Color, ColorOutput, MP_BaseColor);
+		if (Mode == TEXT("normal"))
+		{
+			UMaterialExpression* Normal = UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionVertexNormalWS::StaticClass(), -700, 200);
+			UMaterialExpressionComponentMask* Up = Cast<UMaterialExpressionComponentMask>(
+				UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionComponentMask::StaticClass(), -550, 200));
+			Up->R = Up->G = Up->A = false;
+			Up->B = true;
+			UMaterialExpression* Abs = UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionAbs::StaticClass(), -400, 200);
+			UMaterialExpression* Wall = UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionOneMinus::StaticClass(), -250, 200);
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Normal, TEXT(""), Up, TEXT(""));
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Up, TEXT(""), Abs, TEXT(""));
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Abs, TEXT(""), Wall, TEXT(""));
+			UMaterialEditingLibrary::ConnectMaterialProperty(Wall, TEXT(""), MP_Specular);
+		}
+		Material->bUsedWithNanite = true;
+		Material->PostEditChange();
+		return Material;
+	}
+#endif
+
+	void LightProbe(const TArray<FString>& Args, UWorld* World)
+	{
+		APlayerController* Controller = World ? World->GetFirstPlayerController() : nullptr;
+		if (!Controller)
+		{
+			return;
+		}
+		// The pawn and control rotation, not the camera: those are already where Airport.Shots just put them
+		const FVector Eye = Controller->GetPawn() ? Controller->GetPawn()->GetActorLocation() : FVector::ZeroVector;
+		const FRotator Rotation = Controller->GetControlRotation();
+		FHitResult Hit;
+		const FVector Target = World->LineTraceSingleByChannel(Hit, Eye, Eye + Rotation.Vector() * 1000000.0, ECC_Visibility) ? Hit.ImpactPoint : Eye + Rotation.Vector() * 5000.0;
+		const bool bSwap = Args.Num() > 0 && (Args[0] == TEXT("swap") || Args[0] == TEXT("swapnew"));
+		// "swap <material path>": that material instead of the plain one; "swapnew <mode>": a test material made now
+		UMaterialInterface* Plain = nullptr;
+#if WITH_EDITOR
+		if (Args.Num() > 1 && Args[0] == TEXT("swapnew"))
+		{
+			Plain = MakeTestMaterial(Args[1]);
+		}
+#endif
+		Plain = Plain ? Plain : LoadObject<UMaterialInterface>(nullptr, Args.Num() > 1 && Args[0] == TEXT("swap") ? *Args[1] : TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+		const UEnum* MobilityEnum = StaticEnum<EComponentMobility::Type>();
+		const UEnum* ShadingEnum = StaticEnum<EMaterialShadingModel>();
+		int32 Count = 0;
+		for (TObjectIterator<UStaticMeshComponent> It; It; ++It)
+		{
+			UStaticMeshComponent* Component = *It;
+			if (Component->GetWorld() != World || !Component->IsVisible() || !Component->GetStaticMesh()
+				|| Component->Bounds.ComputeSquaredDistanceFromBoxToPoint(Target) > FMath::Square(15000.0))
+			{
+				continue;
+			}
+			if (Count < 15)
+			{
+				const UMaterialInterface* First = Component->GetMaterial(0);
+				const UMaterial* Base = First ? First->GetMaterial() : nullptr;
+				UE_LOG(LogTemp, Display, TEXT("Airport.LightProbe: %s mesh %s mobility=%s channels=%d%d%d castShadow=%d dynIndirect=%d dfLighting=%d skyCapture=%d lightmapRes=%d mat0=%s base=%s shading=%s"),
+					*Component->GetOwner()->GetName(), *Component->GetStaticMesh()->GetName(), *MobilityEnum->GetNameStringByValue(Component->Mobility),
+					Component->LightingChannels.bChannel0 ? 1 : 0, Component->LightingChannels.bChannel1 ? 1 : 0, Component->LightingChannels.bChannel2 ? 1 : 0,
+					Component->CastShadow ? 1 : 0, Component->bAffectDynamicIndirectLighting ? 1 : 0, Component->bAffectDistanceFieldLighting ? 1 : 0,
+					Component->bVisibleInRealTimeSkyCaptures ? 1 : 0, Component->GetStaticMesh()->GetLightMapResolution(),
+					First ? *First->GetName() : TEXT("none"), Base ? *Base->GetName() : TEXT("none"),
+					Base ? *ShadingEnum->GetNameStringByValue(Base->GetShadingModels().GetFirstShadingModel()) : TEXT("-"));
+			}
+			++Count;
+			if (bSwap && Plain)
+			{
+				for (int32 Slot = 0; Slot < Component->GetNumMaterials(); ++Slot)
+				{
+					Component->SetMaterial(Slot, Plain);
+				}
+			}
+		}
+		UE_LOG(LogTemp, Display, TEXT("Airport.LightProbe: %d meshes within 150 m of %s%s"), Count, *Target.ToString(), bSwap ? TEXT(", given the plain material") : TEXT(""));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs LightProbeCommand(
+		TEXT("Airport.LightProbe"),
+		TEXT("Play: the meshes around the point the camera looks at, how they are lit; 'swap' gives them the plain engine material"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&LightProbe));
 
 	/** Play: "Airport.Pick 0.25 0.6" - what is at that point of the picture (0..1 across, 0..1 down), with its materials. */
 	void Pick(const TArray<FString>& Args, UWorld* World)
@@ -3495,6 +4046,52 @@ namespace
 			}
 #endif
 		}
+		// "Airport.Shots 30 model <prefix> <mesh path part>": the map's aircraft whose meshes have that path part (hidden ones
+		// too: a traffic stand-in then shows in their place), one aircraft = all parts within 40 m, 4 views around each
+		else if (Mode == TEXT("model") && Args.Num() > 3)
+		{
+			// Several path parts with | between them; a fifth argument scales the distance (0.5 = twice as close)
+			TArray<FString> Parts;
+			Args[3].ParseIntoArray(Parts, TEXT("|"));
+			const double Closer = Args.Num() > 4 ? FMath::Max(FCString::Atod(*Args[4]), 0.1) : 1.0;
+			TArray<FBox> Found;
+			for (TActorIterator<AActor> It(World); It; ++It)
+			{
+				TInlineComponentArray<UMeshComponent*> Meshes(*It);
+				for (const UMeshComponent* Mesh : Meshes)
+				{
+					const UStaticMeshComponent* StaticMesh = Cast<UStaticMeshComponent>(Mesh);
+					const USkinnedMeshComponent* SkinnedMesh = Cast<USkinnedMeshComponent>(Mesh);
+					const UObject* Asset = StaticMesh ? static_cast<const UObject*>(StaticMesh->GetStaticMesh())
+						: SkinnedMesh ? static_cast<const UObject*>(SkinnedMesh->GetSkinnedAsset()) : nullptr;
+					const FString Path = Asset ? Asset->GetPathName() : FString();
+					if (!Parts.ContainsByPredicate([&Path](const FString& Part) { return Path.Contains(Part); }))
+					{
+						continue;
+					}
+					const FBox Box = Mesh->Bounds.GetBox();
+					FBox* Near = Found.FindByPredicate([&Box](const FBox& Other) { return FVector::Dist2D(Other.GetCenter(), Box.GetCenter()) < 4000.0; });
+					if (Near)
+					{
+						*Near += Box;
+					}
+					else
+					{
+						Found.Add(Box);
+					}
+				}
+			}
+			for (int32 Index = 0; Index < Found.Num() && Views.Num() < 12; ++Index)
+			{
+				const FVector Target = Found[Index].GetCenter();
+				const double Reach = FMath::Clamp(Found[Index].GetExtent().Size2D() * 1.5, 2500.0, 9000.0) * Closer;
+				for (const FVector Side : { FVector(0.8, 0.6, 0.25), FVector(-0.8, -0.6, 0.2), FVector(0.1, 1.0, 0.12), FVector(-0.6, 0.8, 0.5) })
+				{
+					Views.Add({ Target + Side * Reach, Target });
+				}
+				UE_LOG(LogTemp, Display, TEXT("Airport.Shots: model %d at %s, %.0f m"), Index, *Target.ToString(), Found[Index].GetSize().Size2D() / 100.0);
+			}
+		}
 		// "Airport.Shots 60 planes": only close-ups of parked aircraft, from both sides
 		else if (Mode == TEXT("planes") || Mode == TEXT("hq"))
 		{
@@ -3529,6 +4126,77 @@ namespace
 		const FString Folder = FPaths::ProjectSavedDir() / TEXT("Screenshots/Airport") / Prefix;
 		GEngine->Exec(World, TEXT("DisableAllScreenMessages"));
 
+		// "Airport.Shots 40 planes <prefix> vary": views 2, 5 and 6 once per lighting variant (v<view>_<variant>.png), to
+		// see what lights the shadows: the sky light reached the aircraft but not the map (16-11-2026)
+		if (Args.Num() > 3 && Args.Last().StartsWith(TEXT("vary")))
+		{
+			TArray<int32> Picked;
+			for (const int32 Index : { 2, 5, 6 })
+			{
+				if (Views.IsValidIndex(Index))
+				{
+					Picked.Add(Index);
+				}
+			}
+			// "vary2": with the plain engine material on the meshes around (from the third shot on, it stays)
+			// "vary5": less haze at the horizon (Mie scale, aerial perspective scale)
+			const TArray<FString> Variants = Args.Last() == TEXT("vary5")
+				? TArray<FString>{ TEXT("Airport.SkyInfo"), TEXT("Airport.SkyInfo atmo 0.002 0.7"), TEXT("Airport.SkyInfo atmo 0.001 0.5"), TEXT("Airport.SkyInfo atmo 0.0005 0.35") }
+				// "vary4": test materials made on the spot (grey; the photo through a virtual texture; grey with the facade gloss)
+				: Args.Last() == TEXT("vary4")
+				? TArray<FString>{ TEXT("Airport.LightProbe swapnew const"), TEXT("Airport.SkyInfo intensity 10"), TEXT("Airport.LightProbe swapnew vt"),
+					TEXT("Airport.SkyInfo intensity 10"), TEXT("Airport.LightProbe swapnew normal"), TEXT("Airport.SkyInfo intensity 10") }
+				// "vary3": the same with the bare M_TerrainVT (no imported instance)
+				: Args.Last() == TEXT("vary3")
+				? TArray<FString>{ TEXT(""), TEXT("Airport.SkyInfo intensity 10"), TEXT("Airport.LightProbe swap /Game/EHAM/Materials/M_TerrainVT.M_TerrainVT"), TEXT("Airport.SkyInfo intensity 10"),
+					TEXT("ShowFlag.SkyLighting 0") }
+				: Args.Last() == TEXT("vary2")
+				? TArray<FString>{ TEXT("Airport.LightProbe"), TEXT("Airport.SkyInfo intensity 10"), TEXT("Airport.LightProbe swap"), TEXT("Airport.SkyInfo intensity 10") }
+				: TArray<FString>{ TEXT(""), TEXT("Airport.SkyInfo intensity 10"), TEXT("r.Nanite 0"), TEXT("r.Nanite 0;Airport.SkyInfo intensity 10"),
+					TEXT("ShowFlag.SkyLighting 0"), TEXT("Airport.SkyInfo gi 0;Airport.SkyInfo intensity 10") };
+			const FString Reset = TEXT("r.Nanite 1;ShowFlag.SkyLighting 1;Airport.SkyInfo intensity 2;Airport.SkyInfo gi 2");
+			TSharedRef<int32> VaryStep = MakeShared<int32>(0);
+			FTimerHandle VaryHandle;
+			World->GetTimerManager().SetTimer(VaryHandle, FTimerDelegate::CreateLambda([World, Views, Picked, Variants, Reset, Folder, VaryStep]()
+			{
+				const int32 Combo = *VaryStep / 2;
+				if (Combo >= Picked.Num() * Variants.Num())
+				{
+					UE_LOG(LogTemp, Display, TEXT("Airport.Shots: done"));
+					FPlatformMisc::RequestExit(false);
+					return;
+				}
+				const int32 ViewIndex = Picked[Combo / Variants.Num()];
+				const int32 Variant = Combo % Variants.Num();
+				if (*VaryStep % 2 == 0)
+				{
+					APlayerController* Controller = World->GetFirstPlayerController();
+					if (APawn* Pawn = Controller ? Controller->GetPawn() : nullptr)
+					{
+						Pawn->SetActorLocation(Views[ViewIndex].Location);
+					}
+					if (Controller)
+					{
+						Controller->SetControlRotation((Views[ViewIndex].Target - Views[ViewIndex].Location).Rotation());
+					}
+					TArray<FString> Commands;
+					(Reset + TEXT(";") + Variants[Variant]).ParseIntoArray(Commands, TEXT(";"));
+					for (const FString& Command : Commands)
+					{
+						GEngine->Exec(World, *Command);
+					}
+				}
+				else
+				{
+					const FString File = Folder / FString::Printf(TEXT("v%d_%d.png"), ViewIndex, Variant);
+					FScreenshotRequest::RequestScreenshot(File, false, false);
+					UE_LOG(LogTemp, Display, TEXT("Airport.Shots: %s (%s)"), *File, *Variants[Variant]);
+				}
+				++(*VaryStep);
+			}), Args.Last() == TEXT("vary4") ? 20.f : 5.f, true, FirstDelay);   // new materials compile first
+			return;
+		}
+
 		// One timer step per view: move camera, wait, shoot
 		TSharedRef<int32> Step = MakeShared<int32>(0);
 		FTimerHandle Handle;
@@ -3554,7 +4222,8 @@ namespace
 			{
 				if (APawn* Pawn = Controller->GetPawn())
 				{
-					Pawn->SetActorLocation(View.Location);
+					// The VR pawn's camera follows the pawn itself, not only the control rotation
+					Pawn->SetActorLocationAndRotation(View.Location, (View.Target - View.Location).Rotation(), false, nullptr, ETeleportType::TeleportPhysics);
 				}
 				Controller->SetControlRotation((View.Target - View.Location).Rotation());
 			}
@@ -3710,6 +4379,187 @@ namespace
 		TEXT("Airport.ListGround"),
 		TEXT("Log materials used on flat ground meshes"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&ListGroundMaterials));
+
+	/**
+	 * "Airport.Fleet <seconds first> <prefix> [ICAO]" (Play): every fleet model (each aircraft type and each airline livery)
+	 * in turn on an empty taxiway, nose along +X, with 4 views: whole aircraft, engine from the front, from the side and
+	 * from behind (see-through engines and wings, 17-11-2026). Also logs every material of the models.
+	 */
+	void FleetShots(const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World || !World->IsGameWorld() || !World->GetFirstPlayerController())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Airport.Fleet: run this during Play."));
+			return;
+		}
+		struct FModel { FString Name; UStaticMesh* Mesh; FTransform Offset; float Length; float Span; };
+		TArray<FModel> Models;
+		TArray<FAssetData> Assets;
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get().GetAssetsByClass(UAircraftTypeData::StaticClass()->GetClassPathName(), Assets);
+		Assets.Sort([](const FAssetData& A, const FAssetData& B) { return A.AssetName.LexicalLess(B.AssetName); });
+		const UEnum* BlendEnum = StaticEnum<EBlendMode>();
+		for (const FAssetData& Asset : Assets)
+		{
+			const UAircraftTypeData* Type = Cast<UAircraftTypeData>(Asset.GetAsset());
+			if (!Type || (Args.Num() > 2 && Type->ICAOType.ToString() != Args[2]))
+			{
+				continue;
+			}
+			auto Add = [&](const FString& Airline, const TSoftObjectPtr<UStaticMesh>& Soft, const FTransform& Offset)
+			{
+				UStaticMesh* Mesh = Soft.LoadSynchronous();
+				if (!Mesh)
+				{
+					return;
+				}
+				Models.Add({ Type->ICAOType.ToString() + TEXT("_") + Airline, Mesh, Offset, Type->LengthM * 100.f, Type->WingspanM * 100.f });
+				for (int32 Slot = 0; Slot < Mesh->GetStaticMaterials().Num(); ++Slot)
+				{
+					const UMaterialInterface* Material = Mesh->GetStaticMaterials()[Slot].MaterialInterface;
+					const UMaterialInstance* Instance = Cast<UMaterialInstance>(Material);
+					UE_LOG(LogTemp, Display, TEXT("Airport.Fleet: %s slot %d %s < %s blend=%s twosided=%d"), *Models.Last().Name, Slot,
+						Material ? *Material->GetName() : TEXT("none"), Instance && Instance->Parent ? *Instance->Parent->GetName() : TEXT("-"),
+						Material ? *BlendEnum->GetNameStringByValue(Material->GetBlendMode()) : TEXT("-"), Material && Material->IsTwoSided() ? 1 : 0);
+				}
+			};
+			Add(TEXT("own"), Type->Mesh, Type->MeshOffset);
+			for (const FAircraftLivery& Livery : Type->Liveries)
+			{
+				Add(Livery.Airline, Livery.Mesh, Livery.MeshOffset);
+			}
+		}
+		UE_LOG(LogTemp, Display, TEXT("Airport.Fleet: %d models"), Models.Num());
+
+		// An empty taxiway west of the airport, on the ground if it has collision
+		FVector Spot(-327590.0, -259745.0, 0.0);
+		FHitResult Hit;
+		if (World->LineTraceSingleByChannel(Hit, Spot + FVector(0, 0, 50000.0), Spot - FVector(0, 0, 50000.0), ECC_Visibility))
+		{
+			Spot.Z = Hit.ImpactPoint.Z;
+		}
+		AStaticMeshActor* Shown = World->SpawnActor<AStaticMeshActor>();
+		Shown->SetMobility(EComponentMobility::Movable);
+
+		const FString Folder = FPaths::ProjectSavedDir() / TEXT("Screenshots/Airport") / (Args.Num() > 1 ? Args[1] : FString(TEXT("fleet")));
+		GEngine->Exec(World, TEXT("DisableAllScreenMessages"));
+		TSharedRef<int32> Step = MakeShared<int32>(0);
+		FTimerHandle Handle;
+		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([World, Models, Spot, Shown, Folder, Step]()
+		{
+			const int32 ViewsPerModel = 4;
+			const int32 View = *Step / 2;
+			if (View >= Models.Num() * ViewsPerModel)
+			{
+				UE_LOG(LogTemp, Display, TEXT("Airport.Fleet: done"));
+				FPlatformMisc::RequestExit(false);
+				return;
+			}
+			const FModel& Model = Models[View / ViewsPerModel];
+			const int32 Kind = View % ViewsPerModel;
+			if (*Step % 2 == 0)
+			{
+				if (Kind == 0)
+				{
+					Shown->GetStaticMeshComponent()->SetStaticMesh(Model.Mesh);
+					Shown->SetActorTransform(Model.Offset * FTransform(Spot));
+				}
+				// In the aircraft's frame: nose +X, main gear at the origin; the left engine about here
+				const double L = Model.Length;
+				const FVector Engine(0.1 * L, -0.17 * Model.Span, 0.045 * L + 50.0);
+				FVector Eye, Target = Engine;
+				switch (Kind)
+				{
+				case 0: Eye = FVector(0.9 * L, -0.8 * L, 0.25 * L); Target = FVector(0.1 * L, 0.0, 300.0); break;
+				case 1: Eye = Engine + FVector(0.25 * L, -0.15 * L, -0.01 * L); break;
+				case 2: Eye = Engine + FVector(-0.03 * L, -0.3 * L, 0.04 * L); break;
+				default: Eye = Engine + FVector(-0.3 * L, -0.12 * L, 0.02 * L); break;
+				}
+				APlayerController* Controller = World->GetFirstPlayerController();
+				const FRotator Look = (Target - Eye).Rotation();
+				if (APawn* Pawn = Controller->GetPawn())
+				{
+					Pawn->SetActorLocationAndRotation(Spot + Eye, Look, false, nullptr, ETeleportType::TeleportPhysics);
+				}
+				Controller->SetControlRotation(Look);
+			}
+			else
+			{
+				const FString File = Folder / FString::Printf(TEXT("%s_v%d.png"), *Model.Name, Kind);
+				FScreenshotRequest::RequestScreenshot(File, false, false);
+				UE_LOG(LogTemp, Display, TEXT("Airport.Fleet: %s"), *File);
+			}
+			++(*Step);
+		}), 2.5f, true, Args.Num() > 0 ? FCString::Atof(*Args[0]) : 20.f);
+	}
+
+	/**
+	 * "Airport.Chase <callsign> <prefix> <shots> <seconds between> [distance m]" (Play): a camera that keeps up with one
+	 * aircraft, from behind and to the left a little above it, and saves a picture every few seconds, then quits. To see
+	 * a landing, a sidestep and its bank (17-11-2026). Logs where the aircraft is and how it banks.
+	 */
+	void Chase(const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World || !World->IsGameWorld() || !World->GetFirstPlayerController() || Args.Num() < 4)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Airport.Chase <callsign> <prefix> <shots> <seconds between> [distance m] (Play)"));
+			return;
+		}
+		const FName Callsign(*Args[0]);
+		const FString Folder = FPaths::ProjectSavedDir() / TEXT("Screenshots/Airport") / Args[1];
+		const int32 Shots = FCString::Atoi(*Args[2]);
+		const double Distance = (Args.Num() > 4 ? FCString::Atod(*Args[4]) : 120.0) * 100.0;
+		GEngine->Exec(World, TEXT("DisableAllScreenMessages"));
+		TSharedRef<int32> Shot = MakeShared<int32>(0);
+		FTimerHandle Handle;
+		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([World, Callsign, Folder, Shots, Distance, Shot]()
+		{
+			AActor* Target = nullptr;
+			for (TActorIterator<AActor> It(World); It && !Target; ++It)
+			{
+				if (It->Implements<UAircraftInfo>() && IAircraftInfo::Execute_GetCallsign(*It) == Callsign)
+				{
+					Target = *It;
+				}
+			}
+			if (*Shot >= Shots)
+			{
+				UE_LOG(LogTemp, Display, TEXT("Airport.Chase: done"));
+				FPlatformMisc::RequestExit(false);
+				return;
+			}
+			if (!Target)
+			{
+				UE_LOG(LogTemp, Display, TEXT("Airport.Chase: %s not there (yet)"), *Callsign.ToString());
+				return;
+			}
+			const FRotator Rotation = Target->GetActorRotation();
+			const FVector Aim = Target->GetActorLocation() + FVector(0.0, 0.0, 400.0);
+			const FVector From = Aim + FRotator(0.0, Rotation.Yaw, 0.0).RotateVector(FVector(-0.75, -0.65, 0.0)) * Distance + FVector(0.0, 0.0, Distance * 0.2);
+			const FRotator Look = (Aim - From).Rotation();
+			APlayerController* Controller = World->GetFirstPlayerController();
+			if (APawn* Pawn = Controller->GetPawn())
+			{
+				Pawn->SetActorLocationAndRotation(From, Look, false, nullptr, ETeleportType::TeleportPhysics);
+			}
+			Controller->SetControlRotation(Look);
+			const FString File = Folder / FString::Printf(TEXT("chase_%02d.png"), *Shot);
+			FScreenshotRequest::RequestScreenshot(File, false, false);
+			UE_LOG(LogTemp, Display, TEXT("Airport.Chase: %s at X=%.0f Y=%.0f m, %.0f m up, heading %.0f, bank %.1f, pitch %.1f: %s"), *Callsign.ToString(),
+				Aim.X / 100.0, Aim.Y / 100.0, (Aim.Z - 400.0) / 100.0, Rotation.Yaw, Rotation.Roll, Rotation.Pitch,
+				*IAircraftInfo::Execute_GetStatusText(Target).ToString());
+			++(*Shot);
+		}), FMath::Max(FCString::Atof(*Args[3]), 0.2f), true, 1.f);
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs ChaseCommand(
+		TEXT("Airport.Chase"),
+		TEXT("Play: follow one aircraft with the camera and save pictures. Usage: Airport.Chase <callsign> <prefix> <shots> <seconds between> [distance m]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Chase));
+
+	FAutoConsoleCommandWithWorldAndArgs FleetCommand(
+		TEXT("Airport.Fleet"),
+		TEXT("Play: every fleet model with close-ups of its engine. Usage: Airport.Fleet <seconds first> <prefix> [ICAO]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&FleetShots));
 
 	FAutoConsoleCommandWithWorldAndArgs ShotsCommand(
 		TEXT("Airport.Shots"),

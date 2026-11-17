@@ -315,6 +315,36 @@ namespace ATCCommands
 	}
 
 	/**
+	 * ATC.Land <arrival Route.*> [approach Route.* | -] [type] [callsign]: one landing on the route's runway, with an
+	 * approach route a late sidestep from that route's final. Example: ATC.Land Route.EHAM.B15.Arr22 Route.EHAM.B15.Arr27 E190 KLC11
+	 */
+	void Land(const TArray<FString>& Args, UWorld* World)
+	{
+		UAircraftSpawnSubsystem* Spawner = World ? World->GetSubsystem<UAircraftSpawnSubsystem>() : nullptr;
+		if (!Spawner || Args.Num() < 1)
+		{
+			UE_LOG(LogATC, Warning, TEXT("ATC.Land <arrival Route.*> [approach Route.* | -] [type] [callsign]"));
+			return;
+		}
+		FAircraftSpawnRequest Request;
+		Request.RouteTag = Tag(Args[0]);
+		Request.ApproachRouteTag = Args.Num() > 1 && Args[1] != TEXT("-") ? Tag(Args[1]) : FGameplayTag();
+		if (Args.Num() > 2)
+		{
+			Request.Type = LoadByName<UAircraftTypeData>(Args[2], TEXT("/Game/Aircraft/") + Args[2], TEXT("DA_AircraftType_"));
+		}
+		if (Args.Num() > 3)
+		{
+			Request.Callsign = FName(*Args[3]);
+		}
+		Request.bLand = true;
+		Request.InitialSpeedKt = 30.f;
+		Request.bRemoveAtRouteEnd = false;
+		const FName Callsign = Spawner->RequestSpawn(Request);
+		UE_LOG(LogATC, Display, TEXT("ATC.Land: %s"), Callsign.IsNone() ? TEXT("failed") : *Callsign.ToString());
+	}
+
+	/**
 	 * ATC.Spawn <Spawn.*|Route.*> [type] [callsign] [start m] [end stop]: one aircraft through the spawn manager.
 	 * "-" keeps the default (spawn point or traffic mix). Example: ATC.Spawn Route.EHAM.G4.Rwy24 A320 EZY12AB 900
 	 */
@@ -742,6 +772,8 @@ namespace ATCCommands
 	FAutoConsoleCommandWithWorldAndArgs TrafficDirectorCommand(TEXT("ATC.TrafficDirector"),
 		TEXT("ATC.TrafficDirector <start|stop|status|auto 0/1|rate N>: the map's traffic program (arrivals, turnarounds, departures)"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TrafficDirector));
+	FAutoConsoleCommandWithWorldAndArgs LandCommand(TEXT("ATC.Land"), TEXT("ATC.Land <arrival Route.*> [approach Route.* | -] [type] [callsign]: a landing, with an approach route a late sidestep"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Land));
 	FAutoConsoleCommandWithWorldAndArgs SpawnCommand(TEXT("ATC.Spawn"), TEXT("ATC.Spawn <Spawn.*|Route.*> [type] [callsign] [start m] [end stop]: spawn an aircraft on a route"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Spawn));
 	FAutoConsoleCommandWithWorldAndArgs TrafficCommand(TEXT("ATC.Traffic"), TEXT("List every aircraft with state, route and place"),

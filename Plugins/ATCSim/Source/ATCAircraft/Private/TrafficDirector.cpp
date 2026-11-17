@@ -380,6 +380,18 @@ void ATrafficDirector::SpawnArrival()
 	Request.Callsign = Spawner->MakeCallsign(Airlines);
 	Request.AircraftClass = TrafficMix->AircraftClass.LoadSynchronous();
 	Request.RouteTag = Gates[Gate].ArrivalRoute;
+	// Now and then a small one flies the final and sidesteps late to the other runway (Schiphol: 27 -> Oostbaan 22),
+	// when nobody stands in the way of that arrival either
+	if (bVisibleLandings && Gates[Gate].SidestepArrivalRoute.IsValid() && Type && Type->AerodromeCode <= EAerodromeCode::C && Random.FRand() < SidestepShare)
+	{
+		TArray<FTransform> Poses;
+		AddPoses(Traffic->FindRoute(Gates[Gate].SidestepArrivalRoute), -60000.f, BIG_NUMBER, Type, false, Poses);
+		if (Traffic->FindRoute(Gates[Gate].SidestepArrivalRoute) && !FindInTheWay(nullptr, Type, Poses))
+		{
+			Request.ApproachRouteTag = Gates[Gate].ArrivalRoute;
+			Request.RouteTag = Gates[Gate].SidestepArrivalRoute;
+		}
+	}
 	Request.StartDistanceM = 0.f;
 	Request.InitialSpeedKt = ArrivalSpeedKt;
 	Request.bLand = bVisibleLandings;
@@ -391,7 +403,7 @@ void ATrafficDirector::SpawnArrival()
 		return;
 	}
 	// The landing runway (Route.EHAM.G7.Arr36C -> 36C) stays closed for crossings until the rollout is done
-	const FString RouteName = Gates[Gate].ArrivalRoute.ToString();
+	const FString RouteName = Request.RouteTag.ToString();
 	const int32 Arr = RouteName.Find(TEXT(".Arr"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
 	if (bVisibleLandings && Arr != INDEX_NONE)
 	{
@@ -499,7 +511,7 @@ void ATrafficDirector::HandleAircraftEvent(AActor* Actor, FName Callsign, FGamep
 
 	// Arrived at the end of the arrival route (or the parallel lane it was given): on the stand, the turnaround starts
 	if (EventTag == TAG_ATC_Event_Taxi_Arrived && Gate && Aircraft && Aircraft->TaxiController->PlannedRoute
-		&& Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].ArrivalRoute)
+		&& (Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].ArrivalRoute || Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].SidestepArrivalRoute))
 	{
 		FTimerHandle Handle;
 		GetWorldTimerManager().SetTimer(Handle, FTimerDelegate::CreateWeakLambda(this, [this, Callsign]() { Depart(Callsign); }),

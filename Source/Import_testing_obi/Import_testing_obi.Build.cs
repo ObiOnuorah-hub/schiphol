@@ -10,7 +10,7 @@ public class Import_testing_obi : ModuleRules
 	
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore" });
 
-		PrivateDependencyModuleNames.AddRange(new string[] {  });
+		PrivateDependencyModuleNames.AddRange(new string[] { "ATCAircraft", "AssetRegistry" });
 
 		if (Target.bBuildEditor)
 		{

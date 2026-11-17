@@ -43,8 +43,10 @@ public:
 	 * Final approach on a 3 degree glide path, flare, touchdown and rollout on the runway behind the start of Route (an
 	 * arrival route that starts on the runway). At StartCm it joins the route at RolloutEndSpeedKt and taxis to EndCm.
 	 * On final it asks the taxi network for its runway exit; not reserved 1.5 km before touchdown: it goes around.
+	 * ApproachRoute: first fly the final of that route's runway, then sidestep in a banked turn onto Route's runway short
+	 * of its threshold (Schiphol: 27 final -> Oostbaan 22).
 	 */
-	void StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, float RolloutEndSpeedKt);
+	void StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, float RolloutEndSpeedKt, const ATaxiRoute* ApproachRoute = nullptr);
 
 	UFUNCTION(BlueprintPure, Category = "ATC|Aircraft")
 	bool IsLanding() const { return bLanding; }
@@ -212,4 +214,24 @@ private:
 	float RolloutCm = 0.f;
 	float RolloutDecelCms2 = 0.f;
 	float RolloutEndSpeedCms = 0.f;
+	/** Bank angle (roll), right wing down positive: follows the turn (tan = v^2 / (g R)) at a few degrees a second. */
+	float RollDeg = 0.f;
+
+	/**
+	 * A sidestep in the air, measured back from the touchdown point: straight on the landing runway's final (BackStraight),
+	 * an arc of SidestepRadius (BackArc long, turning TurnSign: +1 right), then the other runway's final outwards.
+	 */
+	bool bSidestep = false;
+	FVector2D SidestepArcStart = FVector2D::ZeroVector;
+	FVector2D SidestepCenter = FVector2D::ZeroVector;
+	FVector2D FirstFinal = FVector2D::UnitX();
+	float SidestepRadius = 0.f;
+	float SidestepTurnRad = 0.f;
+	float SidestepTurnSign = 1.f;
+	float BackStraight = 0.f;
+	float BackArc = 0.f;
+	/** Ground point, heading and signed curvature (1/cm, + right) of the sidestep approach this far before touchdown. */
+	void SidestepAt(float ToGoCm, FVector2D& OutPoint, FVector2D& OutHeading, float& OutCurvature) const;
+	/** Builds the sidestep from the approach route's final to the landing direction; false: no sensible turn. */
+	bool PlanSidestep(const ATaxiRoute* ApproachRoute);
 };

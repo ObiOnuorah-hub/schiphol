@@ -106,5 +106,8 @@ private:
 	FVector GetPointAt(float AtDistance) const;
 
 	FQuat CurrentRotation = FQuat::Identity;
+	/** Body roll on the gear in a turn (outwards, about a degree at a tenth of g) and the yaw it was worked out from. */
+	float LeanDeg = 0.f;
+	float LastYawDeg = 0.f;
 	bool bEndReported = false;
 };

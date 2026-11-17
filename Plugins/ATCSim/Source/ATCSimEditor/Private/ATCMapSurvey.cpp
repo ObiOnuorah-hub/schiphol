@@ -278,6 +278,128 @@ namespace ATCMapSurvey
 		UE_LOG(LogATC, Display, TEXT("ATC map network: %d bridges over gaps in the paint"), Count);
 	}
 
+	int32 FNetwork::AddStraightGaps(float MaxGapCm, TFunctionRef<bool(const FVector&, const FVector&)> OnTaxiway)
+	{
+		if (bStraightGapsAdded)
+		{
+			return 0;
+		}
+		bStraightGapsAdded = true;
+		auto Key = [](int32 A, int32 B) { return (uint64(FMath::Min(A, B)) << 32) | uint64(FMath::Max(A, B)); };
+		const float AlongCos = FMath::Cos(FMath::DegreesToRadians(8.f));    // the gap goes on in the line's direction
+		const float SameCos = FMath::Cos(FMath::DegreesToRadians(15.f));    // and the line beyond runs the same way
+		const TArray<TArray<int32>> Original = Links;
+		int32 Count = 0;
+		for (int32 Node = 0; Node < Nodes.Num(); ++Node)
+		{
+			if (Members[Part[Node]].Num() < 25 || Original[Node].Num() == 0)
+			{
+				continue;
+			}
+			// A line end: all neighbours on one side
+			const FVector2D Center(Nodes[Node]);
+			const FVector2D Along = LineDirection(Node);
+			int32 Ahead = 0, Behind = 0;
+			FVector2D Mean = FVector2D::ZeroVector;
+			for (int32 Other : Original[Node])
+			{
+				const double Projection = (FVector2D(Nodes[Other]) - Center) | Along;
+				(Projection > 0.0 ? Ahead : Behind) += FMath::Abs(Projection) > 10.0 ? 1 : 0;
+				Mean += FVector2D(Nodes[Other]) - Center;
+			}
+			if ((Ahead > 0 && Behind > 0) || Mean.IsNearlyZero())
+			{
+				continue;
+			}
+			const FVector2D Out = -Mean.GetSafeNormal();
+			if (FMath::Abs(Out | Along) < AlongCos)
+			{
+				continue;   // a blob, not the end of a line
+			}
+			const FVector2D Forward = (Out | Along) > 0.0 ? Along : -Along;
+
+			// The nearest node ahead, on a line that runs the same way. Paint not connected to this line at all (the
+			// Oostbaan's taxiways, cut off from the terminal by long unpainted stretches) may lie up to 2.8 times as far
+			// Searched along the line ahead, a few metres either side of it, nearest first
+			int32 Best = INDEX_NONE;
+			double BestDistance = MaxGapCm * 2.8;
+			for (double Ahead2 = 300.0; Ahead2 < BestDistance + CellCm && Best == INDEX_NONE; Ahead2 += CellCm)
+			{
+				const FIntPoint Cell = CellOf(FVector(Center + Forward * Ahead2, 0.0));
+				for (int32 DX = -2; DX <= 2; ++DX)
+				{
+					for (int32 DY = -2; DY <= 2; ++DY)
+					{
+						const TArray<int32>* Others = Grid.Find(Cell + FIntPoint(DX, DY));
+						for (int32 Index = 0; Others && Index < Others->Num(); ++Index)
+						{
+							const int32 Other = (*Others)[Index];
+							const FVector2D D = FVector2D(Nodes[Other]) - Center;
+							const double Distance = D.Size();
+							const double Reach = Part[Other] == Part[Node] ? MaxGapCm : MaxGapCm * 2.8;
+							if (Distance < BestDistance && Distance < Reach && Distance > 300.0 && (D / Distance | Forward) > AlongCos
+								&& FMath::Abs(LineDirection(Other) | Forward) > SameCos)
+							{
+								BestDistance = Distance;
+								Best = Other;
+							}
+						}
+					}
+				}
+			}
+			if (Best == INDEX_NONE || !OnTaxiway(Nodes[Node], Nodes[Best]))
+			{
+				continue;
+			}
+
+			// Only a real gap: no painted way from here to there shorter than 1.5 times the gap plus 20 m
+			const double Limit = 1.5 * BestDistance + 2000.0;
+			TMap<int32, double> Reached;
+			TArray<TPair<double, int32>> Heap;
+			Reached.Add(Node, 0.0);
+			Heap.HeapPush({ 0.0, Node }, [](const TPair<double, int32>& A, const TPair<double, int32>& B) { return A.Key < B.Key; });
+			bool bPainted = false;
+			while (Heap.Num() > 0 && !bPainted)
+			{
+				TPair<double, int32> Current;
+				Heap.HeapPop(Current, [](const TPair<double, int32>& A, const TPair<double, int32>& B) { return A.Key < B.Key; });
+				if (Current.Key > Reached[Current.Value])
+				{
+					continue;
+				}
+				for (int32 Next : Original[Current.Value])
+				{
+					const double Cost = Current.Key + FVector::Dist2D(Nodes[Current.Value], Nodes[Next]);
+					if (Next == Best)
+					{
+						bPainted |= Cost <= Limit;
+					}
+					const double* Known = Reached.Find(Next);
+					if (Cost <= Limit && (!Known || Cost < *Known))
+					{
+						Reached.Add(Next, Cost);
+						Heap.HeapPush({ Cost, Next }, [](const TPair<double, int32>& A, const TPair<double, int32>& B) { return A.Key < B.Key; });
+					}
+				}
+			}
+			if (bPainted)
+			{
+				continue;
+			}
+			Links[Node].AddUnique(Best);
+			Links[Best].AddUnique(Node);
+			StraightLinks.Add(Key(Node, Best));
+			UE_LOG(LogATC, Display, TEXT("ATC map network: straight on over a %.0f m gap from %.0f %.0f to %.0f %.0f (m)"), BestDistance / 100.0,
+				Nodes[Node].X / 100.0, Nodes[Node].Y / 100.0, Nodes[Best].X / 100.0, Nodes[Best].Y / 100.0);
+			++Count;
+		}
+		ComputeParts();
+		PartnerSide.Reset();
+		CostCache.Init(-1.f, Nodes.Num());
+		UE_LOG(LogATC, Display, TEXT("ATC map network: %d straight-on links over gaps at junctions"), Count);
+		return Count;
+	}
+
 	void FNetwork::ComputeParts()
 	{
 		// Connected parts (flood fill); the largest is the taxiway system
@@ -499,7 +621,9 @@ namespace ATCMapSurvey
 			// directions takes different taxiways instead of meeting head-on
 			const FVector2D Way = FVector2D(Nodes[To] - Nodes[From]);
 			const bool bWrongTwin = !PartnerSide[To].IsZero() && (PartnerSide[To] | FVector2D(-Way.Y, Way.X)) > 0.0;
-			return Step * 0.5f * (LineCost(From) + LineCost(To)) * (Step > CellCm ? 1.5f : 1.f) * (bOffNetwork ? 3.f : 1.f) * (NodeCost ? (*NodeCost)[To] : 1.f)
+			// A bridge over unpainted ground costs half as much again; straight on over a junction gap costs like paint
+			const bool bStraight = Step > CellCm && StraightLinks.Contains((uint64(FMath::Min(From, To)) << 32) | uint64(FMath::Max(From, To)));
+			return Step * 0.5f * (LineCost(From) + LineCost(To)) * (Step > CellCm && !bStraight ? 1.5f : 1.f) * (bOffNetwork ? 3.f : 1.f) * (NodeCost ? (*NodeCost)[To] : 1.f)
 				* (bWrongTwin ? 2.f : 1.f);
 		};
 		auto Heuristic = [&](int32 Node) { return static_cast<float>(FVector::Dist2D(Nodes[Node], Nodes[Goal])); };
@@ -709,7 +833,7 @@ namespace ATCMapSurvey
 		return Result;
 	}
 
-	TArray<FVector> SmoothBends(const TArray<FVector>& Points, float MinRadiusCm, bool* bOutReached)
+	TArray<FVector> SmoothBends(const TArray<FVector>& Points, float MinRadiusCm, bool* bOutReached, float KeepEndCm)
 	{
 		// Every metre along the line
 		const float StepCm = 100.f;
@@ -754,6 +878,8 @@ namespace ATCMapSurvey
 		{
 			return Points;
 		}
+		// The last point that may move (one sample per metre, the kept stretch at the end stays exactly where it is)
+		const int32 LastFree = FMath::Min(Num - 3, Num - 2 - FMath::CeilToInt(KeepEndCm / StepCm));
 		auto Radius = [&P, K](int32 I)
 		{
 			const FVector2D A(P[I - K]), B(P[I]), C(P[I + K]);
@@ -796,7 +922,7 @@ namespace ATCMapSurvey
 							continue;
 						}
 						// The two end points stay where they are
-						for (int32 J = FMath::Max(2, I - K); J <= FMath::Min(Num - 3, I + K); ++J)
+						for (int32 J = FMath::Max(2, I - K); J <= FMath::Min(LastFree, I + K); ++J)
 						{
 							P[J] = FMath::Lerp(P[J], (P[J - 1] + P[J + 1]) * 0.5, 0.5);
 						}

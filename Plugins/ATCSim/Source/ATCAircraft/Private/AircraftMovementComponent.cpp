@@ -122,5 +122,21 @@ void UAircraftMovementComponent::UpdateTransform(float DeltaTime, bool bSnap)
 
 	const FQuat TargetRotation = Heading.Rotation().Quaternion();
 	CurrentRotation = (bSnap || RotationSmoothing <= 0.f) ? TargetRotation : FMath::QInterpTo(CurrentRotation, TargetRotation, DeltaTime, RotationSmoothing);
-	GetOwner()->SetActorLocationAndRotation(MainGear, CurrentRotation);
+
+	// In a turn the body rolls a little outwards on its gear: lateral acceleration (forward speed x yaw rate) over g,
+	// times 10 degrees, at most 2; it settles in about half a second
+	FRotator Rotation = CurrentRotation.Rotator();
+	if (!bSnap && DeltaTime > KINDA_SMALL_NUMBER)
+	{
+		const float YawRate = FMath::DegreesToRadians(FRotator::NormalizeAxis(Rotation.Yaw - LastYawDeg)) / DeltaTime;
+		const float ForwardSpeed = bNoseAhead ? Speed : -Speed;
+		LeanDeg = FMath::FInterpTo(LeanDeg, FMath::Clamp(-ForwardSpeed * YawRate / 981.f * 10.f, -2.f, 2.f), DeltaTime, 2.f);
+	}
+	else
+	{
+		LeanDeg = 0.f;
+	}
+	LastYawDeg = Rotation.Yaw;
+	Rotation.Roll = LeanDeg;
+	GetOwner()->SetActorLocationAndRotation(MainGear, Rotation);
 }

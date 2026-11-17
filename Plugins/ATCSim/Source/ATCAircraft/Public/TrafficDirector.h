@@ -24,6 +24,13 @@ struct ATCAIRCRAFT_API FTrafficGate
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	FGameplayTag ArrivalRoute;
 
+	/**
+	 * From another runway's exit to the stand, for a late sidestep: the aircraft flies the final of ArrivalRoute's runway
+	 * and turns onto this one's runway short of the threshold (Schiphol: from the 27 final to the Oostbaan, 22). Empty = never.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
+	FGameplayTag SidestepArrivalRoute;
+
 	/** From the end of the pushback to the departure runway. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	FGameplayTag DepartureRoute;
@@ -100,6 +107,10 @@ public:
 	/** Schiphol handles up to about 70 an hour on two landing runways; 30 keeps the game smooth and still busy. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float ArrivalsPerHour = 30.f;
+
+	/** Share of the small arrivals (code C) to a gate with a SidestepArrivalRoute that sidestep there late. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0", ClampMax = "1"))
+	float SidestepShare = 0.2f;
 
 	/**
 	 * Share of the map's parked models that come to life when the traffic starts (EHAM has 59). Each one is an aircraft

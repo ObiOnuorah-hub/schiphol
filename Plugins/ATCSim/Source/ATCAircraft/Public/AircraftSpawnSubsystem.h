@@ -74,6 +74,13 @@ struct ATCAIRCRAFT_API FAircraftSpawnRequest
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn")
 	bool bLand = false;
 
+	/**
+	 * With bLand: fly the final of this arrival route's runway and sidestep late to the route's own runway (a visual
+	 * sidestep, Schiphol 27 -> 22). Landings are spaced on this approach. Empty = straight in on the route's runway.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn")
+	FGameplayTag ApproachRouteTag;
+
 	/** Instead of a route: park on this stand; RouteTag is then the taxi route after pushback. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn")
 	FGameplayTag StandTag;
@@ -140,7 +147,7 @@ private:
 	 * LandingSpacingSeconds ago and one of its runway exits can be cleared now (nobody on it, nobody who has waited for
 	 * it longer than the landing's head start); after MaxHoldingSeconds also without the exit. OutBlocker = who holds it up.
 	 */
-	bool HoldLanding(const FAircraftSpawnRequest& Request, ATaxiRoute* Route, float StartCm, AActor*& OutBlocker);
+	bool HoldLanding(const FAircraftSpawnRequest& Request, ATaxiRoute* Route, float StartCm, AActor*& OutBlocker, const ATaxiRoute* Approach = nullptr);
 
 	UPROPERTY(Transient)
 	TArray<FAircraftSpawnRequest> Queue;
