@@ -18,6 +18,8 @@
 #include "AircraftMovementComponent.h"
 #include "Components/SplineComponent.h"
 #include "Engine/AssetManager.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/StreamableManager.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
@@ -77,7 +79,7 @@ void ATrafficDirector::StartTraffic()
 		}
 	}
 	Models.RemoveAll([](const FSoftObjectPath& Path) { return Path.IsNull(); });
-	FleetModels = UAssetManager::GetStreamableManager().RequestAsyncLoad(Models);
+	FleetModels = UAssetManager::GetStreamableManager().RequestAsyncLoad(Models, FStreamableDelegate::CreateWeakLambda(this, [this]() { WarmUpModels(); }));
 	UE_LOG(LogATC, Display, TEXT("%s: loading %d aircraft models in the background"), *GetName(), Models.Num());
 
 	// A normal day is already going: part of the gates have an aircraft in its turnaround, ready at different times.
@@ -173,6 +175,44 @@ void ATrafficDirector::StartTraffic()
 		*GetName(), Gates.Num(), Parked, StandIns, EmptiedGates.Num(), Departing, ArrivalsPerHour, bAutoClearances ? TEXT("automatic") : TEXT("by the trainee"));
 }
 
+void ATrafficDirector::WarmUpModels()
+{
+	if (!bRunning || !FleetModels.IsValid())
+	{
+		return;
+	}
+	TArray<UObject*> Loaded;
+	FleetModels->GetLoadedAssets(Loaded);
+	const FVector Underground = GetActorLocation() * FVector(1.0, 1.0, 0.0) - FVector(0.0, 0.0, 200000.0);
+	for (UObject* Asset : Loaded)
+	{
+		UStaticMesh* Mesh = Cast<UStaticMesh>(Asset);
+		if (!Mesh)
+		{
+			continue;
+		}
+		UStaticMeshComponent* Copy = NewObject<UStaticMeshComponent>(this);
+		Copy->SetStaticMesh(Mesh);
+		Copy->SetMobility(EComponentMobility::Movable);
+		Copy->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		Copy->SetCastShadow(false);
+		Copy->SetWorldLocation(Underground);
+		Copy->RegisterComponent();
+		WarmModels.Add(Copy);
+	}
+	// The tug of the aircraft class
+	const UClass* AircraftClass = TrafficMix ? TrafficMix->AircraftClass.LoadSynchronous() : nullptr;
+	const AATCAircraft* Defaults = AircraftClass ? AircraftClass->GetDefaultObject<AATCAircraft>() : nullptr;
+	if (Defaults && Defaults->PushbackController && Defaults->PushbackController->TugClass && !WarmTug)
+	{
+		FActorSpawnParameters Params;
+		Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		WarmTug = GetWorld()->SpawnActor<AActor>(Defaults->PushbackController->TugClass, FTransform(Underground), Params);
+	}
+	UE_LOG(LogATC, Display, TEXT("%s: %d aircraft models and %s set up out of sight, so traffic appears without a hitch"), *GetName(), WarmModels.Num(),
+		WarmTug ? TEXT("a tug") : TEXT("no tug"));
+}
+
 void ATrafficDirector::StopTraffic()
 {
 	if (!bRunning)
@@ -180,6 +220,19 @@ void ATrafficDirector::StopTraffic()
 		return;
 	}
 	bRunning = false;
+	for (UStaticMeshComponent* Copy : WarmModels)
+	{
+		if (Copy)
+		{
+			Copy->DestroyComponent();
+		}
+	}
+	WarmModels.Reset();
+	if (WarmTug)
+	{
+		WarmTug->Destroy();
+		WarmTug = nullptr;
+	}
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearAllTimersForObject(this);

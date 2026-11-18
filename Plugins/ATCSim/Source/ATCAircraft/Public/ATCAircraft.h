@@ -220,7 +220,7 @@ private:
 	/**
 	 * Hand flying and wind on the final, set per flight in StartLanding (from the callsign, so a run repeats): a slow
 	 * wander around the centre line and glide path that dies out towards touchdown, and a crosswind (+ from the right)
-	 * flown crabbed and kicked straight in the flare.
+	 * that rocks the wings and makes the wander bigger (no crab: the nose stays along the way it flies).
 	 */
 	float FinalSeconds = 0.f;
 	/** Takeoff roll and climb-out along the runway centre line (from the route's lineup straight), not the nose direction. */
@@ -235,7 +235,6 @@ private:
 	float WanderVerticalCm = 0.f;
 	float WanderPhase[6] = {};
 	float CrosswindKt = 0.f;
-	float CrabDeg = 0.f;
 
 	/**
 	 * A sidestep in the air, measured back from the touchdown point: straight on the landing runway's final (BackStraight),

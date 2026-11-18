@@ -19,7 +19,7 @@
 #include "HAL/IConsoleManager.h"
 
 static TAutoConsoleVariable<float> CVarCrosswindShare(TEXT("atc.CrosswindShare"), 0.25f,
-	TEXT("Share of landings that come in with a gusty crosswind (crabbed, kicked straight in the flare); 1 = all, for tests"));
+	TEXT("Share of landings that come in with a gusty crosswind (wings rocking, a bigger wander); 1 = all, for tests"));
 
 AATCAircraft::AATCAircraft()
 {
@@ -491,7 +491,7 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 	const float TouchdownFromEnd = Route->TouchdownFromEndCm > 0.f ? Route->TouchdownFromEndCm : 45000.f;
 	RolloutCm = Route->RunwayBeforeStartCm > 0.f ? FMath::Clamp(Route->RunwayBeforeStartCm - TouchdownFromEnd, 40000.f, 250000.f) : 90000.f;
 	TouchdownPoint = Start - LandingDirection * RolloutCm;
-	// Every flight its own: the type's approach speed a few knots either side, now and then a crosswind (crabbed, gusty: half
+	// Every flight its own: the type's approach speed a few knots either side, now and then a gusty crosswind (half
 	// the gust is flown on top), and the way the pilot hand-flies the final. From the callsign, so a run repeats
 	const bool bHeavy = AircraftType && AircraftType->WakeCategory >= EWakeCategory::Heavy;
 	// Which landings get wind: one series for the whole session (from the callsigns the share came out 1 in 8, not 1 in 4)
@@ -502,7 +502,6 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 	const float GustKt = bWindy ? Flight.FRandRange(4.f, 10.f) : 0.f;
 	const float TypeKt = AircraftType && AircraftType->ApproachSpeedKt > 0.f ? AircraftType->ApproachSpeedKt : (bHeavy ? 145.f : 135.f);
 	ApproachSpeedCms = (TypeKt + Flight.FRandRange(-5.f, 5.f) + 0.5f * GustKt) * ATCUnits::KnotsToCms;
-	CrabDeg = FMath::RadiansToDegrees(FMath::Asin(FMath::Clamp(CrosswindKt * ATCUnits::KnotsToCms / ApproachSpeedCms, -0.5f, 0.5f)));
 	WanderLateralCm = FMath::Min(Flight.FRandRange(500.f, 1300.f) * (1.f + FMath::Abs(CrosswindKt) / 15.f), 2500.f);
 	WanderVerticalCm = Flight.FRandRange(150.f, 450.f) * (1.f + FMath::Abs(CrosswindKt) / 25.f);
 	for (float& Phase : WanderPhase)
@@ -540,8 +539,7 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 	UpdateEngineSound();
 	UE_LOG(LogATC, Display, TEXT("%s on final for %s, touchdown %.0f m before the exit route, %.0f kt, %s"), *Identity->Callsign.ToString(),
 		*Route->RouteTag.ToString(), RolloutCm / 100.f, ApproachSpeedCms / ATCUnits::KnotsToCms, FMath::Abs(CrosswindKt) >= 9.f
-		? *FString::Printf(TEXT("crosswind %.0f kt from the %s, %.0f degree crab, gusts %.0f kt"), FMath::Abs(CrosswindKt), CrosswindKt > 0.f ? TEXT("right") : TEXT("left"),
-			FMath::Abs(CrabDeg), GustKt) : TEXT("calm"));
+		? *FString::Printf(TEXT("crosswind %.0f kt from the %s, gusts %.0f kt"), FMath::Abs(CrosswindKt), CrosswindKt > 0.f ? TEXT("right") : TEXT("left"), GustKt) : TEXT("calm"));
 }
 
 void AATCAircraft::TickLanding(float DeltaSeconds)
@@ -630,7 +628,7 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 	// far out, gone at the flare; in a crosswind more, gusts rock the wings, the nose points into the wind (crab) until the
 	// pilot kicks it straight in the flare, upwind wing a little low
 	FinalSeconds += DeltaSeconds;
-	float LateralCm = 0.f, LateralAccel = 0.f, LateralRate = 0.f, YawOffset = 0.f, WindRoll = 0.f, PitchWobble = 0.f;
+	float LateralCm = 0.f, LateralAccel = 0.f, LateralRate = 0.f, WindRoll = 0.f, PitchWobble = 0.f;
 	if (LandingToGoCm > 0.f)
 	{
 		const float T = FinalSeconds;
@@ -643,10 +641,9 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 		LateralAccel = -Size * (0.65f * W1 * W1 * FMath::Sin(W1 * T + WanderPhase[0]) + 0.35f * W2 * W2 * FMath::Sin(W2 * T + WanderPhase[1]));
 		Height += WanderVerticalCm * BeforeFlare * (0.6f * FMath::Sin(0.16f * T + WanderPhase[2]) + 0.4f * FMath::Sin(0.47f * T + WanderPhase[3]));
 		const float Turbulence = FMath::Abs(CrosswindKt) / 20.f;
-		const float Decrab = FMath::SmoothStep(0.f, 1.f, FMath::Clamp(LandingToGoCm / (0.6f * FlareCm), 0.f, 1.f));
-		YawOffset = CrabDeg * Decrab;
-		WindRoll = Turbulence * BeforeFlare * 3.f * (0.6f * FMath::Sin(1.1f * T + WanderPhase[4]) + 0.4f * FMath::Sin(2.3f * T + WanderPhase[5]))
-			+ FMath::Clamp(CrosswindKt / 10.f, -1.f, 1.f) * 2.f * (1.f - Decrab);
+		// No crab (user 18-11-2026: "haal de crabwalking weg"): the nose stays along the way it flies; the wind only rocks
+		// the wings and makes the wander a little bigger
+		WindRoll = Turbulence * BeforeFlare * 3.f * (0.6f * FMath::Sin(1.1f * T + WanderPhase[4]) + 0.4f * FMath::Sin(2.3f * T + WanderPhase[5]));
 		PitchWobble = (0.3f + 0.5f * Turbulence) * BeforeFlare * FMath::Sin(0.9f * T + WanderPhase[5]);
 	}
 	const FVector2D Side(-Heading.Y, Heading.X);
@@ -655,7 +652,7 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 	const float TargetRoll = FMath::Clamp(FMath::RadiansToDegrees(FMath::Atan((FMath::Square(LandingSpeedCms) * Curvature + LateralAccel) / 981.f)) + WindRoll, -30.f, 30.f);
 	RollDeg = FMath::FInterpConstantTo(RollDeg, TargetRoll, DeltaSeconds, 8.f);
 	const FVector Location(Ground.X, Ground.Y, TouchdownPoint.Z + Height);
-	SetActorLocationAndRotation(Location, FRotator(PitchDeg + PitchWobble, TrackYaw + YawOffset, RollDeg));
+	SetActorLocationAndRotation(Location, FRotator(PitchDeg + PitchWobble, TrackYaw, RollDeg));
 
 	// At the start of the arrival route: from here the taxi controller drives (exit, taxi in, stand)
 	if (-LandingToGoCm >= RolloutCm)

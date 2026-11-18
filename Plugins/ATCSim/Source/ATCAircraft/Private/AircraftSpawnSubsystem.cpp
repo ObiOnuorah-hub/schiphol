@@ -232,7 +232,12 @@ AATCAircraft* UAircraftSpawnSubsystem::TrySpawn(const FAircraftSpawnRequest& InR
 	}
 	// A sidestep flies another runway's final first: it is spaced with the landings on that final
 	ATaxiRoute* Approach = Request.bLand && Request.ApproachRouteTag.IsValid() ? Traffic->FindRoute(Request.ApproachRouteTag) : nullptr;
-	if (Request.bLand && HoldLanding(Request, Route, Start, OutBlocker, Approach))
+	bool bHold = false;
+	{
+		CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_HoldLanding);
+		bHold = Request.bLand && HoldLanding(Request, Route, Start, OutBlocker, Approach);
+	}
+	if (bHold)
 	{
 		return nullptr;
 	}
@@ -241,7 +246,11 @@ AATCAircraft* UAircraftSpawnSubsystem::TrySpawn(const FAircraftSpawnRequest& InR
 	FActorSpawnParameters Params;
 	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 	Params.bDeferConstruction = true;
-	AATCAircraft* Aircraft = GetWorld()->SpawnActor<AATCAircraft>(Request.AircraftClass, Transform, Params);
+	AATCAircraft* Aircraft = nullptr;
+	{
+		CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_SpawnActor);
+		Aircraft = GetWorld()->SpawnActor<AATCAircraft>(Request.AircraftClass, Transform, Params);
+	}
 	if (!Aircraft)
 	{
 		return nullptr;
@@ -251,7 +260,10 @@ AATCAircraft* UAircraftSpawnSubsystem::TrySpawn(const FAircraftSpawnRequest& InR
 	Aircraft->Identity->AssignedTaxiRoute = Route->RouteTag;
 	Aircraft->Identity->bRemoveAtRouteEnd = Request.bRemoveAtRouteEnd;
 	Aircraft->Identity->RemoveDelaySeconds = Request.RemoveDelaySeconds;
-	Aircraft->FinishSpawning(Transform);
+	{
+		CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_FinishSpawning);
+		Aircraft->FinishSpawning(Transform);
+	}
 
 	// On the route from the first frame, also when it waits for Cmd.Taxi: other traffic then sees it there
 	Aircraft->Movement->SetPath(Route->Spline, ETravelDirection::Forward, true, Start, true);
@@ -278,6 +290,7 @@ AATCAircraft* UAircraftSpawnSubsystem::TrySpawn(const FAircraftSpawnRequest& InR
 	}
 	if (Request.bLand)
 	{
+		CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_StartLanding);
 		Aircraft->StartLanding(Route, Start, End, Request.InitialSpeedKt, Approach);
 		const ATaxiRoute* Final = Approach ? Approach : Route;
 		const float FinalStart = Approach ? 0.f : Start;

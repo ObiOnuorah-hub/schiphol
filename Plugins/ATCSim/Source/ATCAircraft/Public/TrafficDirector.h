@@ -9,6 +9,7 @@ class AATCAircraft;
 class ATaxiRoute;
 class UAircraftTypeData;
 class UTrafficMixData;
+class UStaticMeshComponent;
 struct FStreamableHandle;
 
 /** A gate in the traffic program: its stand, how arrivals get there and where departures go. */
@@ -232,6 +233,19 @@ private:
 
 	/** The fleet's models, loaded in the background at the start and kept: a spawn never waits for its model. */
 	TSharedPtr<FStreamableHandle> FleetModels;
+
+	/**
+	 * One copy of every fleet model and a pushback tug, 2 km under the ground for as long as the traffic runs: the renderer
+	 * sets up a model's materials once (an HQ model has up to 41), and an aircraft or tug appearing for the first time
+	 * made a 36 ms hitch (18-11-2026). With these registered the real ones appear smoothly.
+	 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> WarmModels;
+
+	UPROPERTY(Transient)
+	TObjectPtr<AActor> WarmTug;
+
+	void WarmUpModels();
 
 	FTimerHandle ArrivalTimer;
 	FRandomStream Random = FRandomStream(2026);
