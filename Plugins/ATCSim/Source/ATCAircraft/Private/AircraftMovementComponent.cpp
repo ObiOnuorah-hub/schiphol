@@ -114,10 +114,29 @@ void UAircraftMovementComponent::UpdateTransform(float DeltaTime, bool bSnap)
 	const bool bNoseAhead = (Direction == ETravelDirection::Forward) == bNoseAlongTravel;
 	const FVector MainGear = GetPointAt(Distance);
 	const FVector NoseGear = GetPointAt(Distance + (bNoseAhead ? WheelbaseCm : -WheelbaseCm));
-	const FVector Heading = (NoseGear - MainGear).GetSafeNormal();
+	FVector Heading = (NoseGear - MainGear).GetSafeNormal();
 	if (Heading.IsNearlyZero())
 	{
 		return;
+	}
+	// Nose first: oversteer, the heading partly along the line at the main gear, so the nose goes wide in a tight turn and
+	// the main gear stays on the line (user 18-11-2026: like a bus, as real aircraft taxi)
+	if (bNoseAlongTravel && OversteerShare > 0.f)
+	{
+		// Only in a really tight turn (user: not everywhere): none above a 60 m radius, all of it from 25 m, the radius from
+		// the change of direction over the 20 m around the main gear
+		const float Ahead = bNoseAhead ? 1.f : -1.f;
+		const FVector Here = GetPointAt(Distance);
+		const FVector In = (Here - GetPointAt(Distance - Ahead * 1000.f)).GetSafeNormal2D();
+		const FVector Out = (GetPointAt(Distance + Ahead * 1000.f) - Here).GetSafeNormal2D();
+		const float Turn = FMath::Acos(FMath::Clamp(float(In | Out), -1.f, 1.f));
+		const float RadiusCm = Turn > KINDA_SMALL_NUMBER ? 1000.f / Turn : BIG_NUMBER;
+		const float Tight = FMath::Clamp((6000.f - RadiusCm) / 3500.f, 0.f, 1.f);
+		const FVector Along = (GetPointAt(Distance + Ahead * 200.f) - GetPointAt(Distance - Ahead * 200.f)).GetSafeNormal();
+		if (Tight > 0.f && !Along.IsNearlyZero())
+		{
+			Heading = FMath::Lerp(Heading, Along, OversteerShare * Tight).GetSafeNormal();
+		}
 	}
 
 	const FQuat TargetRotation = Heading.Rotation().Quaternion();

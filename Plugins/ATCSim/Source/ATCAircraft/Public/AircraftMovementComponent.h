@@ -97,6 +97,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ATC|Movement")
 	float RotationSmoothing = 6.f;
 
+	/**
+	 * Taxiing nose first, how far the pilot lets the nose swing wide in a really tight turn so the main gear stays on the
+	 * line (a bus through a corner): 0 = both gears on the line (the body cuts the corner), 1 = heading along the line at
+	 * the main gear (the nose gear runs outside by about wheelbase^2 / 2R). Only below a 60 m radius, fully from 25 m; not
+	 * in a pushback.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ATC|Movement", meta = (ClampMin = "0", ClampMax = "1"))
+	float OversteerShare = 0.55f;
+
 	/** Fired once when the end (Forward) or start (Reverse) of the spline is reached. */
 	UPROPERTY(BlueprintAssignable, Category = "ATC|Movement")
 	FOnPathEndReached OnPathEndReached;

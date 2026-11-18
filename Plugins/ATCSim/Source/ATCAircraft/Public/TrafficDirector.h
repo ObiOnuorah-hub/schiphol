@@ -33,7 +33,7 @@ struct ATCAIRCRAFT_API FTrafficGate
 
 	/**
 	 * Wide-body gates: the arrival over the narrow-bodies' early runway exit, for wide-body types that brake as short
-	 * (UAircraftTypeData::bEarlyRunwayExit: the 787). Empty = every type takes ArrivalRoute.
+	 * (UAircraftTypeData::EarlyRunwayExitShare: the 787 always, the A350 now and then). Empty = every type takes ArrivalRoute.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	FGameplayTag EarlyExitArrivalRoute;

@@ -1339,9 +1339,19 @@ void UTaxiNetworkSubsystem::CheckDeadlocks()
 		{
 			continue;   // one of them already let go in another circle
 		}
+		// One that has only just left its landing runway (taxiing in, within 300 m past where it vacated it) is asked last:
+		// standing there it holds the exit of the next landing (18-11-2026: an A350 backed off on the 27 far exit for a
+		// 787 coming from the early exit, and the landing behind it went around)
+		auto NearRunwayExit = [this](const TObjectKey<AActor>& Member)
+		{
+			const AATCAircraft* Aircraft = Cast<AATCAircraft>(Claims[Member].Aircraft.Get());
+			const ATaxiRoute* Route = Aircraft && Aircraft->TaxiController->bPriority ? Aircraft->TaxiController->Route.Get() : nullptr;
+			return Route && Route->RunwayBeforeStartCm > 0.f && Aircraft->Movement->Distance < Route->GetRunwayVacatedCm() + 30000.f;
+		};
 		TArray<FString> Names;
 		const TObjectKey<AActor>* Chosen = nullptr;
 		bool bChosenAhead = false;
+		bool bChosenNearExit = false;
 		for (const TObjectKey<AActor>& Member : Circle)
 		{
 			Names.Add(NameOf(Member));
@@ -1351,12 +1361,14 @@ void UTaxiNetworkSubsystem::CheckDeadlocks()
 			{
 				continue;
 			}
+			const bool bNearExit = NearRunwayExit(Member);
 			const FClaim* Best = Chosen ? &Claims[*Chosen] : nullptr;
-			if (!Best || Claim.BackOffUntil < Best->BackOffUntil || (Claim.BackOffUntil == Best->BackOffUntil
-				&& (bAhead != bChosenAhead ? bAhead : Claim.WaitingSince > Best->WaitingSince)))
+			if (!Best || (bNearExit != bChosenNearExit ? !bNearExit : (Claim.BackOffUntil < Best->BackOffUntil || (Claim.BackOffUntil == Best->BackOffUntil
+				&& (bAhead != bChosenAhead ? bAhead : Claim.WaitingSince > Best->WaitingSince)))))
 			{
 				Chosen = &Member;
 				bChosenAhead = bAhead;
+				bChosenNearExit = bNearExit;
 			}
 		}
 		Names.Sort();

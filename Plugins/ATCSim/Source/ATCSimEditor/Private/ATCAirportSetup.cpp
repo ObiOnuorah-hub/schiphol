@@ -1627,7 +1627,7 @@ namespace ATCSetup
 	/**
 	 * A wide-body gate's second arrival: over the early runway exit of the narrow-bodies, for the 787 (user 18-11-2026: of
 	 * the wide-bodies only the 787 leaves 27 where the small ones do, the others take the far exit). Tag
-	 * Route.EHAM.<gate>.Early.Arr<runway>; the traffic director gives it to types with bEarlyRunwayExit.
+	 * Route.EHAM.<gate>.Early.Arr<runway>; the traffic director gives it to types by their EarlyRunwayExitShare.
 	 */
 	void AddEarlyExit(UWorld* World, const FSite& Site, FDeparture& D)
 	{
@@ -2777,6 +2777,28 @@ namespace ATCSetup
 			}
 
 			// An arrival route starts on its landing runway: the runway behind the start is where landings touch down
+			// A departure route ends lined up on its runway: the runway centre line, for the takeoff roll and climb-out
+			if (Route->RouteTag.ToString().Contains(TEXT(".Rwy")) && Length > 7000.f)
+			{
+				const FVector End = Route->GetLocationAt(Length);
+				const FVector EndDirection = (End - Route->GetLocationAt(Length - 5000.f)).GetSafeNormal2D();
+				for (const FMapRunway& Runway : Site.Runways)
+				{
+					double Along = 0.0, Side = 0.0;
+					Runway.Locate(End, Along, Side);
+					if (Side < Runway.HalfWidthCm && Along > 0.0 && Along < Runway.Length() && FMath::Abs(FVector::DotProduct(EndDirection, Runway.Along())) > 0.98)
+					{
+						Route->Modify();
+						Route->TakeoffDirection = FVector::DotProduct(EndDirection, Runway.Along()) > 0.0 ? Runway.Along() : -Runway.Along();
+						Route->TakeoffLinePoint = FVector(Runway.A.X, Runway.A.Y, End.Z) + Runway.Along() * Along;
+						if (UPackage* External = Route->GetExternalPackage())
+						{
+							Packages.AddUnique(External);
+						}
+						break;
+					}
+				}
+			}
 			if (Route->RouteTag.ToString().Contains(TEXT(".Arr")))
 			{
 				// The direction from two points: the spline tangent at its very first point can be zero
@@ -3697,6 +3719,8 @@ namespace ATCSetup
 			Parallel->Tags.Add(ParallelTag);
 			Parallel->RunwayBeforeStartCm = Route->RunwayBeforeStartCm;
 			Parallel->TouchdownFromEndCm = Route->TouchdownFromEndCm;
+			Parallel->TakeoffLinePoint = Route->TakeoffLinePoint;
+			Parallel->TakeoffDirection = Route->TakeoffDirection;
 			for (const FSpeedZone& Zone : Route->SpeedZones)
 			{
 				FSpeedZone& Copy = Parallel->SpeedZones.Add_GetRef(Zone);

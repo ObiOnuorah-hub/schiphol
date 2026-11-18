@@ -380,8 +380,9 @@ void ATrafficDirector::SpawnArrival()
 	Request.Callsign = Spawner->MakeCallsign(Airlines);
 	Request.AircraftClass = TrafficMix->AircraftClass.LoadSynchronous();
 	Request.RouteTag = Gates[Gate].ArrivalRoute;
-	// The 787 leaves the runway at the small ones' early exit, the other wide-bodies roll on to the far one
-	if (Type && Type->bEarlyRunwayExit && Gates[Gate].EarlyExitArrivalRoute.IsValid() && Traffic->FindRoute(Gates[Gate].EarlyExitArrivalRoute))
+	// The 787 leaves the runway at the small ones' early exit, an A350 now and then, the other wide-bodies roll on
+	if (Type && Type->EarlyRunwayExitShare > 0.f && Random.FRand() < Type->EarlyRunwayExitShare && Gates[Gate].EarlyExitArrivalRoute.IsValid()
+		&& Traffic->FindRoute(Gates[Gate].EarlyExitArrivalRoute))
 	{
 		Request.RouteTag = Gates[Gate].EarlyExitArrivalRoute;
 	}

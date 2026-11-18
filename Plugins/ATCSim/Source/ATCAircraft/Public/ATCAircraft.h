@@ -218,6 +218,26 @@ private:
 	float RollDeg = 0.f;
 
 	/**
+	 * Hand flying and wind on the final, set per flight in StartLanding (from the callsign, so a run repeats): a slow
+	 * wander around the centre line and glide path that dies out towards touchdown, and a crosswind (+ from the right)
+	 * flown crabbed and kicked straight in the flare.
+	 */
+	float FinalSeconds = 0.f;
+	/** Takeoff roll and climb-out along the runway centre line (from the route's lineup straight), not the nose direction. */
+	bool bTakeoffOnLine = false;
+	/** Takeoff roll acceleration (cm/s2): by wake category and a little per flight (weight). */
+	float TakeoffAccelCms2 = 200.f;
+	/** After takeoff: the turn still to fly (degrees, + right) once above 150 m, as its departure route (SID) asks. */
+	float DepartureTurnLeftDeg = 0.f;
+	FVector TakeoffLineStart = FVector::ZeroVector;
+	FVector TakeoffLineDir = FVector::ForwardVector;
+	float WanderLateralCm = 0.f;
+	float WanderVerticalCm = 0.f;
+	float WanderPhase[6] = {};
+	float CrosswindKt = 0.f;
+	float CrabDeg = 0.f;
+
+	/**
 	 * A sidestep in the air, measured back from the touchdown point: straight on the landing runway's final (BackStraight),
 	 * an arc of SidestepRadius (BackArc long, turning TurnSign: +1 right), then the other runway's final outwards.
 	 */

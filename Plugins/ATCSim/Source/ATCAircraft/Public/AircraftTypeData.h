@@ -76,11 +76,11 @@ public:
 	TSoftObjectPtr<UStaticMesh> Mesh;
 
 	/**
-	 * A wide-body that leaves the landing runway at the narrow-bodies' early exit (the 787: light, strong brakes); the
-	 * other wide-bodies roll on to the far exit. Used where a gate has an EarlyExitArrivalRoute.
+	 * Share of the landings of this wide-body type that leave the runway at the narrow-bodies' early exit, where a gate
+	 * has an EarlyExitArrivalRoute: the 787 always (light, strong brakes), the A350 now and then, the others never.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ground performance")
-	bool bEarlyRunwayExit = false;
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ground performance", meta = (ClampMin = "0", ClampMax = "1"))
+	float EarlyRunwayExitShare = 0.f;
 
 	/** Puts the model with its main gear on the actor origin and the nose along +X. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Visual")
@@ -96,6 +96,13 @@ public:
 		const FString Text = Callsign.ToString();
 		return Liveries.FindByPredicate([&Text](const FAircraftLivery& Livery) { return !Livery.Airline.IsEmpty() && Text.StartsWith(Livery.Airline); });
 	}
+
+	/**
+	 * Final approach speed, about Vref + 5 kt (E190 125, A320 135, 737/787 145, 777 150, 747 155). Every flight flies a few
+	 * knots either side of it, more with a gusty wind. 0 = 135 kt, 145 for heavies.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Flight")
+	float ApproachSpeedKt = 0.f;
 
 	/** Straight-line taxi speed. Turns are slowed down automatically by MaxLateralAccel. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ground performance")

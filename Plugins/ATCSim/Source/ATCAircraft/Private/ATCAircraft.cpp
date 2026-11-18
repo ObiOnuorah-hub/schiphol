@@ -16,6 +16,10 @@
 #include "Engine/World.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
+#include "HAL/IConsoleManager.h"
+
+static TAutoConsoleVariable<float> CVarCrosswindShare(TEXT("atc.CrosswindShare"), 0.25f,
+	TEXT("Share of landings that come in with a gusty crosswind (crabbed, kicked straight in the flare); 1 = all, for tests"));
 
 AATCAircraft::AATCAircraft()
 {
@@ -338,6 +342,45 @@ void AATCAircraft::StartTakeoff()
 	PitchDeg = 0.f;
 	FlightPathDeg = 0.f;
 	bLiftedOff = false;
+	// The runway centre line from the lineup straight (the route's last 60 m lie on the painted centre line): the roll and
+	// the climb-out stay on it (user 18-11-2026; the nose direction alone drifted metres off over 2 km)
+	// Heavier ones accelerate slower and rotate later: Vr about the approach speed + 10 kt; a few percent per flight (weight)
+	FRandomStream Flight(int32(GetTypeHash(Identity->Callsign.ToString())) ^ 0x7A4E);
+	const EWakeCategory Wake = AircraftType ? AircraftType->WakeCategory : EWakeCategory::Medium;
+	TakeoffAccelCms2 = (Wake == EWakeCategory::Super ? 170.f : Wake == EWakeCategory::Heavy ? 190.f : 230.f) * Flight.FRandRange(0.9f, 1.1f);
+	RotateSpeedKt = (AircraftType && AircraftType->ApproachSpeedKt > 0.f ? AircraftType->ApproachSpeedKt : 140.f) + 10.f + Flight.FRandRange(-4.f, 6.f);
+	bTakeoffOnLine = false;
+	if (const ATaxiRoute* Route = TaxiController->Route)
+	{
+		const float Length = Route->GetLength();
+		if (!Route->TakeoffDirection.IsNearlyZero())
+		{
+			// The painted runway centre line, stored on the route by ATC.CheckRoutes
+			TakeoffLineDir = Route->TakeoffDirection.GetSafeNormal2D();
+			TakeoffLineStart = FVector(Route->TakeoffLinePoint.X, Route->TakeoffLinePoint.Y, GetActorLocation().Z);
+			bTakeoffOnLine = (TakeoffLineDir | GetActorForwardVector().GetSafeNormal2D()) > 0.98f;
+		}
+		else if (Length > 7000.f)
+		{
+			TakeoffLineStart = Route->GetLocationAt(Length);
+			// The chord of the last two spline points: both lie on the centre line, the curve between them does not quite
+			// (its start tangent is the bisector of the turn onto the runway: 0.46 degrees off on 24, 4 m off after 600 m)
+			const int32 Points = Route->Spline->GetNumberOfSplinePoints();
+			const FVector Before = Points >= 2 ? Route->Spline->GetLocationAtSplinePoint(Points - 2, ESplineCoordinateSpace::World) : FVector::ZeroVector;
+			TakeoffLineDir = Points >= 2 && FVector::Dist2D(Before, TakeoffLineStart) > 3000.f ? (TakeoffLineStart - Before).GetSafeNormal2D()
+				: (TakeoffLineStart - Route->GetLocationAt(Length - 6000.f)).GetSafeNormal2D();
+			bTakeoffOnLine = !TakeoffLineDir.IsNearlyZero() && (TakeoffLineDir | GetActorForwardVector().GetSafeNormal2D()) > 0.98f;
+		}
+	}
+	// The departure (SID): from the Kaagbaan (24) straight on or a left turn, from the Polderbaan (36L) straight, left or
+	// right (user 18-11-2026); 25 to 70 degrees, flown from 150 m up
+	const FString RouteTag = TaxiController->Route ? TaxiController->Route->RouteTag.ToString() : FString();
+	const FString Runway = RouteTag.Contains(TEXT(".Rwy")) ? RouteTag.RightChop(RouteTag.Find(TEXT(".Rwy"), ESearchCase::CaseSensitive, ESearchDir::FromEnd) + 4) : FString();
+	const TArray<float> Turns = Runway == TEXT("24") ? TArray<float>{ 0.f, -1.f } : Runway == TEXT("36L") ? TArray<float>{ 0.f, -1.f, 1.f } : TArray<float>{ 0.f };
+	DepartureTurnLeftDeg = Turns[Flight.RandHelper(Turns.Num())] * Flight.FRandRange(25.f, 70.f);
+	UE_LOG(LogATC, Display, TEXT("%s takeoff roll %s: line heading %.2f, nose %.2f, Vr %.0f kt, %.1f m/s2, then %s"), *Identity->Callsign.ToString(),
+		bTakeoffOnLine ? TEXT("on the centre line") : TEXT("along the nose"), TakeoffLineDir.Rotation().Yaw, GetActorRotation().Yaw, RotateSpeedKt, TakeoffAccelCms2 / 100.f,
+		DepartureTurnLeftDeg == 0.f ? TEXT("straight on") : *FString::Printf(TEXT("a %.0f degree %s turn"), FMath::Abs(DepartureTurnLeftDeg), DepartureTurnLeftDeg > 0.f ? TEXT("right") : TEXT("left")));
 	Movement->ClearPath();   // off the taxi network: from here the aircraft flies itself
 	LeaveTaxiNetwork();
 	SetActorTickEnabled(true);
@@ -448,8 +491,29 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 	const float TouchdownFromEnd = Route->TouchdownFromEndCm > 0.f ? Route->TouchdownFromEndCm : 45000.f;
 	RolloutCm = Route->RunwayBeforeStartCm > 0.f ? FMath::Clamp(Route->RunwayBeforeStartCm - TouchdownFromEnd, 40000.f, 250000.f) : 90000.f;
 	TouchdownPoint = Start - LandingDirection * RolloutCm;
+	// Every flight its own: the type's approach speed a few knots either side, now and then a crosswind (crabbed, gusty: half
+	// the gust is flown on top), and the way the pilot hand-flies the final. From the callsign, so a run repeats
 	const bool bHeavy = AircraftType && AircraftType->WakeCategory >= EWakeCategory::Heavy;
-	ApproachSpeedCms = (bHeavy ? 145.f : 135.f) * ATCUnits::KnotsToCms;
+	// Which landings get wind: one series for the whole session (from the callsigns the share came out 1 in 8, not 1 in 4)
+	static FRandomStream WindDraws(2026);
+	const bool bWindy = WindDraws.FRand() < CVarCrosswindShare.GetValueOnGameThread();
+	FRandomStream Flight(int32((GetTypeHash(Identity->Callsign.ToString()) ^ 0x5EEDu) * 2654435761u >> 1));
+	CrosswindKt = bWindy ? Flight.FRandRange(10.f, 25.f) * (Flight.FRand() < 0.5f ? -1.f : 1.f) : Flight.FRandRange(-4.f, 4.f);
+	const float GustKt = bWindy ? Flight.FRandRange(4.f, 10.f) : 0.f;
+	const float TypeKt = AircraftType && AircraftType->ApproachSpeedKt > 0.f ? AircraftType->ApproachSpeedKt : (bHeavy ? 145.f : 135.f);
+	ApproachSpeedCms = (TypeKt + Flight.FRandRange(-5.f, 5.f) + 0.5f * GustKt) * ATCUnits::KnotsToCms;
+	CrabDeg = FMath::RadiansToDegrees(FMath::Asin(FMath::Clamp(CrosswindKt * ATCUnits::KnotsToCms / ApproachSpeedCms, -0.5f, 0.5f)));
+	WanderLateralCm = FMath::Min(Flight.FRandRange(500.f, 1300.f) * (1.f + FMath::Abs(CrosswindKt) / 15.f), 2500.f);
+	WanderVerticalCm = Flight.FRandRange(150.f, 450.f) * (1.f + FMath::Abs(CrosswindKt) / 25.f);
+	for (float& Phase : WanderPhase)
+	{
+		Phase = Flight.FRandRange(0.f, 2.f * PI);
+	}
+	FinalSeconds = 0.f;
+	// Not every touchdown on the same spot: a little short or a long float, within the touchdown zone of the white blocks
+	const float Float = Flight.FRandRange(-2500.f, 6000.f);
+	TouchdownPoint += LandingDirection * Float;
+	RolloutCm = FMath::Max(RolloutCm - Float, 30000.f);
 	TouchdownSpeedCms = ApproachSpeedCms - 5.f * ATCUnits::KnotsToCms;
 	RolloutEndSpeedCms = FMath::Max(RolloutEndSpeedKt, 5.f) * ATCUnits::KnotsToCms;
 	RolloutDecelCms2 = FMath::Clamp((FMath::Square(TouchdownSpeedCms) - FMath::Square(RolloutEndSpeedCms)) / (2.f * RolloutCm), 100.f, 350.f);
@@ -474,8 +538,10 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 	SetActorTickEnabled(true);
 	TickLanding(0.f);
 	UpdateEngineSound();
-	UE_LOG(LogATC, Display, TEXT("%s on final for %s, touchdown %.0f m before the exit route"), *Identity->Callsign.ToString(),
-		*Route->RouteTag.ToString(), RolloutCm / 100.f);
+	UE_LOG(LogATC, Display, TEXT("%s on final for %s, touchdown %.0f m before the exit route, %.0f kt, %s"), *Identity->Callsign.ToString(),
+		*Route->RouteTag.ToString(), RolloutCm / 100.f, ApproachSpeedCms / ATCUnits::KnotsToCms, FMath::Abs(CrosswindKt) >= 9.f
+		? *FString::Printf(TEXT("crosswind %.0f kt from the %s, %.0f degree crab, gusts %.0f kt"), FMath::Abs(CrosswindKt), CrosswindKt > 0.f ? TEXT("right") : TEXT("left"),
+			FMath::Abs(CrabDeg), GustKt) : TEXT("calm"));
 }
 
 void AATCAircraft::TickLanding(float DeltaSeconds)
@@ -559,10 +625,37 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 	{
 		SidestepAt(LandingToGoCm, Ground, Heading, Curvature);
 	}
-	const float TargetRoll = FMath::Clamp(FMath::RadiansToDegrees(FMath::Atan(FMath::Square(LandingSpeedCms) * Curvature / 981.f)), -30.f, 30.f);
+
+	// Hand flown: a slow wander around the centre line (with the bank and heading that make it) and the glide path, more
+	// far out, gone at the flare; in a crosswind more, gusts rock the wings, the nose points into the wind (crab) until the
+	// pilot kicks it straight in the flare, upwind wing a little low
+	FinalSeconds += DeltaSeconds;
+	float LateralCm = 0.f, LateralAccel = 0.f, LateralRate = 0.f, YawOffset = 0.f, WindRoll = 0.f, PitchWobble = 0.f;
+	if (LandingToGoCm > 0.f)
+	{
+		const float T = FinalSeconds;
+		const float Far = FMath::Clamp(LandingToGoCm / 600000.f, 0.f, 1.f);
+		const float BeforeFlare = FMath::Clamp((LandingToGoCm - FlareCm) / 100000.f, 0.f, 1.f);
+		const float Size = WanderLateralCm * (0.15f + 0.85f * Far) * BeforeFlare;
+		const float W1 = 0.13f, W2 = 0.31f;
+		LateralCm = Size * (0.65f * FMath::Sin(W1 * T + WanderPhase[0]) + 0.35f * FMath::Sin(W2 * T + WanderPhase[1]));
+		LateralRate = Size * (0.65f * W1 * FMath::Cos(W1 * T + WanderPhase[0]) + 0.35f * W2 * FMath::Cos(W2 * T + WanderPhase[1]));
+		LateralAccel = -Size * (0.65f * W1 * W1 * FMath::Sin(W1 * T + WanderPhase[0]) + 0.35f * W2 * W2 * FMath::Sin(W2 * T + WanderPhase[1]));
+		Height += WanderVerticalCm * BeforeFlare * (0.6f * FMath::Sin(0.16f * T + WanderPhase[2]) + 0.4f * FMath::Sin(0.47f * T + WanderPhase[3]));
+		const float Turbulence = FMath::Abs(CrosswindKt) / 20.f;
+		const float Decrab = FMath::SmoothStep(0.f, 1.f, FMath::Clamp(LandingToGoCm / (0.6f * FlareCm), 0.f, 1.f));
+		YawOffset = CrabDeg * Decrab;
+		WindRoll = Turbulence * BeforeFlare * 3.f * (0.6f * FMath::Sin(1.1f * T + WanderPhase[4]) + 0.4f * FMath::Sin(2.3f * T + WanderPhase[5]))
+			+ FMath::Clamp(CrosswindKt / 10.f, -1.f, 1.f) * 2.f * (1.f - Decrab);
+		PitchWobble = (0.3f + 0.5f * Turbulence) * BeforeFlare * FMath::Sin(0.9f * T + WanderPhase[5]);
+	}
+	const FVector2D Side(-Heading.Y, Heading.X);
+	Ground += Side * LateralCm;
+	const float TrackYaw = FVector(Heading, 0.f).Rotation().Yaw + FMath::RadiansToDegrees(FMath::Atan2(LateralRate, FMath::Max(LandingSpeedCms, 1.f)));
+	const float TargetRoll = FMath::Clamp(FMath::RadiansToDegrees(FMath::Atan((FMath::Square(LandingSpeedCms) * Curvature + LateralAccel) / 981.f)) + WindRoll, -30.f, 30.f);
 	RollDeg = FMath::FInterpConstantTo(RollDeg, TargetRoll, DeltaSeconds, 8.f);
 	const FVector Location(Ground.X, Ground.Y, TouchdownPoint.Z + Height);
-	SetActorLocationAndRotation(Location, FRotator(PitchDeg, FVector(Heading, 0.f).Rotation().Yaw, RollDeg));
+	SetActorLocationAndRotation(Location, FRotator(PitchDeg + PitchWobble, TrackYaw + YawOffset, RollDeg));
 
 	// At the start of the arrival route: from here the taxi controller drives (exit, taxi in, stand)
 	if (-LandingToGoCm >= RolloutCm)
@@ -613,6 +706,7 @@ void AATCAircraft::StartGoAround()
 	LeaveTaxiNetwork();
 	bLanding = false;
 	bGoingAround = true;
+	bTakeoffOnLine = false;
 	bTakingOff = true;
 	TakeoffSpeedCms = LandingSpeedCms;
 	TakeoffSeconds = 0.f;
@@ -629,7 +723,7 @@ void AATCAircraft::TickTakeoff(float DeltaSeconds)
 	// builds up smoothly to the pitch minus 6 degrees (the wing's angle of attack): 7 degrees at full pitch
 	TakeoffSeconds += DeltaSeconds;
 	const float Rotate = RotateSpeedKt * ATCUnits::KnotsToCms;
-	TakeoffSpeedCms += (TakeoffSpeedCms < Rotate ? 200.f : 80.f) * DeltaSeconds;
+	TakeoffSpeedCms += (TakeoffSpeedCms < Rotate ? TakeoffAccelCms2 : 0.4f * TakeoffAccelCms2) * DeltaSeconds;
 	if (TakeoffSpeedCms >= Rotate)
 	{
 		PitchDeg = FMath::Min(PitchDeg + 2.5f * DeltaSeconds, 13.f);
@@ -641,13 +735,43 @@ void AATCAircraft::TickTakeoff(float DeltaSeconds)
 	}
 	FRotator Rotation = GetActorRotation();
 	Rotation.Pitch = PitchDeg;
-	// Wings level again (a go-around out of the sidestep turn climbs straight ahead)
-	RollDeg = FMath::FInterpConstantTo(RollDeg, 0.f, DeltaSeconds, 8.f);
+	// The departure turn from 150 m up, at the standard rate (3 degrees a second) with the bank that flies it; until then on
+	// the centre line, wings level (a go-around out of the sidestep turn climbs straight ahead)
+	const bool bTurning = !bGoingAround && DepartureTurnLeftDeg != 0.f && GetActorLocation().Z - TakeoffLineStart.Z > 15000.f;
+	if (bTakeoffOnLine && !bTurning && FMath::Abs(DepartureTurnLeftDeg) > 0.f && GetActorLocation().Z - TakeoffLineStart.Z > 15000.f)
+	{
+		bTakeoffOnLine = false;
+	}
+	if (bTakeoffOnLine)
+	{
+		Rotation.Yaw = TakeoffLineDir.Rotation().Yaw;
+	}
+	float TargetRoll = 0.f;
+	if (bTurning)
+	{
+		bTakeoffOnLine = false;
+		// Standard rate (3 degrees a second), but airliners bank at most 25 degrees: slower when fast
+		const float RateDeg = FMath::Min(3.f, FMath::RadiansToDegrees(981.f * FMath::Tan(FMath::DegreesToRadians(25.f)) / FMath::Max(TakeoffSpeedCms, 1.f)));
+		const float Step = FMath::Min(RateDeg * DeltaSeconds, FMath::Abs(DepartureTurnLeftDeg));
+		Rotation.Yaw += FMath::Sign(DepartureTurnLeftDeg) * Step;
+		DepartureTurnLeftDeg -= FMath::Sign(DepartureTurnLeftDeg) * Step;
+		TargetRoll = FMath::Sign(DepartureTurnLeftDeg) * FMath::RadiansToDegrees(FMath::Atan(TakeoffSpeedCms * FMath::DegreesToRadians(RateDeg) / 981.f));
+		TargetRoll = FMath::Abs(DepartureTurnLeftDeg) < 8.f ? TargetRoll * FMath::Abs(DepartureTurnLeftDeg) / 8.f : TargetRoll;   // rolling out
+	}
+	RollDeg = FMath::FInterpConstantTo(RollDeg, TargetRoll, DeltaSeconds, 6.f);
 	Rotation.Roll = RollDeg;
 	const float ClimbDeg = FlightPathDeg;
 	const FVector Flat = FRotator(0.f, Rotation.Yaw, 0.f).Vector();
 	const FVector Velocity = (Flat * FMath::Cos(FMath::DegreesToRadians(ClimbDeg)) + FVector::UpVector * FMath::Sin(FMath::DegreesToRadians(ClimbDeg))) * TakeoffSpeedCms;
-	SetActorLocationAndRotation(GetActorLocation() + Velocity * DeltaSeconds, Rotation);
+	FVector Location = GetActorLocation() + Velocity * DeltaSeconds;
+	if (bTakeoffOnLine)
+	{
+		// Any sideways offset from the centre line (a few centimetres at the lineup) goes away within a few seconds
+		const FVector Side = FVector::CrossProduct(FVector::UpVector, TakeoffLineDir);
+		const float Offset = FVector::DotProduct(Location - TakeoffLineStart, Side);
+		Location -= Side * (Offset - FMath::FInterpTo(Offset, 0.f, DeltaSeconds, 1.5f));
+	}
+	SetActorLocationAndRotation(Location, Rotation);
 
 	// Out of sight of the tower: about 600 m up, or after two minutes
 	if (TakeoffSeconds > 120.f || (ClimbDeg > 0.f && GetActorLocation().Z > 60000.f))
@@ -705,8 +829,9 @@ FText AATCAircraft::GetStatusText_Implementation() const
 	}
 	if (bLanding)
 	{
-		return FText::FromString(FString::Printf(TEXT("%s %.0f kt"), LandingToGoCm > 0.f ? TEXT("Final approach") : TEXT("Landing rollout"),
-			LandingSpeedCms / ATCUnits::KnotsToCms));
+		return FText::FromString(FString::Printf(TEXT("%s %.0f kt%s"), LandingToGoCm > 0.f ? TEXT("Final approach") : TEXT("Landing rollout"),
+			LandingSpeedCms / ATCUnits::KnotsToCms, FMath::Abs(CrosswindKt) >= 9.f && LandingToGoCm > 0.f
+			? *FString::Printf(TEXT(", crosswind %.0f kt from the %s"), FMath::Abs(CrosswindKt), CrosswindKt > 0.f ? TEXT("right") : TEXT("left")) : TEXT("")));
 	}
 	if (bTakingOff)
 	{

@@ -437,12 +437,12 @@ namespace ATCExample
 			FitMesh(B78X, TEXT("/Game/Aircraft/Fleet/SM_KLM_B789_HQ.SM_KLM_B789_HQ"));
 		}
 		// Of the wide-bodies only the 787s leave the runway at the small ones' early exit (user 18-11-2026)
-		B789->bEarlyRunwayExit = true;
-		B78X->bEarlyRunwayExit = true;
+		B789->EarlyRunwayExitShare = 1.f;
+		B78X->EarlyRunwayExitShare = 1.f;
 		UAircraftTypeData* B788 = MakeAircraftType(TEXT("B788"), TEXT("Boeing 787-8"), EAerodromeCode::E, EWakeCategory::Heavy, 60.1f, 56.7f, 22.8f, 25.f, 2.5f);
 		// The 787-8 and the A380 are wider than they are long: the long-side rule would take the wings for the fuselage
 		FitMesh(B788, *Plane(TEXT("787norwegian")), FRotator(0.f, -90.f, 0.f));
-		B788->bEarlyRunwayExit = true;
+		B788->EarlyRunwayExitShare = 1.f;
 		UAircraftTypeData* B77W = MakeAircraftType(TEXT("B77W"), TEXT("Boeing 777-300ER"), EAerodromeCode::E, EWakeCategory::Heavy, 64.8f, 73.9f, 31.2f, 25.f, 2.5f);
 		FitMesh(B77W, *Plane(TEXT("777koreanair")));
 		AddLivery(B77W, TEXT("KLM"), *Model(TEXT("777-306_KLM_orange_pride/777-306_KLM_orange_pride/Geometries/Group_101.Group_101")));
@@ -456,6 +456,7 @@ namespace ATCExample
 		FitMesh(B77L, *Plane(TEXT("777fedex")));
 		UAircraftTypeData* A359 = MakeAircraftType(TEXT("A359"), TEXT("Airbus A350-900"), EAerodromeCode::E, EWakeCategory::Heavy, 64.8f, 66.8f, 28.7f, 25.f, 2.5f);
 		FitMesh(A359, *Plane(TEXT("a350finnair")));
+		A359->EarlyRunwayExitShare = 0.35f;   // user 18-11-2026: A350s sometimes take the early exit too
 		AddLivery(A359, TEXT("DLH"), *Plane(TEXT("a350lufthansa")));
 		AddLivery(A359, TEXT("QTR"), *Plane(TEXT("a350qatar")));
 		AddLivery(A359, TEXT("SIA"), *Plane(TEXT("a350singaporeairlines")));
@@ -469,6 +470,14 @@ namespace ATCExample
 		if (FPackageName::DoesPackageExist(TEXT("/Game/Aircraft/Fleet/SM_UAE_A388_HQ")))
 		{
 			FitMesh(A388, TEXT("/Game/Aircraft/Fleet/SM_UAE_A388_HQ.SM_UAE_A388_HQ"));   // merged HQ model, as the KLM 787
+		}
+
+		// Final approach speeds, about Vref + 5 kt at a typical landing weight (user 18-11-2026: different speeds like real life)
+		const TPair<UAircraftTypeData*, float> Speeds[] = { { E190, 125.f }, { A320, 135.f }, { B738, 145.f }, { B788, 140.f }, { B789, 145.f }, { B78X, 150.f },
+			{ A333, 140.f }, { A359, 140.f }, { B77W, 150.f }, { B77L, 150.f }, { B744, 155.f }, { A388, 140.f } };
+		for (const TPair<UAircraftTypeData*, float>& Speed : Speeds)
+		{
+			Speed.Key->ApproachSpeedKt = Speed.Value;
 		}
 	}
 

@@ -161,6 +161,16 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Taxi|Landing")
 	float TouchdownFromEndCm = 0.f;
 
+	/**
+	 * Departure route that ends lined up on a runway: a point on its centre line and the takeoff direction (from the
+	 * painted runway, set by ATC.CheckRoutes). The takeoff roll and climb-out stay on it. Zero = unknown: the route end.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Taxi|Takeoff")
+	FVector TakeoffLinePoint = FVector::ZeroVector;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Taxi|Takeoff")
+	FVector TakeoffDirection = FVector::ZeroVector;
+
 	/** Yellow centerline along the spline. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Taxi|Visual")
 	bool bShowCenterline = true;
