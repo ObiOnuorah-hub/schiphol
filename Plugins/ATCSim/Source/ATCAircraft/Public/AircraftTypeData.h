@@ -75,6 +75,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Visual")
 	TSoftObjectPtr<UStaticMesh> Mesh;
 
+	/**
+	 * A wide-body that leaves the landing runway at the narrow-bodies' early exit (the 787: light, strong brakes); the
+	 * other wide-bodies roll on to the far exit. Used where a gate has an EarlyExitArrivalRoute.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ground performance")
+	bool bEarlyRunwayExit = false;
+
 	/** Puts the model with its main gear on the actor origin and the nose along +X. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Visual")
 	FTransform MeshOffset;

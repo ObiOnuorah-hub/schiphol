@@ -31,6 +31,13 @@ struct ATCAIRCRAFT_API FTrafficGate
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	FGameplayTag SidestepArrivalRoute;
 
+	/**
+	 * Wide-body gates: the arrival over the narrow-bodies' early runway exit, for wide-body types that brake as short
+	 * (UAircraftTypeData::bEarlyRunwayExit: the 787). Empty = every type takes ArrivalRoute.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
+	FGameplayTag EarlyExitArrivalRoute;
+
 	/** From the end of the pushback to the departure runway. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	FGameplayTag DepartureRoute;

@@ -1061,11 +1061,11 @@ namespace ATCSetup
 		const double RunwayLength = FVector::Dist2D(Runway.A, Runway.B);
 		// Narrow-bodies brake to taxi speed sooner and leave earlier than wide-bodies: two exit streams on one landing
 		// runway (with all on one exit the next landing went around while the last still taxied off, 17-11-2026)
-		// (small ones from a third of the runway: the 27 connector at 1.35 km lay outside a 42 % window, so they took a node
-		// on the parallel taxiway 82 m from the runway and cut across the grass to it)
-		const bool bWide = D.Type->AerodromeCode >= EAerodromeCode::E;
-		const double ExitFrom = (bWide ? 0.42 : 0.33) * RunwayLength, ExitBest = (bWide ? 0.60 : 0.40) * RunwayLength;
-		const double AlongWeight = bWide ? 0.5 : 0.15;   // small ones: near the runway edge counts more than the exact place
+		// User 18-11-2026: on 27 they left too early (small ones at 1.37 km): small ones now around 57 % (the 2 km exit the
+		// wide-bodies had), wide-bodies around 70 % (about 2.4 km on 27); near the runway edge counts more than the exact place
+		const bool bWide = D.Type->AerodromeCode >= EAerodromeCode::E && !D.bEarlyExit;   // the 787 brakes like a small one (bEarlyExit)
+		const double ExitFrom = (bWide ? 0.62 : 0.52) * RunwayLength, ExitBest = (bWide ? 0.70 : 0.575) * RunwayLength;
+		const double AlongWeight = 0.15;
 		// A short runway (the Oostbaan, 2 km) may be left at its end
 		const double ExitTo = RunwayLength < 250000.0 ? RunwayLength + 10000.0 : FMath::Min(0.78 * RunwayLength, RunwayLength - 30000.0);
 		TArray<int32> Nearby;
@@ -1095,6 +1095,19 @@ namespace ATCSetup
 				if (Along < ExitFrom || Along > ExitTo || (!bPastEnd && Side < Runway.HalfWidthCm + 800.0) || Side > Runway.HalfWidthCm + 15000.0)
 				{
 					continue;
+				}
+				// Not an exit angled back against the landing (at 2 km on 27 two exits cross in an X, one made for 09 landings):
+				// the paint line, taken away from the runway, must not lead back more than about 20 degrees
+				if (Pass < 2 && !bPastEnd)
+				{
+					FVector2D Line = Network.LineDirection(Node);
+					const FVector2D Normal(-LandingDirection.Y, LandingDirection.X);
+					const double Outward = FMath::Sign(FVector2D(Delta) | Normal);
+					Line = (Line | Normal) * Outward < 0.0 ? -Line : Line;
+					if (FMath::Abs(Line | Normal) > 0.2 && (Line | FVector2D(LandingDirection)) < -0.35)
+					{
+						continue;
+					}
 				}
 				const double Score = Side + AlongWeight * FMath::Abs(Along - ExitBest);
 				if (Score < BestScore)
@@ -1291,10 +1304,26 @@ namespace ATCSetup
 				}
 				LeadOff[0] = OnCenterline(TurnAlong);
 			}
-			else if (Back.Num() >= 8 && EndSide < Runway.HalfWidthCm + 2500.0)
+			else if (EndSide < Runway.HalfWidthCm + 2500.0)
 			{
-				// The paint stops at the runway edge: its own line goes on straight to the centre line
-				const FVector2D Towards = FVector2D(Network.Nodes[Here] - Network.Nodes[Back[Back.Num() - 8]]).GetSafeNormal();
+				// The paint stops at the runway edge: its own line goes on straight to the centre line. Its direction from the
+				// last 15 m walked, or (the exit node itself is the paint end, 27 at 2 km) from the taxi-in's first 15 m
+				FVector2D Towards = FVector2D::ZeroVector;
+				if (Back.Num() >= 8)
+				{
+					Towards = FVector2D(Network.Nodes[Here] - Network.Nodes[Back[Back.Num() - 8]]).GetSafeNormal();
+				}
+				else
+				{
+					for (const int32 Node : Path)
+					{
+						if (FVector::Dist2D(Network.Nodes[Node], Network.Nodes[Here]) >= 1500.0)
+						{
+							Towards = FVector2D(Network.Nodes[Here] - Network.Nodes[Node]).GetSafeNormal();
+							break;
+						}
+					}
+				}
 				const FVector2D Normal(-LandingDirection.Y, LandingDirection.X);
 				const FVector2D Delta(Network.Nodes[Here] - Threshold);
 				const double Signed = Delta | Normal;
@@ -1592,6 +1621,24 @@ namespace ATCSetup
 		if (BuildArrival(Site, S))
 		{
 			D.SidestepRoute = SpawnArrivalRoute(World, Site, S);
+		}
+	}
+
+	/**
+	 * A wide-body gate's second arrival: over the early runway exit of the narrow-bodies, for the 787 (user 18-11-2026: of
+	 * the wide-bodies only the 787 leaves 27 where the small ones do, the others take the far exit). Tag
+	 * Route.EHAM.<gate>.Early.Arr<runway>; the traffic director gives it to types with bEarlyRunwayExit.
+	 */
+	void AddEarlyExit(UWorld* World, const FSite& Site, FDeparture& D)
+	{
+		FDeparture E = D;
+		const FString Taxi = D.TaxiRouteTag.ToString();
+		E.bEarlyExit = true;
+		E.ArrivalRouteTag = FName(*(Taxi.Left(Taxi.Find(TEXT(".Rwy"), ESearchCase::CaseSensitive, ESearchDir::FromEnd)) + TEXT(".Early.Arr") + D.ArrivalRunway));
+		E.Arrival.Reset();
+		if (!D.ArrivalRunway.IsEmpty() && BuildArrival(Site, E))
+		{
+			D.EarlyExitRoute = SpawnArrivalRoute(World, Site, E);
 		}
 	}
 
@@ -2283,6 +2330,10 @@ namespace ATCSetup
 				{
 					Gate.DepartureRoute = RouteIt->RouteTag;
 				}
+				else if (RouteTag.StartsWith(FString::Printf(TEXT("Route.EHAM.%s.Early.Arr"), *Ref)))
+				{
+					Gate.EarlyExitArrivalRoute = RouteIt->RouteTag;
+				}
 				else if (RouteTag == FString::Printf(TEXT("Route.EHAM.%s.Arr%s"), *Ref, Sidestep22))
 				{
 					Gate.SidestepArrivalRoute = RouteIt->RouteTag;
@@ -2483,7 +2534,7 @@ namespace ATCSetup
 		TArray<FString> DepartureRunways, ArrivalRunways;
 		Args[0].ParseIntoArray(DepartureRunways, TEXT(","));
 		Args[1].ParseIntoArray(ArrivalRunways, TEXT(","));
-		UAircraftTypeData* Type = LoadType(TEXT("A320"));
+		UAircraftTypeData* NarrowType = LoadType(TEXT("A320"));
 
 		auto RouteLength = [](const TArray<FVector>& Points)
 		{
@@ -2498,6 +2549,9 @@ namespace ATCSetup
 		for (int32 Index = 2; Index < Args.Num(); ++Index)
 		{
 			FString Line = Args[Index] + TEXT(":");
+			// A wide-body gate of the plan is tried with a 787 (its own exit), the others with an A320
+			const bool bWideGate = Algo::FindByPredicate(EHAMGates, [&](const FGatePlan& Plan) { return Args[Index] == Plan.Ref && Plan.bWideBody; }) != nullptr;
+			UAircraftTypeData* Type = bWideGate ? LoadType(TEXT("B789")) : NarrowType;
 			FDeparture Best;
 			double BestDeparture = 0.0, BestArrival = 0.0;
 			for (const FString& Runway : DepartureRunways)
@@ -4048,7 +4102,9 @@ namespace ATCSetup
 				if (!Plan.Gate.ArrivalRouteTag.IsNone())
 				{
 					Names.Append({ Plan.Gate.ArrivalRouteTag, FName(*FString::Printf(TEXT("Route.EHAM.%s.Alt.Arr%s"), *Plan.Name, *Plan.Gate.ArrivalRunway)),
-						FName(*FString::Printf(TEXT("Route.EHAM.%s.Arr%s"), *Plan.Name, Sidestep22)), FName(*FString::Printf(TEXT("Route.EHAM.%s.Alt.Arr%s"), *Plan.Name, Sidestep22)) });
+						FName(*FString::Printf(TEXT("Route.EHAM.%s.Arr%s"), *Plan.Name, Sidestep22)), FName(*FString::Printf(TEXT("Route.EHAM.%s.Alt.Arr%s"), *Plan.Name, Sidestep22)),
+						FName(*FString::Printf(TEXT("Route.EHAM.%s.Early.Arr%s"), *Plan.Name, *Plan.Gate.ArrivalRunway)),
+						FName(*FString::Printf(TEXT("Route.EHAM.%s.Early.Alt.Arr%s"), *Plan.Name, *Plan.Gate.ArrivalRunway)) });
 				}
 				for (const FName& Name : Names)
 				{
@@ -4148,7 +4204,11 @@ namespace ATCSetup
 				{
 					AddSidestep(World, Site, Plan.Gate);
 				}
-				for (AActor* Actor : TArray<AActor*>({ Plan.Gate.Stand, Plan.Gate.PushRoute, Plan.Gate.TaxiRoute, Plan.Gate.ArrivalRoute, Plan.Gate.SidestepRoute }))
+				else if (Plan.Gate.ArrivalRoute)
+				{
+					AddEarlyExit(World, Site, Plan.Gate);
+				}
+				for (AActor* Actor : TArray<AActor*>({ Plan.Gate.Stand, Plan.Gate.PushRoute, Plan.Gate.TaxiRoute, Plan.Gate.ArrivalRoute, Plan.Gate.SidestepRoute, Plan.Gate.EarlyExitRoute }))
 				{
 					if (Actor)
 					{
@@ -4162,6 +4222,7 @@ namespace ATCSetup
 				Gate->DepartureRoute = Plan.Gate.TaxiRoute->RouteTag;
 				Gate->ArrivalRoute = Plan.Gate.ArrivalRoute ? Plan.Gate.ArrivalRoute->RouteTag : FGameplayTag();
 				Gate->SidestepArrivalRoute = Plan.Gate.SidestepRoute ? Plan.Gate.SidestepRoute->RouteTag : FGameplayTag();
+				Gate->EarlyExitArrivalRoute = Plan.Gate.EarlyExitRoute ? Plan.Gate.EarlyExitRoute->RouteTag : FGameplayTag();
 				Gate->bWideBody = Plan.Type->AerodromeCode >= EAerodromeCode::E;
 				++Added;
 			}
@@ -4222,6 +4283,10 @@ namespace ATCSetup
 				if (!Plan.bWideBody)
 				{
 					AddSidestep(World, Site, D);
+				}
+				else if (D.ArrivalRoute)
+				{
+					AddEarlyExit(World, Site, D);
 				}
 				Departures.Add(D);
 			}

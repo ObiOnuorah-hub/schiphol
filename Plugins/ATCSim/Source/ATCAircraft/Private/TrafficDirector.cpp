@@ -380,6 +380,11 @@ void ATrafficDirector::SpawnArrival()
 	Request.Callsign = Spawner->MakeCallsign(Airlines);
 	Request.AircraftClass = TrafficMix->AircraftClass.LoadSynchronous();
 	Request.RouteTag = Gates[Gate].ArrivalRoute;
+	// The 787 leaves the runway at the small ones' early exit, the other wide-bodies roll on to the far one
+	if (Type && Type->bEarlyRunwayExit && Gates[Gate].EarlyExitArrivalRoute.IsValid() && Traffic->FindRoute(Gates[Gate].EarlyExitArrivalRoute))
+	{
+		Request.RouteTag = Gates[Gate].EarlyExitArrivalRoute;
+	}
 	// Now and then a small one flies the final and sidesteps late to the other runway (Schiphol: 27 -> Oostbaan 22),
 	// when nobody stands in the way of that arrival either
 	if (bVisibleLandings && Gates[Gate].SidestepArrivalRoute.IsValid() && Type && Type->AerodromeCode <= EAerodromeCode::C && Random.FRand() < SidestepShare)
@@ -511,7 +516,8 @@ void ATrafficDirector::HandleAircraftEvent(AActor* Actor, FName Callsign, FGamep
 
 	// Arrived at the end of the arrival route (or the parallel lane it was given): on the stand, the turnaround starts
 	if (EventTag == TAG_ATC_Event_Taxi_Arrived && Gate && Aircraft && Aircraft->TaxiController->PlannedRoute
-		&& (Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].ArrivalRoute || Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].SidestepArrivalRoute))
+		&& (Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].ArrivalRoute || Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].SidestepArrivalRoute
+			|| Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].EarlyExitArrivalRoute))
 	{
 		FTimerHandle Handle;
 		GetWorldTimerManager().SetTimer(Handle, FTimerDelegate::CreateWeakLambda(this, [this, Callsign]() { Depart(Callsign); }),

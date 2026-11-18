@@ -436,9 +436,13 @@ namespace ATCExample
 			FitMesh(B789, TEXT("/Game/Aircraft/Fleet/SM_KLM_B789_HQ.SM_KLM_B789_HQ"));
 			FitMesh(B78X, TEXT("/Game/Aircraft/Fleet/SM_KLM_B789_HQ.SM_KLM_B789_HQ"));
 		}
+		// Of the wide-bodies only the 787s leave the runway at the small ones' early exit (user 18-11-2026)
+		B789->bEarlyRunwayExit = true;
+		B78X->bEarlyRunwayExit = true;
 		UAircraftTypeData* B788 = MakeAircraftType(TEXT("B788"), TEXT("Boeing 787-8"), EAerodromeCode::E, EWakeCategory::Heavy, 60.1f, 56.7f, 22.8f, 25.f, 2.5f);
 		// The 787-8 and the A380 are wider than they are long: the long-side rule would take the wings for the fuselage
 		FitMesh(B788, *Plane(TEXT("787norwegian")), FRotator(0.f, -90.f, 0.f));
+		B788->bEarlyRunwayExit = true;
 		UAircraftTypeData* B77W = MakeAircraftType(TEXT("B77W"), TEXT("Boeing 777-300ER"), EAerodromeCode::E, EWakeCategory::Heavy, 64.8f, 73.9f, 31.2f, 25.f, 2.5f);
 		FitMesh(B77W, *Plane(TEXT("777koreanair")));
 		AddLivery(B77W, TEXT("KLM"), *Model(TEXT("777-306_KLM_orange_pride/777-306_KLM_orange_pride/Geometries/Group_101.Group_101")));
