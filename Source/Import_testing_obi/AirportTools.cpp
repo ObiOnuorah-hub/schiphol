@@ -16,6 +16,7 @@
 #include "Engine/Engine.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Components/MeshComponent.h"
 #include "Components/SkinnedMeshComponent.h"
 #include "Engine/SkinnedAsset.h"
@@ -79,6 +80,9 @@
 #include "ImageUtils.h"
 #include "ImageCore.h"
 #endif
+#include "Containers/Ticker.h"
+#include "RenderTimer.h"
+#include "DynamicRHI.h"
 
 namespace
 {
@@ -4550,6 +4554,10 @@ namespace
 				Pawn->SetActorLocationAndRotation(From, Look, false, nullptr, ETeleportType::TeleportPhysics);
 			}
 			Controller->SetControlRotation(Look);
+			if (Controller->PlayerCameraManager)
+			{
+				Controller->PlayerCameraManager->SetGameCameraCutThisFrame();   // the jump is a cut: no motion blur in the picture
+			}
 			const FString File = Folder / FString::Printf(TEXT("chase_%02d.png"), *Shot);
 			FScreenshotRequest::RequestScreenshot(File, false, false);
 			UE_LOG(LogTemp, Display, TEXT("Airport.Chase: %s at X=%.0f Y=%.0f m, %.0f m up, heading %.0f, bank %.1f, pitch %.1f: %s"), *Callsign.ToString(),
@@ -4568,6 +4576,169 @@ namespace
 		TEXT("Airport.Fleet"),
 		TEXT("Play: every fleet model with close-ups of its engine. Usage: Airport.Fleet <seconds first> <prefix> [ICAO]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&FleetShots));
+
+	/** What the camera renders now: meshes grouped by actor name, the non-Nanite ones with their sections (about the draw calls) */
+	void PanCensus(UWorld* World, double Yaw)
+	{
+		struct FGroup { int32 Components = 0, Sections = 0; int64 Triangles = 0; FString Example; };
+		TMap<FString, FGroup> Groups;
+		int32 NaniteComponents = 0;
+		FGroup Total;
+		for (TObjectIterator<UStaticMeshComponent> It; It; ++It)
+		{
+			const UStaticMeshComponent* Component = *It;
+			if (Component->GetWorld() != World || !Component->IsRegistered() || !Component->WasRecentlyRendered(0.2f))
+			{
+				continue;
+			}
+			const UStaticMesh* Mesh = Component->GetStaticMesh();
+			const FStaticMeshRenderData* RenderData = Mesh ? Mesh->GetRenderData() : nullptr;
+			if (!RenderData || RenderData->LODResources.Num() == 0)
+			{
+				continue;
+			}
+			if (Mesh->HasValidNaniteData())
+			{
+				++NaniteComponents;
+				continue;
+			}
+			const UInstancedStaticMeshComponent* Instanced = Cast<UInstancedStaticMeshComponent>(Component);
+			const int32 Copies = Instanced ? Instanced->GetInstanceCount() : 1;
+			FString Key = Component->GetOwner() ? Component->GetOwner()->GetActorNameOrLabel() : FString(TEXT("?"));
+			while (Key.Len() > 1 && (FChar::IsDigit(Key[Key.Len() - 1]) || Key[Key.Len() - 1] == TEXT('_')))
+			{
+				Key.LeftChopInline(1);
+			}
+			FGroup& Group = Groups.FindOrAdd(Key);
+			const int32 Sections = RenderData->LODResources[0].Sections.Num();
+			const int64 Triangles = static_cast<int64>(RenderData->LODResources[0].GetNumTriangles()) * Copies;
+			++Group.Components;
+			Group.Sections += Sections;
+			Group.Triangles += Triangles;
+			Group.Example = Mesh->GetPathName();
+			++Total.Components;
+			Total.Sections += Sections;
+			Total.Triangles += Triangles;
+		}
+		// Skinned meshes in view (they animate only while they are rendered)
+		TMap<FString, int32> Skinned;
+		for (TObjectIterator<USkinnedMeshComponent> It; It; ++It)
+		{
+			if (It->GetWorld() == World && It->IsRegistered() && It->WasRecentlyRendered(0.2f))
+			{
+				++Skinned.FindOrAdd(It->GetSkinnedAsset() ? It->GetSkinnedAsset()->GetName() : FString(TEXT("?")));
+			}
+		}
+		for (const TPair<FString, int32>& Pair : Skinned)
+		{
+			UE_LOG(LogTemp, Display, TEXT("Airport.Pan census     skinned %s x%d"), *Pair.Key, Pair.Value);
+		}
+		Groups.ValueSort([](const FGroup& A, const FGroup& B) { return A.Sections > B.Sections; });
+		UE_LOG(LogTemp, Display, TEXT("Airport.Pan census yaw %.0f: %d Nanite meshes, %d other meshes with %d sections and %lld k triangles"),
+			Yaw, NaniteComponents, Total.Components, Total.Sections, Total.Triangles / 1000);
+		int32 Shown = 0;
+		for (const TPair<FString, FGroup>& Pair : Groups)
+		{
+			if (++Shown > 10)
+			{
+				break;
+			}
+			UE_LOG(LogTemp, Display, TEXT("Airport.Pan census     %-28s %5d meshes %5d sections %7lld k tris  (%s)"), *Pair.Key, Pair.Value.Components,
+				Pair.Value.Sections, Pair.Value.Triangles / 1000, *Pair.Value.Example);
+		}
+	}
+
+	/** Play: turns the view once slowly around the camera's place and logs the frame time per direction (where does it get slow?) */
+	void Pan(const TArray<FString>& Args, UWorld* World)
+	{
+		APlayerController* Controller = World ? World->GetFirstPlayerController() : nullptr;
+		APawn* Pawn = Controller ? Controller->GetPawn() : nullptr;
+		if (!World || !World->IsGameWorld() || !Pawn)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Airport.Pan: run this during Play."));
+			return;
+		}
+		const float Period = Args.Num() > 0 ? FMath::Max(FCString::Atof(*Args[0]), 5.f) : 60.f;
+		const float Pitch = Args.Num() > 1 ? FCString::Atof(*Args[1]) : -5.f;
+		FVector Location = Pawn->GetActorLocation();
+		const int32 At = Args.Find(TEXT("at"));
+		if (At != INDEX_NONE && Args.Num() > At + 3)
+		{
+			Location = FVector(FCString::Atof(*Args[At + 1]), FCString::Atof(*Args[At + 2]), FCString::Atof(*Args[At + 3])) * 100.0;
+		}
+		const bool bQuit = Args.Contains(TEXT("quit"));
+		const bool bCensus = Args.Contains(TEXT("census"));
+		const int32 FromArg = Args.Find(TEXT("from"));
+		const double From = FromArg != INDEX_NONE && Args.Num() > FromArg + 1 ? FCString::Atod(*Args[FromArg + 1]) : 0.0;
+		UE_LOG(LogTemp, Display, TEXT("Airport.Pan: from X=%.0f Y=%.0f m, %.0f m up, one turn in %.0f s (yaw 0 east, 90 south, 180 west, 270 north)"),
+			Location.X / 100.0, Location.Y / 100.0, Location.Z / 100.0, Period);
+
+		struct FSector { double Sum = 0.0, Worst = 0.0, Game = 0.0, Render = 0.0, Gpu = 0.0; int32 Frames = 0, Hitches = 0, Slow = 0; };
+		TSharedRef<TArray<FSector>> Sectors = MakeShared<TArray<FSector>>();
+		Sectors->SetNum(24);
+		TSharedRef<double> Elapsed = MakeShared<double>(-3.0);   // the first 3 s to settle
+		TSharedRef<int32> LastSector = MakeShared<int32>(0);
+		const TWeakObjectPtr<UWorld> WeakWorld(World);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakWorld, Location, Period, Pitch, From, bQuit, bCensus, Sectors, Elapsed, LastSector](float DeltaTime)
+		{
+			UWorld* Current = WeakWorld.Get();
+			APlayerController* PC = Current ? Current->GetFirstPlayerController() : nullptr;
+			APawn* Viewer = PC ? PC->GetPawn() : nullptr;
+			if (!Viewer)
+			{
+				return false;
+			}
+			// This frame's time belongs to the direction of the frame before
+			if (*Elapsed >= 0.0)
+			{
+				FSector& Sector = (*Sectors)[*LastSector];
+				const double Ms = DeltaTime * 1000.0;
+				Sector.Sum += Ms;
+				Sector.Worst = FMath::Max(Sector.Worst, Ms);
+				Sector.Game += FPlatformTime::ToMilliseconds(GGameThreadTime);
+				Sector.Render += FPlatformTime::ToMilliseconds(GRenderThreadTime);
+				Sector.Gpu += FPlatformTime::ToMilliseconds(RHIGetGPUFrameCycles());
+				Sector.Hitches += Ms > 33.0 ? 1 : 0;
+				Sector.Slow += Ms > 16.7 ? 1 : 0;   // misses a 60 Hz screen refresh
+				++Sector.Frames;
+			}
+			*Elapsed += DeltaTime;
+			if (*Elapsed >= Period)
+			{
+				for (int32 Index = 0; Index < Sectors->Num(); ++Index)
+				{
+					const FSector& Sector = (*Sectors)[Index];
+					const double N = FMath::Max(Sector.Frames, 1);
+					UE_LOG(LogTemp, Display, TEXT("Airport.Pan: yaw %3d-%3d  frame %5.1f ms (game %4.1f, render %4.1f, gpu %4.1f)  worst %5.1f  over 16.7 ms %4.1f %%  hitches %d"),
+						Index * 15, Index * 15 + 15, Sector.Sum / N, Sector.Game / N, Sector.Render / N, Sector.Gpu / N, Sector.Worst, 100.0 * Sector.Slow / N, Sector.Hitches);
+				}
+				if (bQuit)
+				{
+					FPlatformMisc::RequestExit(false);
+				}
+				return false;
+			}
+			const double Yaw = FMath::Fmod(From + 360.0 * FMath::Max(*Elapsed, 0.0) / Period, 360.0);
+			const int32 NewSector = FMath::Clamp(FMath::FloorToInt32(Yaw / 15.0), 0, 23);
+			// Every 45 degrees: what is in view, and a picture of it
+			if (bCensus && *Elapsed >= 0.0 && NewSector != *LastSector && NewSector % 3 == 1)
+			{
+				PanCensus(Current, Yaw);
+				FScreenshotRequest::RequestScreenshot(FPaths::ProjectSavedDir() / TEXT("Screenshots/Airport/pan") / FString::Printf(TEXT("yaw_%03d.png"), FMath::RoundToInt32(Yaw)), false, false);
+			}
+			*LastSector = NewSector;
+			const FRotator Look(Pitch, Yaw, 0.0);
+			// The VR pawn's camera follows the pawn itself, not only the control rotation
+			Viewer->SetActorLocationAndRotation(Location, Look, false, nullptr, ETeleportType::TeleportPhysics);
+			PC->SetControlRotation(Look);
+			return true;
+		}));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs PanCommand(
+		TEXT("Airport.Pan"),
+		TEXT("Play: turn the view once around and log the frame time per direction. Usage: Airport.Pan [seconds per turn] [pitch] [at <x m> <y m> <h m>] [from <yaw>] [census] [quit]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Pan));
 
 	FAutoConsoleCommandWithWorldAndArgs ShotsCommand(
 		TEXT("Airport.Shots"),

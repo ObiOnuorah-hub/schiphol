@@ -449,6 +449,8 @@ bool FATCTaxiLightsTest::RunTest(const FString& Parameters)
 	Line.Name = TEXT("HP");
 	Line.Distance = 53000.f;
 	Route->Waypoints = { Line };
+	// Fixed 15 m (low visibility) so the counts below don't depend on the default spacing
+	Route->LightSpacingCm = 1500.f;
 	Route->Rebuild();
 
 	const TArray<float>& Data = Route->Lights->PerInstanceSMCustomData;

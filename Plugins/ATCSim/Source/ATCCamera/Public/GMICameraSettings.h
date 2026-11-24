@@ -27,11 +27,12 @@ public:
 
 	/** The other cameras whose screen is in view. A camera whose screens nobody sees does not render at all. */
 	UPROPERTY(Config, EditAnywhere, Category = "Budget", meta = (Units = "Hz", ClampMin = "0"))
-	float BackgroundRateHz = 5.f;
+	float BackgroundRateHz = 3.f;
 
-	/** At most this many captures in one frame, so the cost is spread over the frames. */
+	/** At most this many captures in one frame, so the cost is spread over the frames (two in one frame were a visible stutter
+	 * at 3440x1440: each capture is about 4 ms GPU, 18-11-2026). */
 	UPROPERTY(Config, EditAnywhere, Category = "Budget", meta = (ClampMin = "1"))
-	int32 MaxCapturesPerFrame = 2;
+	int32 MaxCapturesPerFrame = 1;
 
 	/** Mapping for the camera the operator moves (added with priority 1 when play starts). */
 	UPROPERTY(Config, EditAnywhere, Category = "Input")

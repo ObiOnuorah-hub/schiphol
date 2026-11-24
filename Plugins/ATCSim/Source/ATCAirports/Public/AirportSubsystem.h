@@ -55,6 +55,8 @@ private:
 	void ApplyPlayTower(TWeakObjectPtr<UWorld> World, int32 Attempt);
 	void ScheduleSpawns(UWorld* World);
 	void ApplyRenderProfile();
+	/** Skeletal meshes without animation (parked aircraft of the map) drawn in their rest pose, without skinning every frame */
+	static void RenderStillMeshesStatic(TWeakObjectPtr<UWorld> World);
 
 	UPROPERTY(Transient)
 	TObjectPtr<UScenarioData> PendingScenario;

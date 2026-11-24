@@ -45,6 +45,9 @@ UATCSimSettings::UATCSimSettings()
 	DesktopProfile.Add(TEXT("r.VolumetricCloud.Shadow.ViewRaySampleMaxCount"), TEXT("16"));
 	DesktopProfile.Add(TEXT("r.SkyLight.RealTimeReflectionCapture.TimeSlice"), TEXT("1"));
 	DesktopProfile.Add(TEXT("r.TSR.History.ScreenPercentage"), TEXT("100"));
+	// Looking at the tower screens: every camera picture renders the scene again (about 4 ms GPU at 3440x1440), the two
+	// live cameras at 20 Hz made almost every frame slower than 60 Hz there (18-11-2026). 15 Hz like in the headset
+	DesktopProfile.Add(TEXT("atc.CameraRateScale"), TEXT("0.75"));
 
 	ValidatedPaths = { TEXT("/Game/Aircraft"), TEXT("/Game/Airports"), TEXT("/Game/Environment"), TEXT("/Game/Camera"), TEXT("/Game/Scenarios"), TEXT("/ATCSim") };
 	AllowedDependencyRoots = { TEXT("/Game/"), TEXT("/ATCSim/"), TEXT("/Script/"), TEXT("/Engine/"), TEXT("/Niagara/") };

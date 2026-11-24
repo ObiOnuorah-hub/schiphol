@@ -21,6 +21,9 @@
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/PostProcessVolume.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Animation/AnimInstance.h"
+#include "Animation/AnimationAsset.h"
 #include "EngineUtils.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
@@ -113,6 +116,44 @@ void UAirportSubsystem::HandleActorsInitialized(const FActorsInitializedParams& 
 	// A moment after BeginPlay: a follow camera in the map (the EHAM spline aircraft) takes the view on its first tick
 	FTimerHandle Handle;
 	World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateUObject(this, &UAirportSubsystem::ApplyPlayTower, TWeakObjectPtr<UWorld>(World), 0), 0.2f, false);
+	FTimerHandle StillHandle;
+	World->GetTimerManager().SetTimer(StillHandle, FTimerDelegate::CreateStatic(&UAirportSubsystem::RenderStillMeshesStatic, TWeakObjectPtr<UWorld>(World)), 0.1f, false);
+}
+
+void UAirportSubsystem::RenderStillMeshesStatic(TWeakObjectPtr<UWorld> WeakWorld)
+{
+	// Skeletal meshes without animation (the map's parked aircraft) were skinned again for every view and every camera
+	// picture: 1.4 ms GPU a frame, and 1.8 ms animation on the game thread while in view (18-11-2026). In their rest pose
+	// they look the same
+	UWorld* World = WeakWorld.Get();
+	if (!World)
+	{
+		return;
+	}
+	int32 Still = 0;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (Cast<APawn>(*It))
+		{
+			continue;   // the player's hands and anything that moves by itself
+		}
+		TInlineComponentArray<USkeletalMeshComponent*> Meshes(*It);
+		for (USkeletalMeshComponent* Mesh : Meshes)
+		{
+			const EAnimationMode::Type Mode = Mesh->GetAnimationMode();
+			const bool bAnimated = (Mode == EAnimationMode::AnimationBlueprint && Mesh->AnimClass)
+				|| (Mode == EAnimationMode::AnimationSingleNode && Mesh->AnimationData.AnimToPlay)
+				|| Mesh->GetAnimInstance() != nullptr;
+			if (bAnimated || Mesh->bRenderStatic)
+			{
+				continue;
+			}
+			Mesh->SetRenderStatic(true);
+			Mesh->SetComponentTickEnabled(false);
+			++Still;
+		}
+	}
+	UE_LOG(LogATC, Display, TEXT("%d skeletal meshes without animation drawn in their rest pose (no skinning every frame)"), Still);
 }
 
 void UAirportSubsystem::ApplyPlayTower(TWeakObjectPtr<UWorld> WeakWorld, int32 Attempt)

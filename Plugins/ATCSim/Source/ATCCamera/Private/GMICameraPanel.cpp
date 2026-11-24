@@ -1,4 +1,5 @@
 #include "GMICameraPanel.h"
+#include "Engine/TextureRenderTarget2D.h"
 #include "Blueprint/WidgetTree.h"
 #include "Components/Border.h"
 #include "Components/Image.h"
