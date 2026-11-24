@@ -145,6 +145,12 @@ public:
 	 */
 	static TArray<FTaxiClaimRequest> RunwayExitRequests(ATaxiRoute* Route, float StartCm, const UAircraftTypeData* Type);
 
+	/**
+	 * What a landing reserves of its way in, with ReserveTwoWay: the two-way stretches of the first 1.5 km past the runway on
+	 * Lane, from StartCm (where it leaves the runway centre line). Nobody enters them the other way before it has passed.
+	 */
+	static FTaxiClaimRequest TaxiInRequest(ATaxiRoute* Lane, float StartCm, const UAircraftTypeData* Type);
+
 	/** Overlaps the collision monitor has seen since Play started. Should stay 0. */
 	int32 GetOverlapCount() const { return OverlapCount; }
 
@@ -288,6 +294,8 @@ private:
 	void CheckDeadlocks();
 	void DrawClaims() const;
 	FString NameOf(const TObjectKey<AActor>& Key) const;
+	/** atc.LogTwoWay 1: who locks or reserves which two-way stretch, for tracing a head-on meeting. */
+	void LogTwoWay(const FClaim& Claim, const TCHAR* What, int32 Track, int32 TwoWay) const;
 	float GetNow() const;
 
 	TArray<FSample> Samples;

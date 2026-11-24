@@ -1063,7 +1063,7 @@ namespace ATCSetup
 		// runway (with all on one exit the next landing went around while the last still taxied off, 17-11-2026)
 		// User 18-11-2026: on 27 they left too early (small ones at 1.37 km): small ones now around 57 % (the 2 km exit the
 		// wide-bodies had), wide-bodies around 70 % (about 2.4 km on 27); near the runway edge counts more than the exact place
-		const bool bWide = D.Type->AerodromeCode >= EAerodromeCode::E && !D.bEarlyExit;   // the 787 brakes like a small one (bEarlyExit)
+		const bool bWide = (D.Type->AerodromeCode >= EAerodromeCode::E && !D.bEarlyExit) || D.bLateExit;   // the 787 brakes like a small one (bEarlyExit); a small one rolls on (bLateExit)
 		const double ExitFrom = (bWide ? 0.62 : 0.52) * RunwayLength, ExitBest = (bWide ? 0.70 : 0.575) * RunwayLength;
 		const double AlongWeight = 0.15;
 		// A short runway (the Oostbaan, 2 km) may be left at its end
@@ -1549,11 +1549,9 @@ namespace ATCSetup
 		}
 	}
 
-	ATaxiRoute* SpawnRoute(UWorld* World, const FName& RouteTag, const TArray<FVector>& Points)
+	/** Puts a line of points into the spline of a route. */
+	void SetRoutePoints(ATaxiRoute* Route, const TArray<FVector>& Points)
 	{
-		ATaxiRoute* Route = World->SpawnActor<ATaxiRoute>(Points[0], FRotator::ZeroRotator);
-		Route->RouteTag = Tag(RouteTag);
-		Route->bShowCenterline = false;   // the map has its own paint
 		Route->Spline->ClearSplinePoints(false);
 		TArray<FVector> Clean;
 		for (const FVector& Point : Points)
@@ -1580,6 +1578,14 @@ namespace ATCSetup
 			Route->Spline->SetTangentsAtSplinePoint(Index, Direction * Length, Direction * Length, ESplineCoordinateSpace::World, false);
 		}
 		Route->Spline->UpdateSpline();
+	}
+
+	ATaxiRoute* SpawnRoute(UWorld* World, const FName& RouteTag, const TArray<FVector>& Points)
+	{
+		ATaxiRoute* Route = World->SpawnActor<ATaxiRoute>(Points[0], FRotator::ZeroRotator);
+		Route->RouteTag = Tag(RouteTag);
+		Route->bShowCenterline = false;   // the map has its own paint
+		SetRoutePoints(Route, Points);
 		Route->SetActorLabel(RouteTag.ToString().Replace(TEXT("."), TEXT("_")));
 		Route->SetFolderPath(TEXT("ATC"));
 		Route->Tags.Add(SetupTag);
@@ -1602,26 +1608,6 @@ namespace ATCSetup
 		AddRunwayStops(Site, D, Route, true);
 		Route->RerunConstructionScripts();
 		return Route;
-	}
-
-	/** The runway a narrow-body arrival sometimes sidesteps to from the 27 final: the Oostbaan. */
-	const TCHAR* const Sidestep22 = TEXT("22");
-
-	/**
-	 * A narrow-body gate's second arrival: from the Oostbaan (22). Now and then a small aircraft flies the 27 final and
-	 * sidesteps to 22 late, as at Schiphol (ATrafficDirector::SidestepShare). Spawned when the route can be built.
-	 */
-	void AddSidestep(UWorld* World, const FSite& Site, FDeparture& D)
-	{
-		FDeparture S = D;
-		const FString Taxi = D.TaxiRouteTag.ToString();
-		S.ArrivalRunway = Sidestep22;
-		S.ArrivalRouteTag = FName(*(Taxi.Left(Taxi.Find(TEXT(".Rwy"), ESearchCase::CaseSensitive, ESearchDir::FromEnd)) + TEXT(".Arr") + Sidestep22));
-		S.Arrival.Reset();
-		if (BuildArrival(Site, S))
-		{
-			D.SidestepRoute = SpawnArrivalRoute(World, Site, S);
-		}
 	}
 
 	/**
@@ -1905,7 +1891,7 @@ namespace ATCSetup
 	/**
 	 * The Schiphol gates in the simulation: landings on the Buitenveldertbaan (27), departures from the Kaagbaan (24) and
 	 * the Polderbaan (36L) (user 17-11-2026; a real Schiphol combination, e.g. "27 18R 24 18L" in Stcrt. 2024-4851); before
-	 * that arrivals 36C/36R. Narrow-body gates also get an arrival from the Oostbaan (22), for a late sidestep (Sidestep22).
+	 * that arrivals 36C/36R. No routes on runway 22 (user 24-11-2026).
 	 * The pier decides the aircraft size the routes are built for: E, F and G are the wide-body piers. Checked with
 	 * ATC.ProbeEHAMGates.
 	 */
@@ -2333,10 +2319,6 @@ namespace ATCSetup
 				else if (RouteTag.StartsWith(FString::Printf(TEXT("Route.EHAM.%s.Early.Arr"), *Ref)))
 				{
 					Gate.EarlyExitArrivalRoute = RouteIt->RouteTag;
-				}
-				else if (RouteTag == FString::Printf(TEXT("Route.EHAM.%s.Arr%s"), *Ref, Sidestep22))
-				{
-					Gate.SidestepArrivalRoute = RouteIt->RouteTag;
 				}
 				else if (RouteTag.StartsWith(FString::Printf(TEXT("Route.EHAM.%s.Arr"), *Ref)))
 				{
@@ -4126,7 +4108,6 @@ namespace ATCSetup
 				if (!Plan.Gate.ArrivalRouteTag.IsNone())
 				{
 					Names.Append({ Plan.Gate.ArrivalRouteTag, FName(*FString::Printf(TEXT("Route.EHAM.%s.Alt.Arr%s"), *Plan.Name, *Plan.Gate.ArrivalRunway)),
-						FName(*FString::Printf(TEXT("Route.EHAM.%s.Arr%s"), *Plan.Name, Sidestep22)), FName(*FString::Printf(TEXT("Route.EHAM.%s.Alt.Arr%s"), *Plan.Name, Sidestep22)),
 						FName(*FString::Printf(TEXT("Route.EHAM.%s.Early.Arr%s"), *Plan.Name, *Plan.Gate.ArrivalRunway)),
 						FName(*FString::Printf(TEXT("Route.EHAM.%s.Early.Alt.Arr%s"), *Plan.Name, *Plan.Gate.ArrivalRunway)) });
 				}
@@ -4224,15 +4205,11 @@ namespace ATCSetup
 			}
 			else if (SpawnDeparture(World, Site, Plan.Gate))
 			{
-				if (Plan.Type->AerodromeCode < EAerodromeCode::E && Plan.Gate.ArrivalRoute)
-				{
-					AddSidestep(World, Site, Plan.Gate);
-				}
-				else if (Plan.Gate.ArrivalRoute)
+				if (Plan.Type->AerodromeCode >= EAerodromeCode::E && Plan.Gate.ArrivalRoute)
 				{
 					AddEarlyExit(World, Site, Plan.Gate);
 				}
-				for (AActor* Actor : TArray<AActor*>({ Plan.Gate.Stand, Plan.Gate.PushRoute, Plan.Gate.TaxiRoute, Plan.Gate.ArrivalRoute, Plan.Gate.SidestepRoute, Plan.Gate.EarlyExitRoute }))
+				for (AActor* Actor : TArray<AActor*>({ Plan.Gate.Stand, Plan.Gate.PushRoute, Plan.Gate.TaxiRoute, Plan.Gate.ArrivalRoute, Plan.Gate.EarlyExitRoute }))
 				{
 					if (Actor)
 					{
@@ -4245,7 +4222,6 @@ namespace ATCSetup
 				Gate->PushbackOption = Plan.Gate.Stand->PushbackOptions[0].OptionTag;
 				Gate->DepartureRoute = Plan.Gate.TaxiRoute->RouteTag;
 				Gate->ArrivalRoute = Plan.Gate.ArrivalRoute ? Plan.Gate.ArrivalRoute->RouteTag : FGameplayTag();
-				Gate->SidestepArrivalRoute = Plan.Gate.SidestepRoute ? Plan.Gate.SidestepRoute->RouteTag : FGameplayTag();
 				Gate->EarlyExitArrivalRoute = Plan.Gate.EarlyExitRoute ? Plan.Gate.EarlyExitRoute->RouteTag : FGameplayTag();
 				Gate->bWideBody = Plan.Type->AerodromeCode >= EAerodromeCode::E;
 				++Added;
@@ -4304,11 +4280,7 @@ namespace ATCSetup
 			}
 			if (SpawnDeparture(World, Site, D))
 			{
-				if (!Plan.bWideBody)
-				{
-					AddSidestep(World, Site, D);
-				}
-				else if (D.ArrivalRoute)
+				if (Plan.bWideBody && D.ArrivalRoute)
 				{
 					AddEarlyExit(World, Site, D);
 				}
@@ -4357,6 +4329,487 @@ namespace ATCSetup
 	FAutoConsoleCommand SetupEHAMCommand(TEXT("ATC.SetupEHAM"),
 		TEXT("Place stands G7/G4 and their pushback and taxi routes in the EHAM map (over the painted lines) and make the EHAM scenario"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&SetupEHAM));
+
+	/**
+	 * ATC.AddLateExits [list]: every narrow-body gate gets a second arrival on 27 over the far exit the wide-bodies take
+	 * (Route.EHAM.<gate>.Late.Arr27). When its own exit is taken a landing rolls on to that one (user 24-11-2026: "if the
+	 * exit is full, roll on to the next one or take one earlier; both full: go around"). The route runs from the far exit
+	 * to where it meets the gate's own arrival, and from there along that one to the stand; the rest of the map stays as it
+	 * is. Afterwards ATC.CheckRoutes (touchdown point and runway data of the new routes). "list": only says what it would do.
+	 */
+	void AddLateExits(const TArray<FString>& Args)
+	{
+		UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+		const FString MapPackage = TEXT("/Game/EHAM/EHAM");
+		FSite Site;
+		if (!World || World->GetOutermost()->GetName() != MapPackage)
+		{
+			UE_LOG(LogATC, Error, TEXT("ATC.AddLateExits: open %s first"), *MapPackage);
+			return;
+		}
+		const bool bListOnly = Args.Num() > 0 && Args[0] == TEXT("list");
+		ATCMapSurvey::LoadWholeWorld(World);
+		ATrafficDirector* Director = nullptr;
+		for (TActorIterator<ATrafficDirector> It(World); It; ++It)
+		{
+			Director = *It;
+		}
+		if (!Director || !MakeEHAMSite(World, Site))
+		{
+			UE_LOG(LogATC, Error, TEXT("ATC.AddLateExits: no traffic director in the map (ATC.SetupEHAM first)"));
+			return;
+		}
+		if (!bListOnly)
+		{
+			const FString MapFile = FPackageName::LongPackageNameToFilename(MapPackage, FPackageName::GetMapPackageExtension());
+			const FString Backup = FPaths::ProjectSavedDir() / TEXT("Backup_before_LateExits") / FPaths::GetCleanFilename(MapFile);
+			if (!FPaths::FileExists(Backup))
+			{
+				IFileManager::Get().Copy(*Backup, *MapFile);
+				UE_LOG(LogATC, Display, TEXT("ATC.AddLateExits: map backup %s"), *Backup);
+			}
+		}
+
+		// An earlier run's routes
+		TMap<FString, ATaxiRoute*> Routes;
+		TMap<FString, const AStand*> Stands;
+		TArray<AActor*> Old;
+		for (TActorIterator<ATaxiRoute> It(World); It; ++It)
+		{
+			const FString Tag = It->RouteTag.ToString();
+			if (Tag.Contains(TEXT(".Late.")))
+			{
+				Old.Add(*It);
+			}
+			else
+			{
+				Routes.Add(Tag, *It);
+			}
+		}
+		for (TActorIterator<AStand> It(World); It; ++It)
+		{
+			Stands.Add(It->StandTag.ToString(), *It);
+		}
+		if (!bListOnly)
+		{
+			for (AActor* Actor : Old)
+			{
+				World->EditorDestroyActor(Actor, true);
+			}
+			Director->Modify();
+		}
+
+		auto Resample = [](const TArray<FVector>& Line, double Step)
+		{
+			TArray<FVector> Out;
+			double Next = 0.0;
+			for (int32 Index = 1; Index < Line.Num(); ++Index)
+			{
+				const double Length = FVector::Dist(Line[Index - 1], Line[Index]);
+				double At = Next;
+				for (; At < Length; At += Step)
+				{
+					Out.Add(FMath::Lerp(Line[Index - 1], Line[Index], At / Length));
+				}
+				Next = At - Length;
+			}
+			if (Line.Num() > 0)
+			{
+				Out.Add(Line.Last());
+			}
+			return Out;
+		};
+		const FMapRunway* Runway27 = Site.Runways.FindByPredicate([](const FMapRunway& Runway) { return Runway.Ref.Contains(TEXT("27")); });
+		constexpr double Step = 200.0;
+		int32 Added = 0, Failed = 0;
+		for (FTrafficGate& Gate : Director->Gates)
+		{
+			const FString Name = Gate.Stand.ToString().RightChop(FString(TEXT("Stand.EHAM.")).Len());
+			ATaxiRoute* const* Own = Routes.Find(Gate.ArrivalRoute.ToString());
+			const AStand* const* Stand = Stands.Find(Gate.Stand.ToString());
+			if (Gate.bWideBody || !Own || !Stand || !Gate.ArrivalRoute.ToString().EndsWith(TEXT(".Arr27")) || !Runway27)
+			{
+				continue;
+			}
+			UAircraftTypeData* Type = !Gate.ParkedType.IsNull() ? Gate.ParkedType.LoadSynchronous() : LoadType(TEXT("A320"));
+			if (!Type)
+			{
+				continue;
+			}
+			const FTransform Parking = (*Stand)->GetParkingTransform();
+			const FVector Direction = Parking.GetRotation().GetForwardVector().GetSafeNormal2D();
+			const FVector Nose = Parking.GetLocation() + Direction * Type->GetWheelbaseCm();
+			FDeparture D = MakeGate(Name, Gate.DepartureRoute.ToString().RightChop(FString::Printf(TEXT("Route.EHAM.%s.Rwy"), *Name).Len()), TEXT("27"), Type);
+			D.StandRef = FString::Printf(TEXT("#%.1f,%.1f,%.2f"), Nose.X, Nose.Y, Direction.Rotation().Yaw);
+			D.bLateExit = true;
+			D.ArrivalRouteTag = FName(*FString::Printf(TEXT("Route.EHAM.%s.Late.Arr27"), *Name));
+			if (!UGameplayTagsManager::Get().RequestGameplayTag(D.ArrivalRouteTag, false).IsValid())
+			{
+				UE_LOG(LogATC, Warning, TEXT("ATC.AddLateExits: tag %s is not in Config/Tags/ATCSimTags.ini"), *D.ArrivalRouteTag.ToString());
+				++Failed;
+				continue;
+			}
+			if (!BuildArrival(Site, D))
+			{
+				UE_LOG(LogATC, Warning, TEXT("ATC.AddLateExits: %s: no arrival over the far exit"), *Name);
+				++Failed;
+				continue;
+			}
+
+			// Where the new line meets the gate's own arrival off the runway: both along the same line for 30 m
+			TArray<FVector> Far = Resample(D.Arrival, Step);
+			TArray<FVector> Near;
+			for (float Distance = 0.f; Distance < (*Own)->GetLength(); Distance += float(Step))
+			{
+				Near.Add((*Own)->GetLocationAt(Distance));
+			}
+			auto DirectionAt = [](const TArray<FVector>& Line, int32 Index)
+			{
+				const FVector Way = Line[FMath::Min(Index + 1, Line.Num() - 1)] - Line[FMath::Max(Index - 1, 0)];
+				return Way.GetSafeNormal2D();
+			};
+			int32 MergeFar = INDEX_NONE, MergeNear = INDEX_NONE;
+			for (int32 Index = 1; Index + 20 < Far.Num() && MergeFar == INDEX_NONE; ++Index)
+			{
+				double Along, Side;
+				Runway27->Locate(Far[Index], Along, Side);
+				if (Side < Runway27->HalfWidthCm + 6000.0)
+				{
+					continue;   // still on or beside the runway
+				}
+				int32 Closest = INDEX_NONE;
+				double BestDistance = 150.0;
+				for (int32 Other = 0; Other < Near.Num(); ++Other)
+				{
+					const double Distance = FVector::Dist2D(Far[Index], Near[Other]);
+					if (Distance < BestDistance && (DirectionAt(Far, Index) | DirectionAt(Near, Other)) > 0.995)
+					{
+						BestDistance = Distance;
+						Closest = Other;
+					}
+				}
+				bool bSame = Closest != INDEX_NONE && Closest + 16 < Near.Num();
+				for (int32 Ahead = 1; Ahead <= 15 && bSame; ++Ahead)
+				{
+					double Best = 1e9;
+					for (int32 Other = FMath::Max(0, Closest + Ahead - 2); Other <= FMath::Min(Near.Num() - 1, Closest + Ahead + 2); ++Other)
+					{
+						Best = FMath::Min(Best, FVector::Dist2D(Far[Index + Ahead], Near[Other]));
+					}
+					bSame = Best < 150.0;
+				}
+				if (bSame)
+				{
+					MergeFar = Index;
+					MergeNear = Closest;
+				}
+			}
+			if (MergeFar == INDEX_NONE)
+			{
+				UE_LOG(LogATC, Warning, TEXT("ATC.AddLateExits: %s: the way from the far exit never meets its own arrival"), *Name);
+				++Failed;
+				continue;
+			}
+
+			// The new way to there, then the gate's own; the small sideways difference runs out over the next 30 m
+			TArray<FVector> Points(Far.GetData(), MergeFar + 1);
+			const FVector Offset = Far[MergeFar] - Near[MergeNear];
+			for (int32 Other = MergeNear + 1; Other < Near.Num(); ++Other)
+			{
+				const double Ran = (Other - MergeNear) * Step;
+				const double Fade = 1.0 - FMath::SmoothStep(0.0, 3000.0, Ran);
+				Points.Add(Near[Other] + Offset * Fade);
+			}
+			Points.Add((*Own)->GetLocationAt((*Own)->GetLength()));
+			UE_LOG(LogATC, Display, TEXT("ATC.AddLateExits: %s: %.0f m over the far exit, meets %s after %.0f m (its %.0f m), %.0f m in all (own arrival %.0f m)"), *Name,
+				Far.Num() * Step / 100.0, *Gate.ArrivalRoute.ToString(), MergeFar * Step / 100.0, MergeNear * Step / 100.0, Points.Num() * Step / 100.0,
+				(*Own)->GetLength() / 100.0);
+			++Added;
+			if (bListOnly)
+			{
+				continue;
+			}
+
+			ATaxiRoute* Route = SpawnRoute(World, D.ArrivalRouteTag, ATCMapSurvey::Simplify(Points, 15.f));
+			for (const FSpeedZone& Zone : (*Own)->SpeedZones)
+			{
+				FSpeedZone& Copy = Route->SpeedZones.Add_GetRef(Zone);
+				Copy.StartDistance = UAircraftMovementComponent::GetDistanceClosestTo(Route->Spline, (*Own)->GetLocationAt(Zone.StartDistance));
+				Copy.EndDistance = Route->GetLength();
+			}
+			D.ArrivalRunwayIndex = INDEX_NONE;
+			FVector RunwayStart, RunwayDirection;
+			FindTakeoff(Site, D.ArrivalRunway, RunwayStart, RunwayDirection, D.ArrivalRunwayIndex);
+			AddRunwayStops(Site, D, Route, true);
+			Route->RerunConstructionScripts();
+			Gate.LateExitArrivalRoute = Route->RouteTag;
+		}
+		if (!bListOnly)
+		{
+			UEditorLoadingAndSavingUtils::SavePackages({ World->GetOutermost() }, false);
+		}
+		UE_LOG(LogATC, Display, TEXT("ATC.AddLateExits: %d gates got a route over the far exit, %d could not%s"), Added, Failed, bListOnly ? TEXT(" (list only)") : TEXT(", map saved"));
+	}
+
+	FAutoConsoleCommand AddLateExitsCommand(TEXT("ATC.AddLateExits"),
+		TEXT("ATC.AddLateExits [list]: give every narrow-body gate a second 27 arrival over the far exit, to roll on to when its own exit is taken; saves the map"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&AddLateExits));
+
+	/**
+	 * ATC.ApplyLines [list]: lays the taxi routes of EHAM exactly over the map's yellow lines (user 24-11-2026: "check
+	 * everywhere on the spline and make sure it all follow the yellow line, and if it suddenly ends use logic"). The lines
+	 * were worked out beforehand by Tools/Lines (the middle of every painted strip, painted curves at junctions instead of
+	 * short cuts, smooth curves over asphalt where the paint stops) and stand in Data/Lines/EHAM.txt: every route by its
+	 * tag, every stand on its painted lead-in line. Stops, waypoints and speed zones keep their place on the ground.
+	 * Afterwards ATC.CheckRoutes and ATC.CheckStands. "list": only says what it would do.
+	 */
+	void ApplyLines(const TArray<FString>& Args)
+	{
+		UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+		const FString MapPackage = TEXT("/Game/EHAM/EHAM");
+		if (!World || World->GetOutermost()->GetName() != MapPackage)
+		{
+			UE_LOG(LogATC, Error, TEXT("ATC.ApplyLines: open %s first"), *MapPackage);
+			return;
+		}
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("ATCSim"));
+		const FString File = (Plugin ? Plugin->GetBaseDir() : FString()) / TEXT("Data/Lines/EHAM.txt");
+		TArray<FString> Lines;
+		if (!FFileHelper::LoadFileToStringArray(Lines, *File))
+		{
+			UE_LOG(LogATC, Error, TEXT("ATC.ApplyLines: no %s"), *File);
+			return;
+		}
+		const bool bListOnly = Args.Num() > 0 && Args[0] == TEXT("list");
+		ATCMapSurvey::LoadWholeWorld(World);
+		if (!bListOnly)
+		{
+			const FString MapFile = FPackageName::LongPackageNameToFilename(MapPackage, FPackageName::GetMapPackageExtension());
+			const FString Backup = FPaths::ProjectSavedDir() / TEXT("Backup_before_Lines") / FPaths::GetCleanFilename(MapFile);
+			if (!FPaths::FileExists(Backup))
+			{
+				IFileManager::Get().Copy(*Backup, *MapFile);
+				UE_LOG(LogATC, Display, TEXT("ATC.ApplyLines: map backup %s"), *Backup);
+			}
+		}
+		TMap<FString, ATaxiRoute*> Routes;
+		TMap<FString, AStand*> Stands;
+		ATrafficDirector* Director = nullptr;
+		for (TActorIterator<ATaxiRoute> It(World); It; ++It)
+		{
+			Routes.Add(It->RouteTag.ToString(), *It);
+		}
+		for (TActorIterator<AStand> It(World); It; ++It)
+		{
+			Stands.Add(It->StandTag.ToString(), *It);
+		}
+		for (TActorIterator<ATrafficDirector> It(World); It; ++It)
+		{
+			Director = *It;
+		}
+
+		TArray<UPackage*> Packages = { World->GetOutermost() };
+		auto Touch = [&Packages](AActor* Actor)
+		{
+			Actor->Modify();
+			if (UPackage* External = Actor->GetExternalPackage())
+			{
+				Packages.AddUnique(External);
+			}
+		};
+		int32 Moved = 0, Changed = 0, Missing = 0;
+		double Farthest = 0.0;
+		for (int32 Line = 0; Line < Lines.Num(); ++Line)
+		{
+			TArray<FString> Parts;
+			Lines[Line].ParseIntoArrayWS(Parts);
+			if (Parts.Num() >= 6 && Parts[0] == TEXT("stand"))
+			{
+				// stand <tag> <x> <y> <yaw> <North|East|South|West or ->
+				AStand* const* Found = Stands.Find(Parts[1]);
+				if (!Found)
+				{
+					++Missing;
+					UE_LOG(LogATC, Warning, TEXT("ATC.ApplyLines: %s is not in the map"), *Parts[1]);
+					continue;
+				}
+				AStand* Stand = *Found;
+				const FVector Old = Stand->GetActorLocation();
+				const FVector New(FCString::Atod(*Parts[2]), FCString::Atod(*Parts[3]), Old.Z);
+				const float Yaw = FCString::Atof(*Parts[4]);
+				UE_LOG(LogATC, Display, TEXT("ATC.ApplyLines: %s %.1f m, %.1f degrees onto its lead-in line"), *Parts[1], FVector::Dist2D(Old, New) / 100.0,
+					FMath::FindDeltaAngleDegrees(static_cast<float>(Stand->GetActorRotation().Yaw), Yaw));
+				++Moved;
+				if (bListOnly)
+				{
+					continue;
+				}
+				Touch(Stand);
+				Stand->SetActorLocationAndRotation(New, FRotator(0.f, Yaw, 0.f));
+				// Pushed back the other way than before: the option says so, the old name stays as a second name for it
+				const FGameplayTag Option = Parts[5] == TEXT("-") ? FGameplayTag() : Tag(FName(*(FString(TEXT("Pushback.Face")) + Parts[5])));
+				if (Option.IsValid() && Stand->PushbackOptions.Num() > 0 && Stand->PushbackOptions[0].OptionTag != Option)
+				{
+					FPushbackOption First = Stand->PushbackOptions[0];
+					First.OptionTag = Option;
+					First.Phraseology = FText::FromString(FString::Printf(TEXT("push back approved, face %s"), *Parts[5].ToLower()));
+					Stand->PushbackOptions.RemoveAll([&Option](const FPushbackOption& Other) { return Other.OptionTag == Option; });
+					Stand->PushbackOptions.Insert(First, 0);
+					for (int32 Gate = 0; Director && Gate < Director->Gates.Num(); ++Gate)
+					{
+						if (Director->Gates[Gate].Stand == Stand->StandTag)
+						{
+							Touch(Director);
+							Director->Gates[Gate].PushbackOption = Option;
+						}
+					}
+				}
+			}
+			else if (Parts.Num() >= 3 && Parts[0] == TEXT("route"))
+			{
+				const int32 Count = FCString::Atoi(*Parts[2]);
+				ATaxiRoute* const* Found = Routes.Find(Parts[1]);
+				if (!Found || Count < 2 || Line + Count >= Lines.Num())
+				{
+					++Missing;
+					UE_LOG(LogATC, Warning, TEXT("ATC.ApplyLines: %s is not in the map"), *Parts[1]);
+					Line += Count;
+					continue;
+				}
+				ATaxiRoute* Route = *Found;
+				const float OldLength = Route->GetLength();
+				const double Z = Route->Spline->GetLocationAtDistanceAlongSpline(0.f, ESplineCoordinateSpace::World).Z;
+				TArray<FVector> Points;
+				for (int32 Index = 1; Index <= Count; ++Index)
+				{
+					FString X, Y;
+					if (Lines[Line + Index].Split(TEXT(" "), &X, &Y))
+					{
+						Points.Add(FVector(FCString::Atod(*X), FCString::Atod(*Y), Z));
+					}
+				}
+				Line += Count;
+				++Changed;
+				if (bListOnly)
+				{
+					continue;
+				}
+				// What lies along the route stays where it is on the ground
+				TArray<TPair<float*, FVector>> Keep;
+				auto Remember = [&Keep, Route](float& Distance)
+				{
+					Keep.Emplace(&Distance, Route->Spline->GetLocationAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::World));
+				};
+				for (FTaxiStop& Stop : Route->Stops)
+				{
+					Remember(Stop.Distance);
+				}
+				for (FTaxiWaypoint& Waypoint : Route->Waypoints)
+				{
+					Remember(Waypoint.Distance);
+				}
+				for (FSpeedZone& Zone : Route->SpeedZones)
+				{
+					Remember(Zone.StartDistance);
+					Remember(Zone.EndDistance);
+				}
+				Touch(Route);
+				Route->SetActorLocation(Points[0]);
+				SetRoutePoints(Route, Points);
+				const float Length = Route->GetLength();
+				for (TPair<float*, FVector>& Item : Keep)
+				{
+					const float Was = *Item.Key;
+					*Item.Key = Was < 1.f ? 0.f : Was > OldLength - 1.f ? Length : UAircraftMovementComponent::GetDistanceClosestTo(Route->Spline, Item.Value);
+					if (Was >= 1.f && Was <= OldLength - 1.f)
+					{
+						const double Off = FVector::Dist2D(Route->Spline->GetLocationAtDistanceAlongSpline(*Item.Key, ESplineCoordinateSpace::World), Item.Value);
+						Farthest = FMath::Max(Farthest, Off);
+						if (Off > 2000.0)
+						{
+							UE_LOG(LogATC, Warning, TEXT("ATC.ApplyLines: %s: something at %.0f m lies %.0f m beside the new line"), *Route->RouteTag.ToString(), Was / 100.f, Off / 100.0);
+						}
+					}
+				}
+			}
+		}
+		if (!bListOnly)
+		{
+			World->MarkPackageDirty();
+			UEditorLoadingAndSavingUtils::SavePackages(Packages, false);
+		}
+		UE_LOG(LogATC, Display, TEXT("ATC.ApplyLines: %d stands and %d routes onto the yellow lines, %d not in the map, stops and zones at most %.0f m beside where they were%s"),
+			Moved, Changed, Missing, Farthest / 100.0, bListOnly ? TEXT(" (list only)") : TEXT(", map saved"));
+	}
+
+	FAutoConsoleCommand ApplyLinesCommand(TEXT("ATC.ApplyLines"),
+		TEXT("ATC.ApplyLines [list]: lay the taxi routes of the open EHAM map exactly over its yellow lines (Data/Lines/EHAM.txt, made by Tools/Lines); saves the map"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&ApplyLines));
+
+	/**
+	 * ATC.RemoveRunwayRoutes <runway, for example 22> [list]: takes every arrival route that starts on that runway out of the
+	 * open EHAM map (user 24-11-2026: "take away all splines on runway 22"), with its lanes; the gates forget them. Saves
+	 * the map. "list": only says which.
+	 */
+	void RemoveRunwayRoutes(const TArray<FString>& Args)
+	{
+		UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+		const FString MapPackage = TEXT("/Game/EHAM/EHAM");
+		if (!World || World->GetOutermost()->GetName() != MapPackage || Args.Num() < 1)
+		{
+			UE_LOG(LogATC, Error, TEXT("ATC.RemoveRunwayRoutes <runway> [list], with %s open"), *MapPackage);
+			return;
+		}
+		const bool bListOnly = Args.Num() > 1 && Args[1] == TEXT("list");
+		ATCMapSurvey::LoadWholeWorld(World);
+		TArray<ATaxiRoute*> Gone;
+		TSet<FGameplayTag> Tags;
+		for (TActorIterator<ATaxiRoute> It(World); It; ++It)
+		{
+			if (It->RouteTag.ToString().EndsWith(TEXT(".Arr") + Args[0]))
+			{
+				Gone.Add(*It);
+				Tags.Add(It->RouteTag);
+				UE_LOG(LogATC, Display, TEXT("ATC.RemoveRunwayRoutes: %s"), *It->RouteTag.ToString());
+			}
+		}
+		if (!bListOnly && Gone.Num() > 0)
+		{
+			TArray<UPackage*> Packages = { World->GetOutermost() };
+			for (TActorIterator<ATrafficDirector> It(World); It; ++It)
+			{
+				It->Modify();
+				for (FTrafficGate& Gate : It->Gates)
+				{
+					for (FGameplayTag* Tag : { &Gate.ArrivalRoute, &Gate.SidestepArrivalRoute, &Gate.EarlyExitArrivalRoute, &Gate.LateExitArrivalRoute })
+					{
+						if (Tags.Contains(*Tag))
+						{
+							*Tag = FGameplayTag();
+						}
+					}
+				}
+			}
+			for (TActorIterator<ATaxiRoute> It(World); It; ++It)
+			{
+				if (!Gone.Contains(*It))
+				{
+					It->Alternatives.RemoveAll([&Gone](const TObjectPtr<ATaxiRoute>& Lane) { return Gone.Contains(Lane.Get()); });
+				}
+			}
+			for (ATaxiRoute* Route : Gone)
+			{
+				World->EditorDestroyActor(Route, true);
+			}
+			World->MarkPackageDirty();
+			UEditorLoadingAndSavingUtils::SavePackages(Packages, false);
+		}
+		UE_LOG(LogATC, Display, TEXT("ATC.RemoveRunwayRoutes: %d routes on runway %s%s"), Gone.Num(), *Args[0], bListOnly ? TEXT(" (list only)") : TEXT(" taken away, map saved"));
+	}
+
+	FAutoConsoleCommand RemoveRunwayRoutesCommand(TEXT("ATC.RemoveRunwayRoutes"),
+		TEXT("ATC.RemoveRunwayRoutes <runway> [list]: take the arrival routes of that runway out of the open EHAM map; saves the map"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RemoveRunwayRoutes));
 
 	// ---------------------------------------------------------------- Checking OSM data
 

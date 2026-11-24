@@ -14,6 +14,7 @@
 #include "ImageUtils.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "HAL/IConsoleManager.h"
 
 namespace
 {
@@ -154,6 +155,31 @@ int32 UTaxiNetworkSubsystem::Relation(int32 Sample, int32 Track) const
 		}
 	}
 	return -1;
+}
+
+static TAutoConsoleVariable<int32> CVarLogTwoWay(TEXT("atc.LogTwoWay"), 0,
+	TEXT("1: log every two-way stretch an aircraft locks or reserves (route, metres, which routes run the other way there)."));
+
+void UTaxiNetworkSubsystem::LogTwoWay(const FClaim& Claim, const TCHAR* What, int32 Track, int32 TwoWay) const
+{
+	if (!CVarLogTwoWay.GetValueOnGameThread() || !Tracks.IsValidIndex(Track) || !TwoWays.IsValidIndex(TwoWay))
+	{
+		return;
+	}
+	const FStretch& Stretch = TwoWays[TwoWay];
+	TSet<FString> Opposite;
+	for (const FOppositePair& Pair : Stretch.Pairs)
+	{
+		if (const ATaxiRoute* Other = Tracks.IsValidIndex(Pair.OtherTrack) ? Tracks[Pair.OtherTrack].Route.Get() : nullptr)
+		{
+			Opposite.Add(Other->RouteTag.ToString().Replace(TEXT("Route.EHAM."), TEXT("")));
+		}
+	}
+	const ATaxiRoute* Route = Tracks[Track].Route.Get();
+	UE_LOG(LogATC, Display, TEXT("TwoWay: %s %s #%d of %s (%.0f-%.0f m), claim %.0f-%.0f m; other way: %s"), *NameOf(TObjectKey<AActor>(Claim.Aircraft.Get())), What,
+		TwoWay, Route ? *Route->RouteTag.ToString() : TEXT("?"), SampleCm(Stretch.First) / 100.f, SampleCm(Stretch.Last) / 100.f,
+		Tracks.IsValidIndex(Claim.Track) ? SampleCm(Claim.First) / 100.f : -1.f, Tracks.IsValidIndex(Claim.Track) ? SampleCm(Claim.Last) / 100.f : -1.f,
+		*FString::Join(Opposite.Array(), TEXT(" ")));
 }
 
 FString UTaxiNetworkSubsystem::NameOf(const TObjectKey<AActor>& Key) const
@@ -471,6 +497,18 @@ void UTaxiNetworkSubsystem::Build()
 		LockUnder(Restored, Restored.First, Restored.Last);
 	}
 
+	for (int32 TrackIndex = 0; CVarLogTwoWay.GetValueOnGameThread() && TrackIndex < Tracks.Num(); ++TrackIndex)
+	{
+		for (int32 Local = 0; Local < Tracks[TrackIndex].Num; ++Local)
+		{
+			const int32 TwoWay = Tracks[TrackIndex].TwoWay[Local];
+			if (TwoWay != INDEX_NONE && (Local == 0 || Tracks[TrackIndex].TwoWay[Local - 1] != TwoWay))
+			{
+				FClaim None;
+				LogTwoWay(None, TEXT("stretch"), TrackIndex, TwoWay);
+			}
+		}
+	}
 	UE_LOG(LogATC, Display, TEXT("Taxi network: %d routes, %d samples, %.1f km two-way in %d stretches, %.1f km at %d crossings, built in %.0f ms"),
 		Tracks.Num(), Samples.Num(), TwoWaySamples * StepCm / 100000.f, TwoWays.Num(), CrossingSamples * StepCm / 100000.f, Crossings.Num(),
 		(FPlatformTime::Seconds() - StartSeconds) * 1000.0);
@@ -547,6 +585,17 @@ bool UTaxiNetworkSubsystem::IsFree(const TObjectKey<AActor>& Me, const FClaim* M
 		}
 		const FClaim* Behind = Claims.Find(Other.Blocker);
 		if (Behind && Behind->WaitingSince >= 0.f && Behind->Blocker == Me)
+		{
+			continue;
+		}
+		// A landing waiting for its runway exit while this one stands on it: moving on is the only way to free it
+		// (23-11-2026: a departure stood still in the 27 exit for an A380 that waited for exactly that exit, which went around)
+		bool bInItsWay = false;
+		for (int32 Local = MyClaim ? MyClaim->First : 0; Other.bAirborne && MyClaim && Tracks.IsValidIndex(MyClaim->Track) && Local <= MyClaim->Last && !bInItsWay; ++Local)
+		{
+			bInItsWay = Other.WantedBox.ComputeSquaredDistanceToPoint(Samples[Tracks[MyClaim->Track].First + Local].Location) < Reach * Reach;
+		}
+		if (bInItsWay)
 		{
 			continue;
 		}
@@ -627,6 +676,10 @@ void UTaxiNetworkSubsystem::LockUnder(FClaim& Claim, int32 First, int32 Last)
 	{
 		if (Tracks[Claim.Track].TwoWay[Local] != INDEX_NONE)
 		{
+			if (!Claim.Locks.Contains(Tracks[Claim.Track].TwoWay[Local]))
+			{
+				LogTwoWay(Claim, TEXT("locks (under its claim)"), Claim.Track, Tracks[Claim.Track].TwoWay[Local]);
+			}
 			Claim.Locks.AddUnique(Tracks[Claim.Track].TwoWay[Local]);
 		}
 	}
@@ -736,7 +789,13 @@ float UTaxiNetworkSubsystem::UpdateClaim(const AActor* Aircraft, const FTaxiClai
 		Claim.Last = Rear - 1;
 	}
 	Claim.Locks.RemoveAll([this, &Claim](int32 Locked) { return TwoWays[Locked].Last < Claim.First; });
+	// And the stretches of this route it reserved before it got here (a landing's first part of the taxi-in) once passed
+	Claim.Reserved.RemoveAll([this, &Claim, TrackIndex](const FClaim::FReserved& Ahead) { return Ahead.Track == TrackIndex && TwoWays[Ahead.TwoWay].Last < Claim.First; });
 	// Under the body: always, it is there
+	if (bNewTrack && CVarLogTwoWay.GetValueOnGameThread())
+	{
+		UE_LOG(LogATC, Display, TEXT("TwoWay: %s starts on %s at %.0f-%.0f m"), *NameOf(Key), *Request.Route->RouteTag.ToString(), Request.RearCm / 100.f, Request.FrontCm / 100.f);
+	}
 	while (Claim.Last < Front)
 	{
 		Hold(Key, Track.First + ++Claim.Last);
@@ -749,6 +808,7 @@ float UTaxiNetworkSubsystem::UpdateClaim(const AActor* Aircraft, const FTaxiClai
 		{
 			if (Ahead.Track == TrackIndex)
 			{
+				LogTwoWay(Claim, TEXT("locks (reserved before)"), TrackIndex, Ahead.TwoWay);
 				Claim.Locks.AddUnique(Ahead.TwoWay);
 			}
 		}
@@ -774,6 +834,7 @@ float UTaxiNetworkSubsystem::UpdateClaim(const AActor* Aircraft, const FTaxiClai
 				bWaiting = true;
 				break;
 			}
+			LogTwoWay(Claim, TEXT("enters"), TrackIndex, TwoWay);
 			Claim.Locks.Add(TwoWay);
 		}
 		// A crossing in one go, until the tail is out of it, but not past a stop that waits for a clearance (the runway
@@ -796,6 +857,35 @@ float UTaxiNetworkSubsystem::UpdateClaim(const AActor* Aircraft, const FTaxiClai
 			if (End < Next || SampleCm(End) - Request.FrontCm > Request.RoomAheadCm)
 			{
 				break;
+			}
+			// A two-way stretch that begins inside the crossing is entered with it: the same check, before the crossing
+			// (23-11-2026: an arrival took a crossing at the H pier in one go, 430 m, and so drove into a two-way stretch that a
+			// departure held the other way without asking; they met nose to nose and stood there for the rest of the session)
+			TArray<int32, TInlineAllocator<2>> Entered;
+			bool bTwoWayBlocked = false;
+			for (int32 Local = Next + 1; Local <= End && !bTwoWayBlocked; ++Local)
+			{
+				const int32 Inside = Track.TwoWay[Local];
+				if (Inside == INDEX_NONE || Claim.Locks.Contains(Inside) || Entered.Contains(Inside))
+				{
+					continue;
+				}
+				if (!IsTwoWayFree(Key, Claim, TrackIndex, Inside, Local, Blocker))
+				{
+					SetWaiting(Claim, TrackIndex, Local, TwoWays[Inside].Last, Inside, Blocker);
+					bTwoWayBlocked = true;
+				}
+				Entered.Add(Inside);
+			}
+			if (bTwoWayBlocked)
+			{
+				bWaiting = true;
+				break;
+			}
+			for (const int32 Inside : Entered)
+			{
+				LogTwoWay(Claim, TEXT("enters (inside a crossing)"), TrackIndex, Inside);
+				Claim.Locks.Add(Inside);
 			}
 		}
 		// From where the wings will now come (the old nose part) to the new nose
@@ -829,6 +919,12 @@ float UTaxiNetworkSubsystem::UpdateClaim(const AActor* Aircraft, const FTaxiClai
 		Claim.Blocker = HeldBy;
 	}
 	OutBlocker = bWaiting ? Blocker.ResolveObjectPtr() : nullptr;
+	if (bWaiting && CVarLogTwoWay.GetValueOnGameThread() && Claim.WaitingSince == GetNow())
+	{
+		UE_LOG(LogATC, Display, TEXT("TwoWay: %s waits on %s, claim %.0f-%.0f m, for %s (%s)"), *NameOf(Key), *Request.Route->RouteTag.ToString(),
+			SampleCm(Claim.First) / 100.f, SampleCm(Claim.Last) / 100.f, *NameOf(Blocker),
+			Claim.WantedTwoWay != INDEX_NONE ? *FString::Printf(TEXT("two-way #%d"), Claim.WantedTwoWay) : TEXT("a place in the way"));
+	}
 	// Up to the stop or the end of the taxi: from there on the taxi controller's own braking for it is the limit
 	return Claim.Last >= LimitLocal ? BIG_NUMBER : SampleCm(Claim.Last);
 }
@@ -877,6 +973,10 @@ bool UTaxiNetworkSubsystem::ClaimStretch(const AActor* Aircraft, const FTaxiClai
 	{
 		return true;
 	}
+	if (CVarLogTwoWay.GetValueOnGameThread())
+	{
+		UE_LOG(LogATC, Display, TEXT("TwoWay: %s claims %s %.0f-%.0f m in one go"), *NameOf(Key), *Request.Route->RouteTag.ToString(), SampleCm(First) / 100.f, SampleCm(Last) / 100.f);
+	}
 	ClearHeld(Key, Claim);
 	Claim.Locks.Reset();
 	Claim.Track = TrackIndex;
@@ -910,6 +1010,7 @@ bool UTaxiNetworkSubsystem::ReserveTwoWay(const AActor* Aircraft, const FTaxiCla
 	FClaim& Claim = bCheckOnly ? Copy : Claims.FindOrAdd(Key);
 	Claim.Aircraft = Aircraft;
 	SetShape(Claim, Request);
+	Claim.bPriority |= Request.bPriority;   // a landing's way in: its place in the queues, also before it is here
 	TArray<FClaim::FReserved, TInlineAllocator<2>> Found;
 	for (int32 Local = LocalSample(Track, Request.RearCm); Local <= FMath::Min(LocalSample(Track, Request.FrontCm) + 1, Track.Num - 1); ++Local)
 	{
@@ -934,8 +1035,18 @@ bool UTaxiNetworkSubsystem::ReserveTwoWay(const AActor* Aircraft, const FTaxiCla
 	{
 		if (!bCheckOnly && !Claim.Reserved.ContainsByPredicate([&Entry](const FClaim::FReserved& Held) { return Held.TwoWay == Entry.TwoWay; }))
 		{
+			LogTwoWay(Claim, TEXT("reserves"), Entry.Track, Entry.TwoWay);
 			Claim.Reserved.Add(Entry);
 		}
+	}
+	// It waited for one of them (an earlier try): that wait is over
+	if (!bCheckOnly && Claim.WaitingSince >= 0.f && Claim.WantedTwoWay != INDEX_NONE
+		&& Found.ContainsByPredicate([&Claim](const FClaim::FReserved& Entry) { return Entry.TwoWay == Claim.WantedTwoWay; }))
+	{
+		Claim.WaitingSince = -1.f;
+		Claim.WantedTrack = INDEX_NONE;
+		Claim.WantedTwoWay = INDEX_NONE;
+		Claim.Blocker = TObjectKey<AActor>();
 	}
 	return true;
 }
@@ -1184,6 +1295,20 @@ TArray<FTaxiClaimRequest> UTaxiNetworkSubsystem::RunwayExitRequests(ATaxiRoute* 
 		Exit.bPriority = true;
 	}
 	return Requests;
+}
+
+FTaxiClaimRequest UTaxiNetworkSubsystem::TaxiInRequest(ATaxiRoute* Lane, float StartCm, const UAircraftTypeData* Type)
+{
+	// 1.5 km: wherever it may still have to wait after that, it is well clear of every runway exit
+	FTaxiClaimRequest Way;
+	Way.Route = Lane;
+	Way.HalfSpanCm = Type ? Type->GetHalfSpanCm() : 1790.f;
+	Way.LengthCm = Type ? Type->GetLengthCm() : 3950.f;
+	Way.NoseOffsetCm = Type ? Type->GetNoseOffsetCm() : 2034.f;
+	Way.RearCm = StartCm;
+	Way.FrontCm = (Lane ? FMath::Max(Lane->GetRunwayVacatedCm(), StartCm) : StartCm) + 150000.f;
+	Way.bPriority = true;
+	return Way;
 }
 
 namespace

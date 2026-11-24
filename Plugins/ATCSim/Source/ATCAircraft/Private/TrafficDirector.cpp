@@ -115,7 +115,7 @@ void ATrafficDirector::StartTraffic()
 		}
 		UAircraftTypeData* Type = ModelType;
 		TArray<FString> Airlines = { Gates[Index].ParkedAirline };
-		if (!ModelType && !PickType(Gates[Index].bWideBody, Type, Airlines))
+		if (!ModelType && !PickType(Index, Type, Airlines))
 		{
 			continue;
 		}
@@ -267,15 +267,34 @@ void ATrafficDirector::StopTraffic()
 	UE_LOG(LogATC, Display, TEXT("%s: traffic stopped (aircraft already moving finish their way)"), *GetName());
 }
 
-bool ATrafficDirector::PickType(bool bWideBody, UAircraftTypeData*& OutType, TArray<FString>& OutAirlines)
+float ATrafficDirector::GetLargestSpanM(int32 Gate) const
 {
+	const UTrafficSubsystem* Traffic = GetWorld()->GetSubsystem<UTrafficSubsystem>();
+	const AStand* Stand = Traffic ? Traffic->FindStand(Gates[Gate].Stand) : nullptr;
+	float Largest = BIG_NUMBER;
+	for (int32 Index = 0; Stand && Index < Gates.Num(); ++Index)
+	{
+		const AStand* Other = Index != Gate ? Traffic->FindStand(Gates[Index].Stand) : nullptr;
+		if (Other)
+		{
+			const float Apart = FVector::Dist2D(Stand->GetActorLocation(), Other->GetActorLocation()) / 100.f;
+			Largest = FMath::Min(Largest, 2.f * (Apart - (Gates[Index].bWideBody ? 32.5f : 18.f) - 3.f));
+		}
+	}
+	return Largest;
+}
+
+bool ATrafficDirector::PickType(int32 Gate, UAircraftTypeData*& OutType, TArray<FString>& OutAirlines)
+{
+	const bool bWideBody = Gates[Gate].bWideBody;
+	const float LargestSpanM = bWideBody ? GetLargestSpanM(Gate) : BIG_NUMBER;
 	// Weighted pick among the entries that fit the gate
 	float Total = 0.f;
 	TArray<const FTrafficMixEntry*> Fitting;
 	for (const FTrafficMixEntry& Entry : TrafficMix->Entries)
 	{
 		const UAircraftTypeData* Type = Entry.Type.LoadSynchronous();
-		if (Type && (Type->AerodromeCode >= EAerodromeCode::E) == bWideBody)
+		if (Type && (Type->AerodromeCode >= EAerodromeCode::E) == bWideBody && (!bWideBody || Type->AerodromeCode < EAerodromeCode::F || Type->WingspanM <= LargestSpanM))
 		{
 			Fitting.Add(&Entry);
 			Total += FMath::Max(Entry.Weight, 0.f);
@@ -404,7 +423,7 @@ void ATrafficDirector::SpawnArrival()
 	while (Spawner && Traffic && Blocked.Num() < 8 && Gate == INDEX_NONE)
 	{
 		const int32 Candidate = PickFreeGate(true, Blocked);
-		if (Candidate == INDEX_NONE || !PickType(Gates[Candidate].bWideBody, Type, Airlines))
+		if (Candidate == INDEX_NONE || !PickType(Candidate, Type, Airlines))
 		{
 			break;
 		}
@@ -454,6 +473,17 @@ void ATrafficDirector::SpawnArrival()
 	Request.StartDistanceM = 0.f;
 	Request.InitialSpeedKt = ArrivalSpeedKt;
 	Request.bLand = bVisibleLandings;
+	// The other exits of its runway to the same gate: when the one it is planned on is taken it rolls on or takes an earlier one
+	if (!Request.ApproachRouteTag.IsValid())
+	{
+		for (const FGameplayTag& Other : { Gates[Gate].ArrivalRoute, Gates[Gate].EarlyExitArrivalRoute, Gates[Gate].LateExitArrivalRoute })
+		{
+			if (Other.IsValid() && Other != Request.RouteTag && Traffic->FindRoute(Other))
+			{
+				Request.OtherExitRouteTags.Add(Other);
+			}
+		}
+	}
 	Request.bRemoveAtRouteEnd = false;
 	GateOf.Add(Request.Callsign, Gate);
 	if (Spawner->RequestSpawn(Request).IsNone())
@@ -571,7 +601,8 @@ void ATrafficDirector::HandleAircraftEvent(AActor* Actor, FName Callsign, FGamep
 	// Arrived at the end of the arrival route (or the parallel lane it was given): on the stand, the turnaround starts
 	if (EventTag == TAG_ATC_Event_Taxi_Arrived && Gate && Aircraft && Aircraft->TaxiController->PlannedRoute
 		&& (Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].ArrivalRoute || Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].SidestepArrivalRoute
-			|| Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].EarlyExitArrivalRoute))
+			|| Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].EarlyExitArrivalRoute
+			|| Aircraft->TaxiController->PlannedRoute->RouteTag == Gates[*Gate].LateExitArrivalRoute))
 	{
 		FTimerHandle Handle;
 		GetWorldTimerManager().SetTimer(Handle, FTimerDelegate::CreateWeakLambda(this, [this, Callsign]() { Depart(Callsign); }),

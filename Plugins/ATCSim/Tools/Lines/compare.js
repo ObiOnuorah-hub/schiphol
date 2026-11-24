@@ -1,0 +1,8 @@
+const L=require('./lib.js');const O=L.loadRoutes(),Nw=L.loadRoutes(process.argv[2]||L.dir+'new_routes.txt');const m=new Map(O.map(r=>[r.tag,r]));
+function grid(p){const g=new Map();for(const q of p){const k=Math.floor(q[0]/10)*100003+Math.floor(q[1]/10);let a=g.get(k);if(!a)g.set(k,a=[]);a.push(q);}return (x,y,r)=>{const I=Math.floor(x/10),J=Math.floor(y/10),c=Math.ceil(r/10);let b=1e9;for(let i=-c;i<=c;i++)for(let j=-c;j<=c;j++){const a=g.get((I+i)*100003+J+j);if(a)for(const q of a)b=Math.min(b,Math.hypot(q[0]-x,q[1]-y));}return b;};}
+const share=(a,b)=>{const g=grid(b);let n=0;for(const q of a)if(g(q[0],q[1],10)<6)n++;return n/a.length;};
+const rows=[];const nm=new Map(Nw.map(r=>[r.tag,r]));
+for(const r of Nw){const o=m.get(r.tag);const g=grid(o.pts),h=grid(r.pts);let far=0,farN=0,at=null;r.pts.forEach(p=>{const d=Math.min(400,g(p[0],p[1],400>0?120:0));if(d>15)farN++;if(d>far){far=d;at=p;}});rows.push({t:r.tag,ol:o.len,nl:r.pts.length,far,farN,at});}
+rows.sort((a,b)=>b.farN-a.farN);let tot=0;for(const r of rows)if(r.farN>60&&tot++<45)console.log(r.t.replace('Route.EHAM.','').padEnd(18),'old',r.ol.toFixed(0),'new',r.nl,'>15m from old:',r.farN,'m, max',r.far.toFixed(0),'at',r.at.slice(0,2).map(v=>v.toFixed(0)).join(','));
+let a=0,b=0,n=0,bad=[];for(const r of Nw)if(/\.Alt\./.test(r.tag)){const base=r.tag.replace('.Alt.','.');if(!nm.has(base))continue;const s1=share(m.get(r.tag).pts,m.get(base).pts),s2=share(r.pts,nm.get(base).pts);a+=s1;b+=s2;n++;if(s2>s1+0.08)bad.push(r.tag.replace('Route.EHAM.','')+' '+s1.toFixed(2)+'->'+s2.toFixed(2));}
+console.log('Alt share with its base: old',(a/n).toFixed(2),'new',(b/n).toFixed(2),'worse:',bad.join('; '));

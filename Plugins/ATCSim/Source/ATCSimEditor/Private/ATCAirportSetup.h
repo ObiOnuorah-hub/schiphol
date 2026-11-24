@@ -165,10 +165,10 @@ namespace ATCSetup
 		FVector ArrivalApronStart = FVector::ZeroVector;
 		int32 ArrivalRunwayIndex = INDEX_NONE;
 		ATaxiRoute* ArrivalRoute = nullptr;
-		/** Narrow-body gates: the arrival from the Oostbaan (22) for a late sidestep from the 27 final (AddSidestep). */
-		ATaxiRoute* SidestepRoute = nullptr;
 		/** Build the arrival with the narrow-body runway exit although the type is a wide-body (the 787's early exit). */
 		bool bEarlyExit = false;
+		/** Build the arrival over the far exit of the wide-bodies although the type is a narrow-body (ATC.AddLateExits). */
+		bool bLateExit = false;
 		/** Wide-body gates: the arrival over the early (narrow-body) exit, for the 787 (AddEarlyExit). */
 		ATaxiRoute* EarlyExitRoute = nullptr;
 	};

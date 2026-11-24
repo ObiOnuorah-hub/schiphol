@@ -81,6 +81,13 @@ struct ATCAIRCRAFT_API FAircraftSpawnRequest
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn")
 	FGameplayTag ApproachRouteTag;
 
+	/**
+	 * Landings: arrival routes over other exits of the same runway to the same stand. When the exit of RouteTag is taken the
+	 * landing rolls on to the next one, or takes an earlier one; all taken: go around (user 24-11-2026).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn")
+	TArray<FGameplayTag> OtherExitRouteTags;
+
 	/** Instead of a route: park on this stand; RouteTag is then the taxi route after pushback. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn")
 	FGameplayTag StandTag;
@@ -154,6 +161,8 @@ private:
 
 	/** Landings in the holding stack since (game seconds), by callsign. */
 	TMap<FName, float> HoldingSince;
+	/** What keeps each landing in the stack, as last logged. */
+	TMap<FName, FString> HoldReason;
 
 	/** The last landings: where they join their runway, the landing direction, when. */
 	struct FRecentLanding

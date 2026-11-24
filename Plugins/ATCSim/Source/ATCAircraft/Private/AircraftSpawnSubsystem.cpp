@@ -291,6 +291,15 @@ AATCAircraft* UAircraftSpawnSubsystem::TrySpawn(const FAircraftSpawnRequest& InR
 	if (Request.bLand)
 	{
 		CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ATC_StartLanding);
+		TArray<ATaxiRoute*> Others;
+		for (const FGameplayTag& Tag : Request.OtherExitRouteTags)
+		{
+			if (ATaxiRoute* Other = Traffic->FindRoute(Tag))
+			{
+				Others.Add(Other);
+			}
+		}
+		Aircraft->SetOtherExits(Others);
 		Aircraft->StartLanding(Route, Start, End, Request.InitialSpeedKt, Approach);
 		const ATaxiRoute* Final = Approach ? Approach : Route;
 		const float FinalStart = Approach ? 0.f : Start;
@@ -344,20 +353,64 @@ bool UAircraftSpawnSubsystem::HoldLanding(const FAircraftSpawnRequest& Request, 
 
 	// One of its runway exits free: nobody on it, and nobody who has waited for it longer than a landing's head start
 	UTaxiNetworkSubsystem* Network = GetWorld()->GetSubsystem<UTaxiNetworkSubsystem>();
-	const TArray<FTaxiClaimRequest> Exits = UTaxiNetworkSubsystem::RunwayExitRequests(Route, StartCm, Request.Type);
-	bool bExitFree = !Network || Exits.Num() == 0;
-	for (const FTaxiClaimRequest& Exit : Exits)
+	// On one of its lanes (the arrival route or a parallel one) both:
+	//  - the runway exit: nobody on it. Or the landing before it holds it, still on the runway or rolling off it: that one
+	//    is gone long before this one gets there (a minute and a half of final), like a controller who clears the next one
+	//    to land behind it; on final it asks again and decides late (AATCAircraft::TickLanding). 23-11-2026: landings
+	//    waited in the stack for exactly that, 22 an hour came instead of 30;
+	//  - the way in: nobody coming the other way in its first part (UTaxiNetworkSubsystem::TaxiInRequest). Otherwise it
+	//    stops on its exit for that one, and the landing behind it has to go around (23-11-2026: arrivals to the H and C
+	//    piers met departures that had just pushed back towards them)
+	// The exits it may take: that of its own route, or another one of its runway (AATCAircraft::TryOtherExit)
+	TArray<FTaxiClaimRequest> Exits = UTaxiNetworkSubsystem::RunwayExitRequests(Route, StartCm, Request.Type);
+	const UTrafficSubsystem* Traffic = GetWorld()->GetSubsystem<UTrafficSubsystem>();
+	for (const FGameplayTag& Tag : Request.OtherExitRouteTags)
 	{
-		bExitFree = bExitFree || Network->ClaimStretch(nullptr, Exit, OutBlocker, true);
+		if (ATaxiRoute* Other = Traffic ? Traffic->FindRoute(Tag) : nullptr)
+		{
+			Exits.Append(UTaxiNetworkSubsystem::RunwayExitRequests(Other, 0.f, Request.Type));
+		}
+	}
+	bool bExitFree = !Network || Exits.Num() == 0;
+	bool bWayInFree = bExitFree;
+	AActor* WayBlocker = nullptr;
+	for (int32 Index = 0; Index < Exits.Num() && !bWayInFree; ++Index)
+	{
+		AActor* Blocker = nullptr;
+		const AATCAircraft* Before = nullptr;
+		if (!Network->ClaimStretch(nullptr, Exits[Index], Blocker, true))
+		{
+			OutBlocker = Blocker;
+			Before = Cast<AATCAircraft>(Blocker);
+			if (!Before || !(Before->IsLanding() || (Before->TaxiController->bPriority && Before->Movement->Speed > 100.f)))
+			{
+				continue;
+			}
+		}
+		bExitFree = true;
+		const float LaneStartCm = Exits[Index].RearCm + Exits[Index].LengthCm + 1000.f;
+		bWayInFree = Network->ReserveTwoWay(nullptr, UTaxiNetworkSubsystem::TaxiInRequest(Exits[Index].Route, LaneStartCm, Request.Type), WayBlocker, true);
 	}
 	const float Waited = Now - HoldingSince.FindOrAdd(Request.Callsign, Now);
-	if (!bExitFree && Waited < Settings->MaxHoldingSeconds)
+	if ((!bExitFree || !bWayInFree) && Waited < Settings->MaxHoldingSeconds)
 	{
+		// Who keeps it in the stack, once per change
+		OutBlocker = bExitFree ? WayBlocker : OutBlocker;
+		const AATCAircraft* Holder = Cast<AATCAircraft>(OutBlocker);
+		const FString Reason = FString::Printf(TEXT("%s taken by %s"), bExitFree ? TEXT("way in") : TEXT("exit"), Holder ? *FString::Printf(TEXT("%s (%s)"),
+			*Holder->Identity->Callsign.ToString(), Holder->TaxiController->bPriority ? TEXT("taxiing in") : *UEnum::GetValueAsString(Holder->TaxiController->GetState()))
+			: TEXT("(unknown)"));
+		if (HoldReason.FindRef(Request.Callsign) != Reason)
+		{
+			UE_LOG(LogATC, Display, TEXT("%s holds in the stack (%.0f s): %s, %s"), *Request.Callsign.ToString(), Waited, *Route->RouteTag.ToString(), *Reason);
+			HoldReason.Add(Request.Callsign, Reason);
+		}
 		return true;
 	}
-	if (!bExitFree)
+	HoldReason.Remove(Request.Callsign);
+	if (!bExitFree || !bWayInFree)
 	{
-		UE_LOG(LogATC, Display, TEXT("%s leaves the holding stack after %.0f s, its runway exit still taken"), *Request.Callsign.ToString(), Waited);
+		UE_LOG(LogATC, Display, TEXT("%s leaves the holding stack after %.0f s, its runway exit or way in still taken"), *Request.Callsign.ToString(), Waited);
 	}
 	HoldingSince.Remove(Request.Callsign);
 	OutBlocker = nullptr;

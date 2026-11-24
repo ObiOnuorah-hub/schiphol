@@ -39,6 +39,13 @@ struct ATCAIRCRAFT_API FTrafficGate
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	FGameplayTag EarlyExitArrivalRoute;
 
+	/**
+	 * Narrow-body gates: the arrival over the far (wide-body) exit. When its own exit is taken a landing rolls on to this one
+	 * (made by ATC.AddLateExits). Empty = its own exit only.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
+	FGameplayTag LateExitArrivalRoute;
+
 	/** From the end of the pushback to the departure runway. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	FGameplayTag DepartureRoute;
@@ -112,13 +119,19 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0", ClampMax = "1"))
 	float InitialOccupancy = 0.6f;
 
-	/** Schiphol handles up to about 70 an hour on two landing runways; 30 keeps the game smooth and still busy. */
+	/**
+	 * Schiphol handles up to about 70 an hour on two landing runways; 30 on the one here keeps the game smooth and still
+	 * busy (user 23-11-2026: "keep it at 30").
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float ArrivalsPerHour = 30.f;
 
-	/** Share of the small arrivals (code C) to a gate with a SidestepArrivalRoute that sidestep there late. */
+	/**
+	 * Share of the small arrivals (code C) to a gate with a SidestepArrivalRoute that sidestep there late. Off: all
+	 * landings stay on their own runway (user 23-11-2026: "remove the approach to runway 22").
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0", ClampMax = "1"))
-	float SidestepShare = 0.2f;
+	float SidestepShare = 0.f;
 
 	/**
 	 * Share of the map's parked models that come to life when the traffic starts (EHAM has 59). Each one is an aircraft
@@ -214,8 +227,14 @@ private:
 	/** The aircraft on a stand that an aircraft of Type would touch somewhere in these poses; nullptr = the way is free. */
 	const AATCAircraft* FindInTheWay(const AActor* Self, const UAircraftTypeData* Type, const TArray<FTransform>& Poses) const;
 
-	/** Type and airlines from the mix that fit the gate size. */
-	bool PickType(bool bWideBody, UAircraftTypeData*& OutType, TArray<FString>& OutAirlines);
+	/** Type and airlines from the mix that fit the gate. */
+	bool PickType(int32 Gate, UAircraftTypeData*& OutType, TArray<FString>& OutAirlines);
+
+	/**
+	 * The widest wing (m) that fits on a gate: 3 m clear of the usual aircraft on the gate next to it (code C 36 m, wide-bodies
+	 * 65 m). An A380 on D10 reached over an arrival on D12 (24-11-2026).
+	 */
+	float GetLargestSpanM(int32 Gate) const;
 
 	float Now() const;
 

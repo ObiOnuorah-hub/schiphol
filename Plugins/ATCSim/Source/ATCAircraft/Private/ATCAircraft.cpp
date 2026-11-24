@@ -473,6 +473,8 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 		return;
 	}
 	bExitReserved = false;
+	bTaxiInReserved = false;
+	TaxiInRetrySeconds = 0.f;
 	bGoingAround = false;
 	LandingRoute = Route;
 	ExitLane = Route;
@@ -497,7 +499,8 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 	// Which landings get wind: one series for the whole session (from the callsigns the share came out 1 in 8, not 1 in 4)
 	static FRandomStream WindDraws(2026);
 	const bool bWindy = WindDraws.FRand() < CVarCrosswindShare.GetValueOnGameThread();
-	FRandomStream Flight(int32((GetTypeHash(Identity->Callsign.ToString()) ^ 0x5EEDu) * 2654435761u >> 1));
+	const int32 FlightSeed = int32((GetTypeHash(Identity->Callsign.ToString()) ^ 0x5EEDu) * 2654435761u >> 1);
+	FRandomStream Flight(FlightSeed);
 	CrosswindKt = bWindy ? Flight.FRandRange(10.f, 25.f) * (Flight.FRand() < 0.5f ? -1.f : 1.f) : Flight.FRandRange(-4.f, 4.f);
 	const float GustKt = bWindy ? Flight.FRandRange(4.f, 10.f) : 0.f;
 	const float TypeKt = AircraftType && AircraftType->ApproachSpeedKt > 0.f ? AircraftType->ApproachSpeedKt : (bHeavy ? 145.f : 135.f);
@@ -509,12 +512,106 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 		Phase = Flight.FRandRange(0.f, 2.f * PI);
 	}
 	FinalSeconds = 0.f;
+	// The pilot: picks up the final a little off the centre line and the glide path (more in wind), corrects from there.
+	// Its own random series, so the other per-flight values stay as they were
+	PilotRandom.Initialize(FlightSeed ^ 0x2B1D);
+	LatCm = PilotRandom.FRandRange(0.4f, 1.f) * WanderLateralCm * (PilotRandom.FRand() < 0.5f ? -1.f : 1.f);
+	LatVelCms = PilotRandom.FRandRange(-60.f, 60.f);
+	VertCm = PilotRandom.FRandRange(-1.5f, 1.5f) * WanderVerticalCm;
+	VertVelCms = 0.f;
+	BankCmdDeg = BankDeg = PitchCmdDeg = PitchAdjDeg = LatGustCms2 = VertGustCms2 = 0.f;
+	PilotGain = PilotRandom.FRandRange(0.7f, 1.3f);
+	PilotDelay = PilotRandom.FRandRange(0.7f, 1.8f);
+	LatInputTimer = PilotRandom.FRandRange(0.f, PilotDelay);
+	VertInputTimer = PilotRandom.FRandRange(0.f, 2.f * PilotDelay);
 	// Not every touchdown on the same spot: a little short or a long float, within the touchdown zone of the white blocks
-	const float Float = Flight.FRandRange(-2500.f, 6000.f);
+	float Float = Flight.FRandRange(-2500.f, 6000.f);
 	TouchdownPoint += LandingDirection * Float;
 	RolloutCm = FMath::Max(RolloutCm - Float, 30000.f);
 	TouchdownSpeedCms = ApproachSpeedCms - 5.f * ATCUnits::KnotsToCms;
 	RolloutEndSpeedCms = FMath::Max(RolloutEndSpeedKt, 5.f) * ATCUnits::KnotsToCms;
+
+	// How this pilot puts it down (user 23-11-2026: "some butter it and float a little, some land hard like cargo").
+	// Freighters are flown onto the runway, heavy and on the numbers; low-cost and short-haul crews land firm to make the
+	// early exit; wide-body passenger flights (the A380 and 787 best of all) are greased on; in a gusty crosswind every
+	// pilot puts it down firmly instead of floating
+	const FString Airline = Identity->Callsign.ToString().Left(3);
+	const FString TypeCode = AircraftType ? AircraftType->ICAOType.ToString() : FString();
+	static const TArray<FString> Freighters = { TEXT("FDX"), TEXT("UPS"), TEXT("NCA"), TEXT("CLX"), TEXT("GTI"), TEXT("ABW"), TEXT("MPH"), TEXT("CKS"), TEXT("BOX"), TEXT("GEC") };
+	static const TArray<FString> LowCost = { TEXT("EZY"), TEXT("EJU"), TEXT("RYR"), TEXT("VLG"), TEXT("TRA"), TEXT("IBS"), TEXT("TFL"), TEXT("WZZ") };
+	float ButterChance = 0.2f, FirmChance = 0.2f;
+	if (Freighters.Contains(Airline) || TypeCode == TEXT("B744") || TypeCode == TEXT("B77L"))
+	{
+		ButterChance = 0.05f;
+		FirmChance = 0.6f;
+	}
+	else if (LowCost.Contains(Airline))
+	{
+		ButterChance = 0.15f;
+		FirmChance = 0.35f;
+	}
+	else if (TypeCode == TEXT("A388") || TypeCode.StartsWith(TEXT("B78")) || TypeCode == TEXT("A359"))
+	{
+		ButterChance = 0.4f;
+		FirmChance = 0.1f;
+	}
+	else if (bHeavy)
+	{
+		ButterChance = 0.3f;
+		FirmChance = 0.15f;
+	}
+	if (bWindy)
+	{
+		ButterChance *= 0.4f;
+		FirmChance = FMath::Min(FirmChance + 0.25f, 0.9f);
+	}
+	const float Draw = PilotRandom.FRand();
+	LandingStyle = Draw < ButterChance ? ELandingStyle::Butter : Draw < ButterChance + FirmChance ? ELandingStyle::Firm : ELandingStyle::Normal;
+	switch (LandingStyle)
+	{
+	case ELandingStyle::Butter:
+	{
+		// Flare from higher up, held off just above the runway: floats 80 to 200 m further, bleeds a few knots, touches
+		// at about 60 ft/min and keeps the nose up for a few seconds. Not past the point where it could still brake for its exit
+		FlareHeightCm = 1500.f;
+		TouchdownSinkShare = 0.08f;
+		FlarePitchDeg = PilotRandom.FRandRange(6.5f, 7.f);
+		NoseHoldSeconds = PilotRandom.FRandRange(2.5f, 3.5f);
+		NoseDownRate = 1.f;
+		ThumpCm = 0.f;
+		TouchdownSpeedCms = ApproachSpeedCms - 8.f * ATCUnits::KnotsToCms;
+		const float Needed = (FMath::Square(TouchdownSpeedCms) - FMath::Square(RolloutEndSpeedCms)) / (2.f * 250.f);
+		const float Extra = FMath::Min(PilotRandom.FRandRange(8000.f, 20000.f), FMath::Max(RolloutCm - Needed, 0.f));
+		TouchdownPoint += LandingDirection * Extra;
+		RolloutCm -= Extra;
+		Float += Extra;
+		break;
+	}
+	case ELandingStyle::Firm:
+		// Short flare, on the aiming point at 300 to 500 ft/min: the gear takes a thump, the nose comes down right away
+		FlareHeightCm = 900.f;
+		TouchdownSinkShare = PilotRandom.FRandRange(0.5f, 0.65f);
+		FlarePitchDeg = PilotRandom.FRandRange(4.5f, 5.f);
+		NoseHoldSeconds = PilotRandom.FRandRange(0.5f, 0.9f);
+		NoseDownRate = 2.5f;
+		ThumpCm = PilotRandom.FRandRange(20.f, 30.f);
+		TouchdownSpeedCms = ApproachSpeedCms - 3.f * ATCUnits::KnotsToCms;
+		if (Float > 1500.f)
+		{
+			TouchdownPoint -= LandingDirection * (Float - 1500.f);
+			RolloutCm += Float - 1500.f;
+			Float = 1500.f;
+		}
+		break;
+	default:
+		FlareHeightCm = 1200.f;
+		TouchdownSinkShare = 0.3f;
+		FlarePitchDeg = 6.f;
+		NoseHoldSeconds = 1.5f;
+		NoseDownRate = 1.5f;
+		ThumpCm = 8.f;
+		break;
+	}
 	RolloutDecelCms2 = FMath::Clamp((FMath::Square(TouchdownSpeedCms) - FMath::Square(RolloutEndSpeedCms)) / (2.f * RolloutCm), 100.f, 350.f);
 	LandingToGoCm = ApproachDistanceM * ATCUnits::MetersToCm;
 	LandingSpeedCms = ApproachSpeedCms;
@@ -537,9 +634,11 @@ void AATCAircraft::StartLanding(ATaxiRoute* Route, float StartCm, float EndCm, f
 	SetActorTickEnabled(true);
 	TickLanding(0.f);
 	UpdateEngineSound();
-	UE_LOG(LogATC, Display, TEXT("%s on final for %s, touchdown %.0f m before the exit route, %.0f kt, %s"), *Identity->Callsign.ToString(),
-		*Route->RouteTag.ToString(), RolloutCm / 100.f, ApproachSpeedCms / ATCUnits::KnotsToCms, FMath::Abs(CrosswindKt) >= 9.f
-		? *FString::Printf(TEXT("crosswind %.0f kt from the %s, gusts %.0f kt"), FMath::Abs(CrosswindKt), CrosswindKt > 0.f ? TEXT("right") : TEXT("left"), GustKt) : TEXT("calm"));
+	const float SinkFpm = TouchdownSinkShare * TouchdownSpeedCms * FMath::Tan(FMath::DegreesToRadians(3.f)) * 60.f / 30.48f;
+	UE_LOG(LogATC, Display, TEXT("%s on final for %s, touchdown %.0f m before the exit route, %.0f kt, %s, %s landing (%.0f m float, %.0f ft/min)"),
+		*Identity->Callsign.ToString(), *Route->RouteTag.ToString(), RolloutCm / 100.f, ApproachSpeedCms / ATCUnits::KnotsToCms, FMath::Abs(CrosswindKt) >= 9.f
+		? *FString::Printf(TEXT("crosswind %.0f kt from the %s, gusts %.0f kt"), FMath::Abs(CrosswindKt), CrosswindKt > 0.f ? TEXT("right") : TEXT("left"), GustKt) : TEXT("calm"),
+		LandingStyle == ELandingStyle::Butter ? TEXT("butter") : LandingStyle == ELandingStyle::Firm ? TEXT("firm") : TEXT("normal"), Float / 100.f, SinkFpm);
 }
 
 void AATCAircraft::TickLanding(float DeltaSeconds)
@@ -565,10 +664,40 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 		// touchdown (17-11-2026: two wide-bodies went around behind one taxiing in at 12 kt and one passing at 7 kt)
 		const bool bMovingOff = Ahead && !Ahead->IsLanding() && Ahead->Movement->Speed > 50.f;
 		const float DecideCm = Ahead && Ahead->IsLanding() ? 15000.f : bMovingOff ? 5000.f : 150000.f;
-		if (!bExitReserved && LandingToGoCm < DecideCm)
+		// Taken: on to the next exit down the runway, or an earlier one. Those taken too: it goes around (user 24-11-2026)
+		if (!bExitReserved && LandingToGoCm > 0.f && LandingToGoCm < DecideCm && !TryOtherExit())
 		{
 			StartGoAround();
 			return;
+		}
+		Route = LandingRoute.Get();
+	}
+	// Nobody else down on this runway any more when it crosses the threshold
+	if (LandingToGoCm > 0.f && LandingToGoCm < 15000.f)
+	{
+		UTrafficSubsystem* Traffic = GetWorld()->GetSubsystem<UTrafficSubsystem>();
+		for (AActor* Actor : Traffic ? Traffic->GetAllAircraft() : TArray<AActor*>())
+		{
+			const AATCAircraft* Other = Cast<AATCAircraft>(Actor);
+			if (Other && Other != this && Other->IsOnRunway() && (Other->LandingDirection | LandingDirection) > 0.98f
+				&& FMath::Abs(FVector::CrossProduct(LandingDirection, Other->GetActorLocation() - TouchdownPoint).Z) < 9000.f)
+			{
+				ExitBlocker = const_cast<AATCAircraft*>(Other);
+				StartGoAround();
+				return;
+			}
+		}
+	}
+	// With the exit, the first part of the way in: nobody pushes back or taxis into it the other way any more, so the
+	// arrival never stops on its exit for a departure with the next landing behind it (23-11-2026: arrivals stood on the 27
+	// exits for minutes for departures that had pushed back into their way, 4 go-arounds in 40 minutes)
+	if (bExitReserved && !bTaxiInReserved)
+	{
+		TaxiInRetrySeconds -= DeltaSeconds;
+		if (TaxiInRetrySeconds <= 0.f)
+		{
+			TaxiInRetrySeconds = 0.5f;
+			bTaxiInReserved = ReserveTaxiIn(ExitLane.IsValid() ? ExitLane.Get() : Route);
 		}
 	}
 
@@ -589,12 +718,14 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 		UpdateEngineSound();
 	}
 
-	// 3 degree glide path, nose 2.5 degrees up; from 12 m the flare: the sink rate drops to a third at touchdown
-	// (smooth cubic) while the nose comes up to 6 degrees. On the main gear first: the nose stays up for a second and a
-	// half, then comes down at 1.5 degrees a second (the nose wheel touches about four seconds after the mains)
+	// 3 degree glide path, nose 2.5 degrees up; then the flare (from 9, 12 or 15 m by the landing style): the sink rate
+	// drops to TouchdownSinkShare of the glide path's at touchdown (smooth cubic, the same slope as the glide path where
+	// it starts) while the nose comes up to FlarePitchDeg. On the main gear first: the nose is held up NoseHoldSeconds,
+	// then comes down at NoseDownRate degrees a second. A firm touchdown compresses the gear for a moment (thump)
 	const float Glide = FMath::Tan(FMath::DegreesToRadians(3.f));
-	const float FlareCm = 1200.f / Glide;
+	const float FlareCm = FlareHeightCm / Glide;
 	float Height = 0.f;
+	float ThumpPitch = 0.f, ThumpRoll = 0.f;
 	if (LandingToGoCm > FlareCm)
 	{
 		Height = LandingToGoCm * Glide;
@@ -603,15 +734,27 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 	else if (LandingToGoCm > 0.f)
 	{
 		const float U = LandingToGoCm / FlareCm;
-		Height = 1200.f * (0.3f * U + 1.4f * U * U - 0.7f * U * U * U);
-		PitchDeg = FMath::Lerp(6.f, 2.5f, FMath::SmoothStep(0.f, 1.f, U));
+		const float S = TouchdownSinkShare;
+		Height = FlareHeightCm * (S * U + 2.f * (1.f - S) * U * U - (1.f - S) * U * U * U);
+		PitchDeg = FMath::Lerp(FlarePitchDeg, 2.5f, FMath::SmoothStep(0.f, 1.f, U));
 	}
 	else
 	{
 		SinceTouchdown = SinceTouchdown < 0.f ? 0.f : SinceTouchdown + DeltaSeconds;
-		if (SinceTouchdown > 1.5f)
+		if (SinceTouchdown > NoseHoldSeconds)
 		{
-			PitchDeg = FMath::FInterpConstantTo(PitchDeg, 0.f, DeltaSeconds, 1.5f);
+			PitchDeg = FMath::FInterpConstantTo(PitchDeg, 0.f, DeltaSeconds, NoseDownRate);
+		}
+		// The gear compresses (the model is rigid: it sinks a few cm), springs back and lifts the aircraft a little, then it
+		// settles; the nose dips with it and the wings rock once
+		const float ThumpSeconds = 0.6f;
+		if (ThumpCm > 0.f && SinceTouchdown < ThumpSeconds)
+		{
+			const float Phase = SinceTouchdown / ThumpSeconds;
+			const float Bounce = Phase < 0.35f ? -0.3f * FMath::Sin(PI * Phase / 0.35f) : 0.6f * FMath::Sin(PI * (Phase - 0.35f) / 0.65f);
+			Height += ThumpCm * Bounce;
+			ThumpPitch = -0.04f * ThumpCm * FMath::Sin(PI * Phase) * (1.f - Phase);
+			ThumpRoll = 0.025f * ThumpCm * FMath::Sin(2.f * PI * 1.5f * Phase) * (1.f - Phase);
 		}
 	}
 
@@ -624,43 +767,70 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 		SidestepAt(LandingToGoCm, Ground, Heading, Curvature);
 	}
 
-	// Hand flown: a slow wander around the centre line (with the bank and heading that make it) and the glide path, more
-	// far out, gone at the flare; in a crosswind more, gusts rock the wings, the nose points into the wind (crab) until the
-	// pilot kicks it straight in the flare, upwind wing a little low
+	// Hand flown: the pilot's small corrections around the centre line and the glide path (FlyPilot), lined up and on the
+	// path by the flare. In a crosswind more gusts to correct, and they rock the wings. No crab (user 18-11-2026: "haal de
+	// crabwalking weg"): the nose stays along the way it flies
 	FinalSeconds += DeltaSeconds;
-	float LateralCm = 0.f, LateralAccel = 0.f, LateralRate = 0.f, WindRoll = 0.f, PitchWobble = 0.f;
+	float LateralCm = 0.f, LateralRate = 0.f, PilotBank = 0.f, PitchAdj = 0.f, WindRoll = 0.f, PitchWobble = 0.f;
 	if (LandingToGoCm > 0.f)
 	{
 		const float T = FinalSeconds;
 		const float Far = FMath::Clamp(LandingToGoCm / 600000.f, 0.f, 1.f);
 		const float BeforeFlare = FMath::Clamp((LandingToGoCm - FlareCm) / 100000.f, 0.f, 1.f);
-		const float Size = WanderLateralCm * (0.15f + 0.85f * Far) * BeforeFlare;
-		const float W1 = 0.13f, W2 = 0.31f;
-		LateralCm = Size * (0.65f * FMath::Sin(W1 * T + WanderPhase[0]) + 0.35f * FMath::Sin(W2 * T + WanderPhase[1]));
-		LateralRate = Size * (0.65f * W1 * FMath::Cos(W1 * T + WanderPhase[0]) + 0.35f * W2 * FMath::Cos(W2 * T + WanderPhase[1]));
-		LateralAccel = -Size * (0.65f * W1 * W1 * FMath::Sin(W1 * T + WanderPhase[0]) + 0.35f * W2 * W2 * FMath::Sin(W2 * T + WanderPhase[1]));
-		Height += WanderVerticalCm * BeforeFlare * (0.6f * FMath::Sin(0.16f * T + WanderPhase[2]) + 0.4f * FMath::Sin(0.47f * T + WanderPhase[3]));
+		FlyPilot(DeltaSeconds, Far);
+		// What is left of the offset goes in the last 800 m before the middle of the flare, with the heading that makes it
+		const float AlignLength = 80000.f;
+		const float U = FMath::Clamp((LandingToGoCm - 0.5f * FlareCm) / AlignLength, 0.f, 1.f);
+		const float Align = U * U * (3.f - 2.f * U);
+		const float AlignSlope = U > 0.f && U < 1.f ? 6.f * U * (1.f - U) / AlignLength : 0.f;   // d Align / d to go
+		LateralCm = LatCm * Align;
+		LateralRate = LatVelCms * Align - LatCm * AlignSlope * LandingSpeedCms;   // the distance to go shrinks at the speed
+		PilotBank = BankDeg * Align;
+		Height += VertCm * BeforeFlare;
+		PitchAdj = PitchAdjDeg * BeforeFlare;
 		const float Turbulence = FMath::Abs(CrosswindKt) / 20.f;
-		// No crab (user 18-11-2026: "haal de crabwalking weg"): the nose stays along the way it flies; the wind only rocks
-		// the wings and makes the wander a little bigger
-		WindRoll = Turbulence * BeforeFlare * 3.f * (0.6f * FMath::Sin(1.1f * T + WanderPhase[4]) + 0.4f * FMath::Sin(2.3f * T + WanderPhase[5]));
-		PitchWobble = (0.3f + 0.5f * Turbulence) * BeforeFlare * FMath::Sin(0.9f * T + WanderPhase[5]);
+		WindRoll = Turbulence * BeforeFlare * 1.5f * (0.6f * FMath::Sin(1.1f * T + WanderPhase[4]) + 0.4f * FMath::Sin(2.3f * T + WanderPhase[5]));
+		PitchWobble = 0.3f * Turbulence * BeforeFlare * FMath::Sin(0.9f * T + WanderPhase[5]);
 	}
 	const FVector2D Side(-Heading.Y, Heading.X);
 	Ground += Side * LateralCm;
 	const float TrackYaw = FVector(Heading, 0.f).Rotation().Yaw + FMath::RadiansToDegrees(FMath::Atan2(LateralRate, FMath::Max(LandingSpeedCms, 1.f)));
-	const float TargetRoll = FMath::Clamp(FMath::RadiansToDegrees(FMath::Atan((FMath::Square(LandingSpeedCms) * Curvature + LateralAccel) / 981.f)) + WindRoll, -30.f, 30.f);
-	RollDeg = FMath::FInterpConstantTo(RollDeg, TargetRoll, DeltaSeconds, 8.f);
+	const float TurnBank = FMath::RadiansToDegrees(FMath::Atan(FMath::Square(LandingSpeedCms) * Curvature / 981.f));
+	const float TargetRoll = FMath::Clamp(TurnBank + PilotBank + WindRoll, -30.f, 30.f);
+	RollDeg = FMath::FInterpConstantTo(RollDeg, TargetRoll, DeltaSeconds, 12.f);
 	const FVector Location(Ground.X, Ground.Y, TouchdownPoint.Z + Height);
-	SetActorLocationAndRotation(Location, FRotator(PitchDeg + PitchWobble, TrackYaw, RollDeg));
+	SetActorLocationAndRotation(Location, FRotator(PitchDeg + PitchAdj + PitchWobble + ThumpPitch, TrackYaw, RollDeg + ThumpRoll));
 
 	// At the start of the arrival route: from here the taxi controller drives (exit, taxi in, stand)
 	if (-LandingToGoCm >= RolloutCm)
 	{
 		bLanding = false;
 		SetActorTickEnabled(false);
-		// On the lane its exit is reserved on
+		// On the lane its exit is reserved on. That was picked from the air, before departures now on the taxiways had left
+		// their gates: choose again with the traffic of now (the parallel taxiway when somebody comes the other way, keep
+		// right), and take it if its exit is free (23-11-2026: an arrival met a departure head-on south of the H pier, both
+		// on the same taxiway, and blocked the 27 exits for the rest of the session)
 		ATaxiRoute* Lane = ExitLane.IsValid() ? ExitLane.Get() : Route;
+		if (UTaxiNetworkSubsystem* Network = GetWorld()->GetSubsystem<UTaxiNetworkSubsystem>())
+		{
+			FString Reason;
+			ATaxiRoute* Better = Network->ChooseLane(this, Route, Route->GetLocationAt(LandingStartCm), &Reason);
+			for (const FTaxiClaimRequest& Exit : UTaxiNetworkSubsystem::RunwayExitRequests(Route, LandingStartCm, AircraftType))
+			{
+				AActor* Blocker = nullptr;
+				if (Better && Better != Lane && Exit.Route == Better && Network->ClaimStretch(this, Exit, Blocker, true) && ReserveTaxiIn(Better, true)
+					&& Network->ClaimStretch(this, Exit, Blocker))
+				{
+					UE_LOG(LogATC, Display, TEXT("%s leaves the runway onto %s instead of %s: %s"), *Identity->Callsign.ToString(), *Better->RouteTag.ToString(),
+						*Lane->RouteTag.ToString(), *Reason);
+					Lane = Better;
+					ExitLane = Better;
+					// The way in reserved on the new lane instead of the old one
+					Network->CancelReservations(this);
+					bTaxiInReserved = ReserveTaxiIn(Better);
+				}
+			}
+		}
 		Movement->SetPath(Route->Spline, ETravelDirection::Forward, true, LandingStartCm, true);
 		// Off the runway first: until it is on its stand it goes before ground traffic, or it blocks its runway's exits
 		TaxiController->bPriority = true;
@@ -672,6 +842,56 @@ void AATCAircraft::TickLanding(float DeltaSeconds)
 	}
 }
 
+void AATCAircraft::FlyPilot(float DeltaSeconds, float Far)
+{
+	// Gusts: a push sideways and up or down that changes over a few seconds (random, with a memory: Ornstein-Uhlenbeck)
+	const float Turbulence = FMath::Abs(CrosswindKt) / 20.f;
+	const float LatGustSigma = 28.f + 45.f * Turbulence;    // cm/s2
+	const float VertGustSigma = 14.f + 20.f * Turbulence;
+	auto Gauss = [this]()
+	{
+		const float U1 = FMath::Max(PilotRandom.FRand(), 1e-6f);
+		return FMath::Sqrt(-2.f * FMath::Loge(U1)) * FMath::Cos(2.f * PI * PilotRandom.FRand());
+	};
+	const float Speed = FMath::Max(LandingSpeedCms, 1000.f);
+	for (float Left = DeltaSeconds; Left > 0.f; )
+	{
+		const float Dt = FMath::Min(Left, 0.02f);
+		Left -= Dt;
+		LatGustCms2 += -LatGustCms2 / 3.f * Dt + LatGustSigma * FMath::Sqrt(2.f / 3.f * Dt) * Gauss();
+		VertGustCms2 += -VertGustCms2 / 2.5f * Dt + VertGustSigma * FMath::Sqrt(2.f / 2.5f * Dt) * Gauss();
+
+		// Every second or so the pilot looks and moves the yoke: back towards the centre line, calmer when close and
+		// tighter near the runway; a few degrees of bank at most, wings level again once on the line
+		LatInputTimer -= Dt;
+		if (LatInputTimer <= 0.f)
+		{
+			LatInputTimer = PilotDelay * PilotRandom.FRandRange(0.7f, 1.4f);
+			const float WantVel = FMath::Clamp(-LatCm / FMath::Lerp(6.f, 14.f, Far), -250.f, 250.f);
+			const float MaxBank = FMath::Lerp(4.f, 8.f, Far);
+			BankCmdDeg = FMath::Abs(LatCm) < 150.f && FMath::Abs(LatVelCms) < 40.f
+				? PilotRandom.FRandRange(-0.4f, 0.4f)
+				: FMath::Clamp(0.03f * PilotGain * PilotRandom.FRandRange(0.8f, 1.25f) * (WantVel - LatVelCms), -MaxBank, MaxBank);
+		}
+		BankDeg = FMath::FInterpConstantTo(BankDeg, BankCmdDeg, Dt, 5.f);
+		LatVelCms += (981.f * FMath::Tan(FMath::DegreesToRadians(BankDeg)) + LatGustCms2 - 0.05f * LatVelCms) * Dt;
+		LatCm += LatVelCms * Dt;
+
+		// Glide path: a touch of nose up or down (at most 1.2 degrees), the sink rate follows within a second or two
+		VertInputTimer -= Dt;
+		if (VertInputTimer <= 0.f)
+		{
+			VertInputTimer = PilotDelay * PilotRandom.FRandRange(1.f, 2.f);
+			const float WantVel = FMath::Clamp(-VertCm / FMath::Lerp(5.f, 10.f, Far), -150.f, 150.f);
+			PitchCmdDeg = FMath::Abs(VertCm) < 60.f && FMath::Abs(VertVelCms) < 20.f ? 0.f
+				: FMath::Clamp(FMath::RadiansToDegrees(WantVel / Speed) * PilotGain, -1.2f, 1.2f);
+		}
+		PitchAdjDeg = FMath::FInterpConstantTo(PitchAdjDeg, PitchCmdDeg, Dt, 1.f);
+		VertVelCms += ((Speed * FMath::DegreesToRadians(PitchAdjDeg) - VertVelCms) / 1.5f + VertGustCms2) * Dt;
+		VertCm += VertVelCms * Dt;
+	}
+}
+
 bool AATCAircraft::ReserveRunwayExit()
 {
 	UTaxiNetworkSubsystem* Network = GetWorld() ? GetWorld()->GetSubsystem<UTaxiNetworkSubsystem>() : nullptr;
@@ -680,14 +900,109 @@ bool AATCAircraft::ReserveRunwayExit()
 	{
 		return true;
 	}
-	// The first lane that is free; none free: it queues on the landing route
+	// The first lane whose exit and way in are free, else the first whose exit is free; none free: it queues on the landing route
 	AActor* Blocker = nullptr;
-	const FTaxiClaimRequest* Free = Exits.FindByPredicate([this, Network, &Blocker](const FTaxiClaimRequest& Exit) { return Network->ClaimStretch(this, Exit, Blocker, true); });
+	const FTaxiClaimRequest* Free = Exits.FindByPredicate([this, Network, &Blocker](const FTaxiClaimRequest& Exit)
+		{ return Network->ClaimStretch(this, Exit, Blocker, true) && ReserveTaxiIn(Exit.Route, true); });
+	Free = Free ? Free : Exits.FindByPredicate([this, Network, &Blocker](const FTaxiClaimRequest& Exit) { return Network->ClaimStretch(this, Exit, Blocker, true); });
 	const FTaxiClaimRequest& Exit = Free ? *Free : Exits[0];
 	const bool bReserved = Network->ClaimStretch(this, Exit, Blocker);
 	ExitBlocker = Blocker;
 	ExitLane = Exit.Route;
 	return bReserved;
+}
+
+void AATCAircraft::SetOtherExits(const TArray<ATaxiRoute*>& Routes)
+{
+	OtherExits.Reset();
+	for (ATaxiRoute* Route : Routes)
+	{
+		OtherExits.Add(Route);
+	}
+}
+
+bool AATCAircraft::TryOtherExit()
+{
+	UTaxiNetworkSubsystem* Network = GetWorld() ? GetWorld()->GetSubsystem<UTaxiNetworkSubsystem>() : nullptr;
+	if (!Network)
+	{
+		return false;
+	}
+	// The other exits of this runway this aircraft can still make from its touchdown point: not braking harder than a firm
+	// landing does (an earlier one), and at least 400 m of rollout
+	struct FOption
+	{
+		ATaxiRoute* Route = nullptr;
+		float RolloutCm = 0.f;
+	};
+	TArray<FOption> Options;
+	for (const TWeakObjectPtr<ATaxiRoute>& Weak : OtherExits)
+	{
+		ATaxiRoute* Other = Weak.Get();
+		if (!Other || Other == LandingRoute.Get())
+		{
+			continue;
+		}
+		const FVector Offset = Other->GetLocationAt(0.f) - TouchdownPoint;
+		const float Rollout = Offset.Dot(LandingDirection);
+		const float Beside = FMath::Abs(FVector::CrossProduct(LandingDirection, Offset).Z);
+		if (Rollout > 40000.f && Beside < 3000.f
+			&& (FMath::Square(TouchdownSpeedCms) - FMath::Square(RolloutEndSpeedCms)) / (2.f * Rollout) < 350.f)
+		{
+			Options.Add({ Other, Rollout });
+		}
+	}
+	// On down the runway first, the nearest one; then the earlier ones, the nearest first
+	Options.Sort([this](const FOption& A, const FOption& B)
+	{
+		const bool bOnA = A.RolloutCm >= RolloutCm, bOnB = B.RolloutCm >= RolloutCm;
+		return bOnA != bOnB ? bOnA : FMath::Abs(A.RolloutCm - RolloutCm) < FMath::Abs(B.RolloutCm - RolloutCm);
+	});
+	// Exit and way in free; else the exit alone
+	for (const bool bWayInToo : { true, false })
+	{
+		for (const FOption& Option : Options)
+		{
+			for (const FTaxiClaimRequest& Exit : UTaxiNetworkSubsystem::RunwayExitRequests(Option.Route, 0.f, AircraftType))
+			{
+				AActor* Blocker = nullptr;
+				const FTaxiClaimRequest Way = UTaxiNetworkSubsystem::TaxiInRequest(Exit.Route, Exit.RearCm + Exit.LengthCm + 1000.f, AircraftType);
+				if (!Network->ClaimStretch(this, Exit, Blocker, true) || (bWayInToo && !Network->ReserveTwoWay(this, Way, Blocker, true)))
+				{
+					continue;
+				}
+				const AActor* Holder = ExitBlocker.Get();
+				UE_LOG(LogATC, Display, TEXT("%s %s: exit of %s taken by %s, takes %s (%.0f m of rollout instead of %.0f m)"), *Identity->Callsign.ToString(),
+					Option.RolloutCm >= RolloutCm ? TEXT("rolls on") : TEXT("brakes for an earlier exit"), *LandingRoute->RouteTag.ToString(),
+					Holder && Holder->Implements<UAircraftInfo>() ? *IAircraftInfo::Execute_GetCallsign(Holder).ToString() : TEXT("?"),
+					*Option.Route->RouteTag.ToString(), Option.RolloutCm / 100.f, RolloutCm / 100.f);
+				LeaveTaxiNetwork();
+				LandingRoute = Option.Route;
+				ExitLane = Option.Route;
+				LandingStartCm = 0.f;
+				RolloutCm = Option.RolloutCm;
+				RolloutDecelCms2 = FMath::Clamp((FMath::Square(TouchdownSpeedCms) - FMath::Square(RolloutEndSpeedCms)) / (2.f * RolloutCm), 60.f, 350.f);
+				bTaxiInReserved = false;
+				TaxiInRetrySeconds = 0.f;
+				bExitReserved = ReserveRunwayExit();
+				return bExitReserved;
+			}
+		}
+	}
+	return false;
+}
+
+bool AATCAircraft::ReserveTaxiIn(ATaxiRoute* Lane, bool bCheckOnly)
+{
+	UTaxiNetworkSubsystem* Network = GetWorld() ? GetWorld()->GetSubsystem<UTaxiNetworkSubsystem>() : nullptr;
+	const ATaxiRoute* Route = LandingRoute.Get();
+	if (!Network || !Lane || !Route || !AircraftType)
+	{
+		return true;
+	}
+	const float StartCm = Lane == Route ? LandingStartCm : UAircraftMovementComponent::GetDistanceClosestTo(Lane->Spline, Route->GetLocationAt(LandingStartCm));
+	AActor* Blocker = nullptr;
+	return Network->ReserveTwoWay(this, UTaxiNetworkSubsystem::TaxiInRequest(Lane, StartCm, AircraftType), Blocker, bCheckOnly);
 }
 
 void AATCAircraft::StartGoAround()

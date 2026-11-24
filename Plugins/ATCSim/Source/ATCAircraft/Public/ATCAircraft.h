@@ -15,6 +15,9 @@ class UStaticMeshComponent;
 class UTaxiControllerComponent;
 struct FTaxiStop;
 
+/** How a pilot puts the aircraft on the runway: greased on after a float, the usual, or flown on firmly. */
+enum class ELandingStyle : uint8 { Normal, Butter, Firm };
+
 /**
  * Base aircraft (BP_Aircraft_Base derives from this). The origin is the main gear on the ground, the nose
  * points along +X. All behaviour lives in the components; this class only wires them together.
@@ -42,7 +45,7 @@ public:
 	/**
 	 * Final approach on a 3 degree glide path, flare, touchdown and rollout on the runway behind the start of Route (an
 	 * arrival route that starts on the runway). At StartCm it joins the route at RolloutEndSpeedKt and taxis to EndCm.
-	 * On final it asks the taxi network for its runway exit; not reserved 1.5 km before touchdown: it goes around.
+	 * On final it asks the taxi network for its runway exit; not reserved 1.5 km before touchdown: another exit of the runway (SetOtherExits), or it goes around.
 	 * ApproachRoute: first fly the final of that route's runway, then sidestep in a banked turn onto Route's runway short
 	 * of its threshold (Schiphol: 27 final -> Oostbaan 22).
 	 */
@@ -50,6 +53,12 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "ATC|Aircraft")
 	bool IsLanding() const { return bLanding; }
+
+	/** Down on the runway, rolling out. */
+	bool IsOnRunway() const { return bLanding && LandingToGoCm <= 0.f; }
+
+	/** Landings: the arrival routes over the other exits of its runway to the same stand, for when its own is taken. */
+	void SetOtherExits(const TArray<ATaxiRoute*>& Routes);
 
 	/** Missed approach: climbing away because its runway exit was not free. */
 	UFUNCTION(BlueprintPure, Category = "ATC|Aircraft")
@@ -182,6 +191,19 @@ private:
 	 * landing route or one of its parallel lanes, whichever is free (ExitLane).
 	 */
 	bool ReserveRunwayExit();
+
+	/**
+	 * Reserves the two-way stretches of the first 1.5 km of the taxi-in on Lane (past the runway): nobody enters
+	 * them the other way before it has passed, like a ground controller who holds a departure for the traffic vacating.
+	 * Otherwise an arrival stopped on its exit for a departure, and the landing behind it had to go around.
+	 */
+	bool ReserveTaxiIn(ATaxiRoute* Lane, bool bCheckOnly = false);
+
+	/**
+	 * Its exit is taken: the next exit down the runway that is free (the rollout gets longer, and braking softer) or an
+	 * earlier one it can still make. Reserves it; false when none is free: then it goes around.
+	 */
+	bool TryOtherExit();
 	void StartGoAround();
 
 	bool bTakingOff = false;
@@ -196,10 +218,14 @@ private:
 
 	bool bLanding = false;
 	bool bExitReserved = false;
+	/** The first part of the taxi-in is reserved too (ReserveTaxiIn); until then it tries again every half second. */
+	bool bTaxiInReserved = false;
+	float TaxiInRetrySeconds = 0.f;
 	bool bGoingAround = false;
 	TWeakObjectPtr<AActor> ExitBlocker;
 	TArray<TWeakObjectPtr<AActor>> StoodInFor;
 	TWeakObjectPtr<ATaxiRoute> LandingRoute;
+	TArray<TWeakObjectPtr<ATaxiRoute>> OtherExits;
 	/** The lane its exit is reserved on: it taxis in on that one. */
 	TWeakObjectPtr<ATaxiRoute> ExitLane;
 	float LandingStartCm = 0.f;
@@ -235,6 +261,42 @@ private:
 	float WanderVerticalCm = 0.f;
 	float WanderPhase[6] = {};
 	float CrosswindKt = 0.f;
+
+	/**
+	 * The pilot on the final (user 23-11-2026: "like a pilot is actually trying to land it, small movements to adjust"):
+	 * gusts push the aircraft off the centre line and the glide path, the pilot answers every second or two with a small
+	 * bank or pitch input and levels the wings again once it is back. Offsets from the final, + to the right / up.
+	 */
+	FRandomStream PilotRandom;
+	float LatCm = 0.f;
+	float LatVelCms = 0.f;
+	float BankCmdDeg = 0.f;
+	float BankDeg = 0.f;
+	float LatGustCms2 = 0.f;
+	float LatInputTimer = 0.f;
+	float VertCm = 0.f;
+	float VertVelCms = 0.f;
+	float PitchCmdDeg = 0.f;
+	float PitchAdjDeg = 0.f;
+	float VertGustCms2 = 0.f;
+	float VertInputTimer = 0.f;
+	/** How hard this pilot corrects (0.7 .. 1.3) and how quick (seconds between inputs, 0.7 .. 1.8). */
+	float PilotGain = 1.f;
+	float PilotDelay = 1.f;
+	void FlyPilot(float DeltaSeconds, float Far);
+
+	/**
+	 * The flare and touchdown of this landing (StartLanding picks the style by operator, type and wind): flare height,
+	 * sink rate at touchdown as a share of the glide path's, nose attitude in the flare, how long the nose is held up and
+	 * how fast it comes down, and how far the gear compresses at touchdown (the thump of a firm landing).
+	 */
+	ELandingStyle LandingStyle = ELandingStyle::Normal;
+	float FlareHeightCm = 1200.f;
+	float TouchdownSinkShare = 0.3f;
+	float FlarePitchDeg = 6.f;
+	float NoseHoldSeconds = 1.5f;
+	float NoseDownRate = 1.5f;
+	float ThumpCm = 8.f;
 
 	/**
 	 * A sidestep in the air, measured back from the touchdown point: straight on the landing runway's final (BackStraight),
